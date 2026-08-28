@@ -215,6 +215,7 @@ supervisor внутри единственного webapp.
 
 ## Документация проекта
 
+- руководство пользователя — [docs/user-guide.md](docs/user-guide.md);
 - руководство администратора — [docs/admin-guide.md](docs/admin-guide.md);
 - архитектура и границы MVP — [docs/architecture.md](docs/architecture.md);
 - ADR единого webapp — [docs/adr/0001-single-webapp.md](docs/adr/0001-single-webapp.md);

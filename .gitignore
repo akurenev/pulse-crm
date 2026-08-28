@@ -41,3 +41,6 @@ test-results/
 tmp/
 uploads/
 .cache/
+
+# Generated documentation previews
+docs/user-guide/rendered/
