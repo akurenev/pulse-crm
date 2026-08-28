@@ -1,0 +1,1382 @@
+from __future__ import annotations
+
+import uuid
+from datetime import UTC, datetime, timedelta
+from typing import Any
+
+import sqlalchemy as sa
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.db import get_session
+from app.integrations.identity import IdentityNormalizationError, sync_contact_points
+from app.integrations.models import PurchaseSchedule, PurchaseScheduleStatus
+from app.integrations.purchases import create_purchase_schedule
+from app.models import (
+    ActivityEvent,
+    Company,
+    Contact,
+    CustomFieldDefinition,
+    Deal,
+    DealContact,
+    DealStageHistory,
+    FieldEntity,
+    Membership,
+    Pipeline,
+    Source,
+    Stage,
+    StageRequiredField,
+    StageType,
+    Task,
+    TaskStatus,
+)
+from app.pagination import decode_cursor, encode_cursor
+from app.schemas import (
+    ActivityPage,
+    ActivityRead,
+    CompanyCreate,
+    CompanyPage,
+    CompanyRead,
+    CompanyUpdate,
+    ContactCreate,
+    ContactPage,
+    ContactRead,
+    ContactUpdate,
+    CustomFieldCreate,
+    CustomFieldRead,
+    DealCreate,
+    DealPage,
+    DealRead,
+    DealUpdate,
+    NoteCreate,
+    PipelineCreate,
+    PipelineRead,
+    RequiredFieldRead,
+    RequiredFieldsReplace,
+    SourceRead,
+    StageRead,
+    StageTransition,
+    TaskCreate,
+    TaskPage,
+    TaskRead,
+    TaskUpdate,
+)
+from app.security import CurrentAdmin, CurrentMutationUser, CurrentUser
+from app.services.events import record_domain_event
+
+router = APIRouter(tags=["crm"])
+BUILT_IN_REQUIRED_FIELDS = {
+    "title",
+    "company_id",
+    "contact_ids",
+    "assignee_id",
+    "amount",
+    "source_id",
+    "next_purchase_at",
+}
+
+
+def not_found(entity: str) -> HTTPException:
+    return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"{entity} not found")
+
+
+def conflict() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={"code": "version_conflict", "message": "record was modified by another user"},
+    )
+
+
+def _cursor_condition(model: Any, cursor_value: str | None) -> Any | None:
+    cursor = decode_cursor(cursor_value)
+    if cursor is None:
+        return None
+    return sa.or_(
+        model.created_at < cursor.created_at,
+        sa.and_(model.created_at == cursor.created_at, model.id < cursor.entity_id),
+    )
+
+
+def _next_cursor(items: list[Any], limit: int) -> tuple[list[Any], str | None]:
+    has_more = len(items) > limit
+    visible = items[:limit]
+    cursor = encode_cursor(visible[-1].created_at, visible[-1].id) if has_more and visible else None
+    return visible, cursor
+
+
+async def _ensure_company(
+    db: AsyncSession, workspace_id: uuid.UUID, entity_id: uuid.UUID
+) -> Company:
+    entity = await db.scalar(
+        sa.select(Company).where(
+            Company.id == entity_id,
+            Company.workspace_id == workspace_id,
+            Company.deleted_at.is_(None),
+        )
+    )
+    if entity is None:
+        raise not_found("company")
+    return entity
+
+
+async def _ensure_contact(
+    db: AsyncSession, workspace_id: uuid.UUID, entity_id: uuid.UUID
+) -> Contact:
+    entity = await db.scalar(
+        sa.select(Contact).where(
+            Contact.id == entity_id,
+            Contact.workspace_id == workspace_id,
+            Contact.deleted_at.is_(None),
+        )
+    )
+    if entity is None:
+        raise not_found("contact")
+    return entity
+
+
+async def _ensure_deal(db: AsyncSession, workspace_id: uuid.UUID, entity_id: uuid.UUID) -> Deal:
+    entity = await db.scalar(
+        sa.select(Deal).where(
+            Deal.id == entity_id,
+            Deal.workspace_id == workspace_id,
+            Deal.deleted_at.is_(None),
+        )
+    )
+    if entity is None:
+        raise not_found("deal")
+    return entity
+
+
+async def _ensure_member(db: AsyncSession, workspace_id: uuid.UUID, user_id: uuid.UUID) -> None:
+    member_id = await db.scalar(
+        sa.select(Membership.id).where(
+            Membership.workspace_id == workspace_id, Membership.user_id == user_id
+        )
+    )
+    if member_id is None:
+        raise not_found("workspace member")
+
+
+@router.get("/companies", response_model=CompanyPage)
+async def list_companies(
+    context: CurrentUser,
+    db: AsyncSession = Depends(get_session),
+    search: str | None = Query(default=None, max_length=200),
+    cursor: str | None = None,
+    limit: int = Query(default=50, ge=1, le=100),
+) -> CompanyPage:
+    query = sa.select(Company).where(
+        Company.workspace_id == context.workspace_id, Company.deleted_at.is_(None)
+    )
+    if search:
+        query = query.where(Company.name.ilike(f"%{search.strip()}%"))
+    if (condition := _cursor_condition(Company, cursor)) is not None:
+        query = query.where(condition)
+    items = list(
+        (
+            await db.scalars(
+                query.order_by(Company.created_at.desc(), Company.id.desc()).limit(limit + 1)
+            )
+        ).all()
+    )
+    items, next_cursor = _next_cursor(items, limit)
+    return CompanyPage(
+        items=[CompanyRead.model_validate(item) for item in items], next_cursor=next_cursor
+    )
+
+
+@router.post("/companies", response_model=CompanyRead, status_code=status.HTTP_201_CREATED)
+async def create_company(
+    payload: CompanyCreate,
+    context: CurrentMutationUser,
+    db: AsyncSession = Depends(get_session),
+) -> Company:
+    company = Company(workspace_id=context.workspace_id, **payload.model_dump(mode="json"))
+    db.add(company)
+    await db.flush()
+    record_domain_event(
+        db,
+        workspace_id=context.workspace_id,
+        event_type="company.created",
+        entity_type="company",
+        entity_id=company.id,
+        actor_id=context.user_id,
+    )
+    await db.commit()
+    return company
+
+
+@router.get("/companies/{company_id}", response_model=CompanyRead)
+async def get_company(
+    company_id: uuid.UUID, context: CurrentUser, db: AsyncSession = Depends(get_session)
+) -> Company:
+    return await _ensure_company(db, context.workspace_id, company_id)
+
+
+@router.patch("/companies/{company_id}", response_model=CompanyRead)
+async def update_company(
+    company_id: uuid.UUID,
+    payload: CompanyUpdate,
+    context: CurrentMutationUser,
+    db: AsyncSession = Depends(get_session),
+) -> Company:
+    values = payload.model_dump(exclude_unset=True, exclude={"expected_version"}, mode="json")
+    values.update(version=payload.expected_version + 1, updated_at=datetime.now(UTC))
+    company = (
+        await db.execute(
+            sa.update(Company)
+            .where(
+                Company.id == company_id,
+                Company.workspace_id == context.workspace_id,
+                Company.deleted_at.is_(None),
+                Company.version == payload.expected_version,
+            )
+            .values(**values)
+            .returning(Company)
+        )
+    ).scalar_one_or_none()
+    if company is None:
+        if await db.scalar(
+            sa.select(Company.id).where(
+                Company.id == company_id, Company.workspace_id == context.workspace_id
+            )
+        ):
+            raise conflict()
+        raise not_found("company")
+    record_domain_event(
+        db,
+        workspace_id=context.workspace_id,
+        event_type="company.updated",
+        entity_type="company",
+        entity_id=company.id,
+        actor_id=context.user_id,
+        payload={"fields": sorted(values.keys() - {"updated_at", "version"})},
+    )
+    await db.commit()
+    return company
+
+
+@router.get("/contacts", response_model=ContactPage)
+async def list_contacts(
+    context: CurrentUser,
+    db: AsyncSession = Depends(get_session),
+    search: str | None = Query(default=None, max_length=200),
+    cursor: str | None = None,
+    limit: int = Query(default=50, ge=1, le=100),
+) -> ContactPage:
+    query = sa.select(Contact).where(
+        Contact.workspace_id == context.workspace_id, Contact.deleted_at.is_(None)
+    )
+    if search:
+        term = f"%{search.strip()}%"
+        if db.get_bind().dialect.name == "postgresql":
+            document = sa.func.to_tsvector(
+                sa.text("'simple'"),
+                sa.func.coalesce(Contact.first_name, "")
+                + " "
+                + sa.func.coalesce(Contact.last_name, "")
+                + " "
+                + sa.func.coalesce(Contact.primary_email, "")
+                + " "
+                + sa.func.coalesce(Contact.primary_phone, ""),
+            )
+            query = query.where(
+                document.op("@@")(sa.func.websearch_to_tsquery(sa.text("'simple'"), search.strip()))
+            )
+        else:
+            query = query.where(
+                sa.or_(
+                    Contact.first_name.ilike(term),
+                    Contact.last_name.ilike(term),
+                    Contact.primary_email.ilike(term),
+                    Contact.primary_phone.ilike(term),
+                )
+            )
+    if (condition := _cursor_condition(Contact, cursor)) is not None:
+        query = query.where(condition)
+    items = list(
+        (
+            await db.scalars(
+                query.order_by(Contact.created_at.desc(), Contact.id.desc()).limit(limit + 1)
+            )
+        ).all()
+    )
+    items, next_cursor = _next_cursor(items, limit)
+    return ContactPage(
+        items=[ContactRead.model_validate(item) for item in items], next_cursor=next_cursor
+    )
+
+
+@router.post("/contacts", response_model=ContactRead, status_code=status.HTTP_201_CREATED)
+async def create_contact(
+    payload: ContactCreate,
+    context: CurrentMutationUser,
+    db: AsyncSession = Depends(get_session),
+) -> Contact:
+    if payload.company_id:
+        await _ensure_company(db, context.workspace_id, payload.company_id)
+    data = payload.model_dump()
+    contact = Contact(workspace_id=context.workspace_id, **data)
+    db.add(contact)
+    await db.flush()
+    try:
+        await sync_contact_points(db, contact)
+    except IdentityNormalizationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    record_domain_event(
+        db,
+        workspace_id=context.workspace_id,
+        event_type="contact.created",
+        entity_type="contact",
+        entity_id=contact.id,
+        actor_id=context.user_id,
+    )
+    await db.commit()
+    return contact
+
+
+@router.get("/contacts/{contact_id}", response_model=ContactRead)
+async def get_contact(
+    contact_id: uuid.UUID, context: CurrentUser, db: AsyncSession = Depends(get_session)
+) -> Contact:
+    return await _ensure_contact(db, context.workspace_id, contact_id)
+
+
+@router.patch("/contacts/{contact_id}", response_model=ContactRead)
+async def update_contact(
+    contact_id: uuid.UUID,
+    payload: ContactUpdate,
+    context: CurrentMutationUser,
+    db: AsyncSession = Depends(get_session),
+) -> Contact:
+    if "company_id" in payload.model_fields_set and payload.company_id:
+        await _ensure_company(db, context.workspace_id, payload.company_id)
+    values = payload.model_dump(exclude_unset=True, exclude={"expected_version"})
+    values.update(version=payload.expected_version + 1, updated_at=datetime.now(UTC))
+    contact = (
+        await db.execute(
+            sa.update(Contact)
+            .where(
+                Contact.id == contact_id,
+                Contact.workspace_id == context.workspace_id,
+                Contact.deleted_at.is_(None),
+                Contact.version == payload.expected_version,
+            )
+            .values(**values)
+            .returning(Contact)
+        )
+    ).scalar_one_or_none()
+    if contact is None:
+        if await db.scalar(
+            sa.select(Contact.id).where(
+                Contact.id == contact_id, Contact.workspace_id == context.workspace_id
+            )
+        ):
+            raise conflict()
+        raise not_found("contact")
+    try:
+        await sync_contact_points(db, contact)
+    except IdentityNormalizationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    record_domain_event(
+        db,
+        workspace_id=context.workspace_id,
+        event_type="contact.updated",
+        entity_type="contact",
+        entity_id=contact.id,
+        actor_id=context.user_id,
+        payload={"fields": sorted(values.keys() - {"updated_at", "version"})},
+    )
+    await db.commit()
+    return contact
+
+
+@router.get("/pipelines", response_model=list[PipelineRead])
+async def list_pipelines(
+    context: CurrentUser, db: AsyncSession = Depends(get_session)
+) -> list[PipelineRead]:
+    pipelines = list(
+        (
+            await db.scalars(
+                sa.select(Pipeline)
+                .where(Pipeline.workspace_id == context.workspace_id, Pipeline.is_active.is_(True))
+                .order_by(Pipeline.position, Pipeline.created_at)
+            )
+        ).all()
+    )
+    stages = list(
+        (
+            await db.scalars(
+                sa.select(Stage)
+                .where(Stage.workspace_id == context.workspace_id)
+                .order_by(Stage.pipeline_id, Stage.position)
+            )
+        ).all()
+    )
+    by_pipeline: dict[uuid.UUID, list[StageRead]] = {}
+    for stage in stages:
+        by_pipeline.setdefault(stage.pipeline_id, []).append(StageRead.model_validate(stage))
+    return [
+        PipelineRead(
+            id=pipeline.id,
+            name=pipeline.name,
+            position=pipeline.position,
+            is_active=pipeline.is_active,
+            version=pipeline.version,
+            stages=by_pipeline.get(pipeline.id, []),
+        )
+        for pipeline in pipelines
+    ]
+
+
+@router.post("/pipelines", response_model=PipelineRead, status_code=status.HTTP_201_CREATED)
+async def create_pipeline(
+    payload: PipelineCreate,
+    context: CurrentAdmin,
+    db: AsyncSession = Depends(get_session),
+) -> PipelineRead:
+    positions = [stage.position for stage in payload.stages]
+    if len(set(positions)) != len(positions):
+        raise HTTPException(status_code=422, detail="stage positions must be unique")
+    pipeline = Pipeline(
+        workspace_id=context.workspace_id, name=payload.name.strip(), position=payload.position
+    )
+    db.add(pipeline)
+    try:
+        await db.flush()
+        stages = [
+            Stage(workspace_id=context.workspace_id, pipeline_id=pipeline.id, **item.model_dump())
+            for item in payload.stages
+        ]
+        db.add_all(stages)
+        await db.flush()
+        record_domain_event(
+            db,
+            workspace_id=context.workspace_id,
+            event_type="pipeline.created",
+            entity_type="pipeline",
+            entity_id=pipeline.id,
+            actor_id=context.user_id,
+        )
+        await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        raise HTTPException(
+            status_code=409, detail="pipeline name or stage position already exists"
+        ) from exc
+    return PipelineRead(
+        id=pipeline.id,
+        name=pipeline.name,
+        position=pipeline.position,
+        is_active=pipeline.is_active,
+        version=pipeline.version,
+        stages=[
+            StageRead.model_validate(item)
+            for item in sorted(stages, key=lambda item: item.position)
+        ],
+    )
+
+
+@router.get("/sources", response_model=list[SourceRead])
+async def list_sources(
+    context: CurrentUser, db: AsyncSession = Depends(get_session)
+) -> list[Source]:
+    return list(
+        (
+            await db.scalars(
+                sa.select(Source)
+                .where(Source.workspace_id == context.workspace_id, Source.is_active.is_(True))
+                .order_by(Source.name)
+            )
+        ).all()
+    )
+
+
+@router.get("/custom-fields", response_model=list[CustomFieldRead])
+async def list_custom_fields(
+    context: CurrentUser,
+    db: AsyncSession = Depends(get_session),
+    entity_type: FieldEntity | None = None,
+) -> list[CustomFieldDefinition]:
+    query = sa.select(CustomFieldDefinition).where(
+        CustomFieldDefinition.workspace_id == context.workspace_id,
+        CustomFieldDefinition.is_active.is_(True),
+    )
+    if entity_type:
+        query = query.where(CustomFieldDefinition.entity_type == entity_type)
+    return list((await db.scalars(query.order_by(CustomFieldDefinition.name))).all())
+
+
+@router.post("/custom-fields", response_model=CustomFieldRead, status_code=status.HTTP_201_CREATED)
+async def create_custom_field(
+    payload: CustomFieldCreate,
+    context: CurrentAdmin,
+    db: AsyncSession = Depends(get_session),
+) -> CustomFieldDefinition:
+    field = CustomFieldDefinition(workspace_id=context.workspace_id, **payload.model_dump())
+    db.add(field)
+    try:
+        await db.flush()
+        record_domain_event(
+            db,
+            workspace_id=context.workspace_id,
+            event_type="custom_field.created",
+            entity_type="custom_field",
+            entity_id=field.id,
+            actor_id=context.user_id,
+        )
+        await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        raise HTTPException(status_code=409, detail="custom field key already exists") from exc
+    return field
+
+
+@router.get("/stages/{stage_id}/required-fields", response_model=list[RequiredFieldRead])
+async def list_required_fields(
+    stage_id: uuid.UUID,
+    context: CurrentAdmin,
+    db: AsyncSession = Depends(get_session),
+) -> list[StageRequiredField]:
+    stage = await db.scalar(
+        sa.select(Stage.id).where(
+            Stage.id == stage_id,
+            Stage.workspace_id == context.workspace_id,
+        )
+    )
+    if stage is None:
+        raise not_found("stage")
+    return list(
+        (
+            await db.scalars(
+                sa.select(StageRequiredField)
+                .where(
+                    StageRequiredField.stage_id == stage_id,
+                    StageRequiredField.workspace_id == context.workspace_id,
+                )
+                .order_by(StageRequiredField.created_at, StageRequiredField.id)
+            )
+        ).all()
+    )
+
+
+@router.put("/stages/{stage_id}/required-fields", response_model=list[RequiredFieldRead])
+async def replace_required_fields(
+    stage_id: uuid.UUID,
+    payload: RequiredFieldsReplace,
+    context: CurrentAdmin,
+    db: AsyncSession = Depends(get_session),
+) -> list[StageRequiredField]:
+    stage = await db.scalar(
+        sa.select(Stage).where(Stage.id == stage_id, Stage.workspace_id == context.workspace_id)
+    )
+    if stage is None:
+        raise not_found("stage")
+    builtin_keys = [item.built_in_key for item in payload.fields if item.built_in_key]
+    if any(key not in BUILT_IN_REQUIRED_FIELDS for key in builtin_keys):
+        raise HTTPException(status_code=422, detail="unsupported built-in required field")
+    definition_ids = [
+        item.field_definition_id for item in payload.fields if item.field_definition_id
+    ]
+    if len(set(builtin_keys)) != len(builtin_keys) or len(set(definition_ids)) != len(
+        definition_ids
+    ):
+        raise HTTPException(status_code=422, detail="required fields must be unique")
+    if definition_ids:
+        count = await db.scalar(
+            sa.select(sa.func.count())
+            .select_from(CustomFieldDefinition)
+            .where(
+                CustomFieldDefinition.id.in_(definition_ids),
+                CustomFieldDefinition.workspace_id == context.workspace_id,
+                CustomFieldDefinition.entity_type == FieldEntity.deal,
+                CustomFieldDefinition.is_active.is_(True),
+            )
+        )
+        if count != len(definition_ids):
+            raise HTTPException(status_code=422, detail="unknown or non-deal custom field")
+    await db.execute(
+        sa.delete(StageRequiredField).where(
+            StageRequiredField.stage_id == stage.id,
+            StageRequiredField.workspace_id == context.workspace_id,
+        )
+    )
+    fields = [
+        StageRequiredField(
+            workspace_id=context.workspace_id,
+            stage_id=stage.id,
+            field_definition_id=item.field_definition_id,
+            built_in_key=item.built_in_key,
+        )
+        for item in payload.fields
+    ]
+    db.add_all(fields)
+    await db.flush()
+    record_domain_event(
+        db,
+        workspace_id=context.workspace_id,
+        event_type="stage.required_fields_changed",
+        entity_type="stage",
+        entity_id=stage.id,
+        actor_id=context.user_id,
+        payload={"count": len(fields)},
+    )
+    await db.commit()
+    return fields
+
+
+async def _validate_deal_references(
+    db: AsyncSession, workspace_id: uuid.UUID, payload: DealCreate
+) -> Stage:
+    stage = await db.scalar(
+        sa.select(Stage).where(
+            Stage.id == payload.stage_id,
+            Stage.pipeline_id == payload.pipeline_id,
+            Stage.workspace_id == workspace_id,
+        )
+    )
+    if stage is None:
+        raise HTTPException(status_code=422, detail="stage does not belong to pipeline")
+    if payload.company_id:
+        await _ensure_company(db, workspace_id, payload.company_id)
+    if payload.assignee_id:
+        await _ensure_member(db, workspace_id, payload.assignee_id)
+    if payload.source_id and not await db.scalar(
+        sa.select(Source.id).where(
+            Source.id == payload.source_id, Source.workspace_id == workspace_id
+        )
+    ):
+        raise not_found("source")
+    if payload.contact_ids:
+        count = await db.scalar(
+            sa.select(sa.func.count())
+            .select_from(Contact)
+            .where(
+                Contact.id.in_(set(payload.contact_ids)),
+                Contact.workspace_id == workspace_id,
+                Contact.deleted_at.is_(None),
+            )
+        )
+        if count != len(set(payload.contact_ids)):
+            raise not_found("contact")
+    return stage
+
+
+async def _sync_purchase_schedule(
+    db: AsyncSession,
+    *,
+    deal: Deal,
+    fallback_assignee_id: uuid.UUID,
+) -> None:
+    """Keep the durable next-purchase schedule aligned with a deal date."""
+
+    active = list(
+        (
+            await db.scalars(
+                sa.select(PurchaseSchedule).where(
+                    PurchaseSchedule.workspace_id == deal.workspace_id,
+                    PurchaseSchedule.deal_id == deal.id,
+                    PurchaseSchedule.status == PurchaseScheduleStatus.active,
+                )
+            )
+        ).all()
+    )
+    if deal.next_purchase_at is None:
+        for schedule in active:
+            schedule.status = PurchaseScheduleStatus.cancelled
+            schedule.version += 1
+        return
+
+    scheduled_for = deal.next_purchase_at
+    if scheduled_for.tzinfo is None:
+        scheduled_for = scheduled_for.replace(tzinfo=UTC)
+    contact_id = await db.scalar(
+        sa.select(DealContact.contact_id)
+        .where(
+            DealContact.workspace_id == deal.workspace_id,
+            DealContact.deal_id == deal.id,
+        )
+        .order_by(DealContact.is_primary.desc(), DealContact.created_at.asc())
+        .limit(1)
+    )
+    for schedule in active:
+        if schedule.scheduled_for != scheduled_for:
+            schedule.status = PurchaseScheduleStatus.cancelled
+            schedule.version += 1
+        else:
+            schedule.contact_id = contact_id
+            schedule.assignee_id = deal.assignee_id or fallback_assignee_id
+            return
+
+    await create_purchase_schedule(
+        db,
+        workspace_id=deal.workspace_id,
+        deal_id=deal.id,
+        contact_id=contact_id,
+        assignee_id=deal.assignee_id or fallback_assignee_id,
+        scheduled_for=scheduled_for,
+        remind_at=scheduled_for - timedelta(days=7),
+    )
+
+
+async def _deal_reads(db: AsyncSession, deals: list[Deal]) -> list[DealRead]:
+    if not deals:
+        return []
+    deal_ids = [deal.id for deal in deals]
+    contact_rows = (
+        await db.execute(
+            sa.select(DealContact.deal_id, Contact)
+            .join(Contact, Contact.id == DealContact.contact_id)
+            .where(
+                DealContact.deal_id.in_(deal_ids),
+                Contact.deleted_at.is_(None),
+            )
+            .order_by(
+                DealContact.deal_id,
+                DealContact.is_primary.desc(),
+                DealContact.created_at,
+            )
+        )
+    ).all()
+    contact_ids_by_deal: dict[uuid.UUID, list[uuid.UUID]] = {deal_id: [] for deal_id in deal_ids}
+    primary_contact_by_deal: dict[uuid.UUID, ContactRead] = {}
+    for deal_id, contact in contact_rows:
+        contact_ids_by_deal[deal_id].append(contact.id)
+        primary_contact_by_deal.setdefault(deal_id, ContactRead.model_validate(contact))
+    company_ids = {deal.company_id for deal in deals if deal.company_id is not None}
+    companies_by_id = {
+        company.id: CompanyRead.model_validate(company)
+        for company in (
+            await db.scalars(
+                sa.select(Company).where(
+                    Company.id.in_(company_ids),
+                    Company.deleted_at.is_(None),
+                )
+            )
+        ).all()
+    }
+    return [
+        DealRead.model_validate(deal).model_copy(
+            update={
+                "contact_ids": contact_ids_by_deal[deal.id],
+                "primary_contact": primary_contact_by_deal.get(deal.id),
+                "company": companies_by_id.get(deal.company_id) if deal.company_id else None,
+            }
+        )
+        for deal in deals
+    ]
+
+
+async def _deal_read(db: AsyncSession, deal: Deal) -> DealRead:
+    return (await _deal_reads(db, [deal]))[0]
+
+
+@router.get("/contacts/{contact_id}/purchases", response_model=DealPage)
+async def list_contact_purchases(
+    contact_id: uuid.UUID,
+    context: CurrentUser,
+    db: AsyncSession = Depends(get_session),
+    cursor: str | None = None,
+    limit: int = Query(default=50, ge=1, le=100),
+) -> DealPage:
+    await _ensure_contact(db, context.workspace_id, contact_id)
+    query = (
+        sa.select(Deal)
+        .join(DealContact, DealContact.deal_id == Deal.id)
+        .join(Stage, Stage.id == Deal.stage_id)
+        .where(
+            Deal.workspace_id == context.workspace_id,
+            Deal.deleted_at.is_(None),
+            DealContact.workspace_id == context.workspace_id,
+            DealContact.contact_id == contact_id,
+            Stage.stage_type == StageType.won,
+        )
+    )
+    if (condition := _cursor_condition(Deal, cursor)) is not None:
+        query = query.where(condition)
+    items = list(
+        (
+            await db.scalars(
+                query.order_by(Deal.created_at.desc(), Deal.id.desc()).limit(limit + 1)
+            )
+        ).all()
+    )
+    items, next_cursor = _next_cursor(items, limit)
+    return DealPage(items=await _deal_reads(db, items), next_cursor=next_cursor)
+
+
+@router.get("/deals", response_model=DealPage)
+async def list_deals(
+    context: CurrentUser,
+    db: AsyncSession = Depends(get_session),
+    pipeline_id: uuid.UUID | None = None,
+    stage_id: uuid.UUID | None = None,
+    search: str | None = Query(default=None, max_length=200),
+    cursor: str | None = None,
+    limit: int = Query(default=50, ge=1, le=100),
+) -> DealPage:
+    query = sa.select(Deal).where(
+        Deal.workspace_id == context.workspace_id, Deal.deleted_at.is_(None)
+    )
+    if pipeline_id:
+        query = query.where(Deal.pipeline_id == pipeline_id)
+    if stage_id:
+        query = query.where(Deal.stage_id == stage_id)
+    if search:
+        if db.get_bind().dialect.name == "postgresql":
+            query = query.where(
+                sa.func.to_tsvector(sa.text("'simple'"), sa.func.coalesce(Deal.title, "")).op("@@")(
+                    sa.func.websearch_to_tsquery(sa.text("'simple'"), search.strip())
+                )
+            )
+        else:
+            query = query.where(Deal.title.ilike(f"%{search.strip()}%"))
+    if (condition := _cursor_condition(Deal, cursor)) is not None:
+        query = query.where(condition)
+    items = list(
+        (
+            await db.scalars(
+                query.order_by(Deal.created_at.desc(), Deal.id.desc()).limit(limit + 1)
+            )
+        ).all()
+    )
+    items, next_cursor = _next_cursor(items, limit)
+    return DealPage(items=await _deal_reads(db, items), next_cursor=next_cursor)
+
+
+@router.post("/deals", response_model=DealRead, status_code=status.HTTP_201_CREATED)
+async def create_deal(
+    payload: DealCreate,
+    context: CurrentMutationUser,
+    db: AsyncSession = Depends(get_session),
+) -> DealRead:
+    await _validate_deal_references(db, context.workspace_id, payload)
+    data = payload.model_dump(exclude={"contact_ids"})
+    deal = Deal(workspace_id=context.workspace_id, **data)
+    db.add(deal)
+    await db.flush()
+    db.add_all(
+        [
+            DealContact(
+                workspace_id=context.workspace_id,
+                deal_id=deal.id,
+                contact_id=contact_id,
+                is_primary=index == 0,
+            )
+            for index, contact_id in enumerate(dict.fromkeys(payload.contact_ids))
+        ]
+    )
+    await db.flush()
+    await _sync_purchase_schedule(
+        db,
+        deal=deal,
+        fallback_assignee_id=context.user_id,
+    )
+    db.add(
+        DealStageHistory(
+            workspace_id=context.workspace_id,
+            deal_id=deal.id,
+            to_stage_id=deal.stage_id,
+            actor_id=context.user_id,
+        )
+    )
+    record_domain_event(
+        db,
+        workspace_id=context.workspace_id,
+        event_type="deal.created",
+        entity_type="deal",
+        entity_id=deal.id,
+        actor_id=context.user_id,
+        payload={"pipeline_id": str(deal.pipeline_id), "stage_id": str(deal.stage_id)},
+    )
+    if deal.assignee_id is not None:
+        record_domain_event(
+            db,
+            workspace_id=context.workspace_id,
+            event_type="deal.assigned",
+            entity_type="deal",
+            entity_id=deal.id,
+            actor_id=context.user_id,
+            payload={
+                "assignee_id": str(deal.assignee_id),
+                "pipeline_id": str(deal.pipeline_id),
+                "stage_id": str(deal.stage_id),
+                "source_id": str(deal.source_id) if deal.source_id else None,
+            },
+        )
+    await db.commit()
+    return await _deal_read(db, deal)
+
+
+@router.get("/deals/{deal_id}", response_model=DealRead)
+async def get_deal(
+    deal_id: uuid.UUID, context: CurrentUser, db: AsyncSession = Depends(get_session)
+) -> DealRead:
+    return await _deal_read(db, await _ensure_deal(db, context.workspace_id, deal_id))
+
+
+@router.patch("/deals/{deal_id}", response_model=DealRead)
+async def update_deal(
+    deal_id: uuid.UUID,
+    payload: DealUpdate,
+    context: CurrentMutationUser,
+    db: AsyncSession = Depends(get_session),
+) -> DealRead:
+    if "contact_ids" in payload.model_fields_set:
+        if payload.contact_ids is None:
+            raise HTTPException(status_code=422, detail="contact_ids must be a list")
+        if payload.contact_ids:
+            count = await db.scalar(
+                sa.select(sa.func.count())
+                .select_from(Contact)
+                .where(
+                    Contact.id.in_(set(payload.contact_ids)),
+                    Contact.workspace_id == context.workspace_id,
+                    Contact.deleted_at.is_(None),
+                )
+            )
+            if count != len(set(payload.contact_ids)):
+                raise not_found("contact")
+    if "company_id" in payload.model_fields_set and payload.company_id:
+        await _ensure_company(db, context.workspace_id, payload.company_id)
+    if "assignee_id" in payload.model_fields_set and payload.assignee_id:
+        await _ensure_member(db, context.workspace_id, payload.assignee_id)
+    if (
+        "source_id" in payload.model_fields_set
+        and payload.source_id
+        and not await db.scalar(
+            sa.select(Source.id).where(
+                Source.id == payload.source_id, Source.workspace_id == context.workspace_id
+            )
+        )
+    ):
+        raise not_found("source")
+    values = payload.model_dump(
+        exclude_unset=True,
+        exclude={"expected_version", "contact_ids"},
+    )
+    values.update(
+        version=payload.expected_version + 1,
+        updated_at=datetime.now(UTC),
+        last_activity_at=datetime.now(UTC),
+    )
+    deal = (
+        await db.execute(
+            sa.update(Deal)
+            .where(
+                Deal.id == deal_id,
+                Deal.workspace_id == context.workspace_id,
+                Deal.deleted_at.is_(None),
+                Deal.version == payload.expected_version,
+            )
+            .values(**values)
+            .returning(Deal)
+        )
+    ).scalar_one_or_none()
+    if deal is None:
+        if await db.scalar(
+            sa.select(Deal.id).where(Deal.id == deal_id, Deal.workspace_id == context.workspace_id)
+        ):
+            raise conflict()
+        raise not_found("deal")
+    if "contact_ids" in payload.model_fields_set:
+        await db.execute(
+            sa.delete(DealContact).where(
+                DealContact.deal_id == deal.id,
+                DealContact.workspace_id == context.workspace_id,
+            )
+        )
+        db.add_all(
+            [
+                DealContact(
+                    workspace_id=context.workspace_id,
+                    deal_id=deal.id,
+                    contact_id=contact_id,
+                    is_primary=index == 0,
+                )
+                for index, contact_id in enumerate(dict.fromkeys(payload.contact_ids or []))
+            ]
+        )
+        await db.flush()
+    if {
+        "next_purchase_at",
+        "assignee_id",
+        "contact_ids",
+    } & payload.model_fields_set:
+        await _sync_purchase_schedule(
+            db,
+            deal=deal,
+            fallback_assignee_id=context.user_id,
+        )
+    record_domain_event(
+        db,
+        workspace_id=context.workspace_id,
+        event_type="deal.updated",
+        entity_type="deal",
+        entity_id=deal.id,
+        actor_id=context.user_id,
+        payload={"fields": sorted(payload.model_fields_set - {"expected_version"})},
+    )
+    if "assignee_id" in payload.model_fields_set and deal.assignee_id is not None:
+        record_domain_event(
+            db,
+            workspace_id=context.workspace_id,
+            event_type="deal.assigned",
+            entity_type="deal",
+            entity_id=deal.id,
+            actor_id=context.user_id,
+            payload={
+                "assignee_id": str(deal.assignee_id),
+                "pipeline_id": str(deal.pipeline_id),
+                "stage_id": str(deal.stage_id),
+                "source_id": str(deal.source_id) if deal.source_id else None,
+            },
+        )
+    await db.commit()
+    return await _deal_read(db, deal)
+
+
+def _is_blank(value: Any) -> bool:
+    return value is None or value == "" or value == [] or value == {}
+
+
+@router.patch("/deals/{deal_id}/stage", response_model=DealRead)
+async def transition_deal_stage(
+    deal_id: uuid.UUID,
+    payload: StageTransition,
+    context: CurrentMutationUser,
+    db: AsyncSession = Depends(get_session),
+) -> DealRead:
+    deal = await _ensure_deal(db, context.workspace_id, deal_id)
+    if deal.version != payload.expected_version:
+        raise conflict()
+    target = await db.scalar(
+        sa.select(Stage).where(
+            Stage.id == payload.target_stage_id,
+            Stage.workspace_id == context.workspace_id,
+            Stage.pipeline_id == deal.pipeline_id,
+        )
+    )
+    if target is None:
+        raise HTTPException(status_code=422, detail="target stage does not belong to deal pipeline")
+    required_rows = (
+        await db.execute(
+            sa.select(StageRequiredField, CustomFieldDefinition)
+            .outerjoin(
+                CustomFieldDefinition,
+                CustomFieldDefinition.id == StageRequiredField.field_definition_id,
+            )
+            .where(
+                StageRequiredField.stage_id == target.id,
+                StageRequiredField.workspace_id == context.workspace_id,
+            )
+        )
+    ).all()
+    missing: list[dict[str, str]] = []
+    for requirement, definition in required_rows:
+        if requirement.built_in_key:
+            if requirement.built_in_key == "contact_ids":
+                value = await db.scalar(
+                    sa.select(DealContact.id)
+                    .where(
+                        DealContact.workspace_id == context.workspace_id,
+                        DealContact.deal_id == deal.id,
+                    )
+                    .limit(1)
+                )
+            else:
+                value = getattr(deal, requirement.built_in_key)
+            if _is_blank(value):
+                missing.append({"key": requirement.built_in_key, "name": requirement.built_in_key})
+        elif definition is not None and _is_blank(deal.custom_fields.get(definition.key)):
+            missing.append({"key": definition.key, "name": definition.name})
+    if missing:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail={"code": "missing_required_fields", "fields": missing},
+        )
+    if deal.stage_id == target.id:
+        return await _deal_read(db, deal)
+    old_stage_id = deal.stage_id
+    changed = (
+        await db.execute(
+            sa.update(Deal)
+            .where(
+                Deal.id == deal.id,
+                Deal.workspace_id == context.workspace_id,
+                Deal.version == payload.expected_version,
+            )
+            .values(
+                stage_id=target.id,
+                version=payload.expected_version + 1,
+                updated_at=datetime.now(UTC),
+                last_activity_at=datetime.now(UTC),
+            )
+            .returning(Deal)
+        )
+    ).scalar_one_or_none()
+    if changed is None:
+        raise conflict()
+    db.add(
+        DealStageHistory(
+            workspace_id=context.workspace_id,
+            deal_id=deal.id,
+            from_stage_id=old_stage_id,
+            to_stage_id=target.id,
+            actor_id=context.user_id,
+        )
+    )
+    record_domain_event(
+        db,
+        workspace_id=context.workspace_id,
+        event_type="deal.stage_changed",
+        entity_type="deal",
+        entity_id=deal.id,
+        actor_id=context.user_id,
+        payload={"from_stage_id": str(old_stage_id), "to_stage_id": str(target.id)},
+    )
+    await db.commit()
+    return await _deal_read(db, changed)
+
+
+async def _validate_task_references(
+    db: AsyncSession, workspace_id: uuid.UUID, payload: TaskCreate
+) -> None:
+    await _ensure_member(db, workspace_id, payload.assignee_id)
+    if payload.deal_id:
+        await _ensure_deal(db, workspace_id, payload.deal_id)
+    if payload.contact_id:
+        await _ensure_contact(db, workspace_id, payload.contact_id)
+    if payload.company_id:
+        await _ensure_company(db, workspace_id, payload.company_id)
+
+
+@router.get("/tasks", response_model=TaskPage)
+async def list_tasks(
+    context: CurrentUser,
+    db: AsyncSession = Depends(get_session),
+    task_status: TaskStatus | None = Query(default=None, alias="status"),
+    overdue: bool = False,
+    cursor: str | None = None,
+    limit: int = Query(default=50, ge=1, le=100),
+) -> TaskPage:
+    query = sa.select(Task).where(Task.workspace_id == context.workspace_id)
+    if task_status:
+        query = query.where(Task.status == task_status)
+    if overdue:
+        query = query.where(Task.status == TaskStatus.open, Task.due_at < sa.func.now())
+    if (condition := _cursor_condition(Task, cursor)) is not None:
+        query = query.where(condition)
+    items = list(
+        (
+            await db.scalars(
+                query.order_by(Task.created_at.desc(), Task.id.desc()).limit(limit + 1)
+            )
+        ).all()
+    )
+    items, next_cursor = _next_cursor(items, limit)
+    return TaskPage(
+        items=[TaskRead.model_validate(item) for item in items], next_cursor=next_cursor
+    )
+
+
+@router.post("/tasks", response_model=TaskRead, status_code=status.HTTP_201_CREATED)
+async def create_task(
+    payload: TaskCreate,
+    context: CurrentMutationUser,
+    db: AsyncSession = Depends(get_session),
+) -> Task:
+    await _validate_task_references(db, context.workspace_id, payload)
+    task = Task(workspace_id=context.workspace_id, **payload.model_dump())
+    db.add(task)
+    await db.flush()
+    record_domain_event(
+        db,
+        workspace_id=context.workspace_id,
+        event_type="task.created",
+        entity_type="task",
+        entity_id=task.id,
+        actor_id=context.user_id,
+    )
+    await db.commit()
+    return task
+
+
+@router.patch("/tasks/{task_id}", response_model=TaskRead)
+async def update_task(
+    task_id: uuid.UUID,
+    payload: TaskUpdate,
+    context: CurrentMutationUser,
+    db: AsyncSession = Depends(get_session),
+) -> Task:
+    if payload.assignee_id:
+        await _ensure_member(db, context.workspace_id, payload.assignee_id)
+    values = payload.model_dump(exclude_unset=True, exclude={"expected_version"})
+    if payload.status is TaskStatus.completed:
+        values["completed_at"] = datetime.now(UTC)
+    elif "status" in payload.model_fields_set:
+        values["completed_at"] = None
+    values.update(version=payload.expected_version + 1, updated_at=datetime.now(UTC))
+    task = (
+        await db.execute(
+            sa.update(Task)
+            .where(
+                Task.id == task_id,
+                Task.workspace_id == context.workspace_id,
+                Task.version == payload.expected_version,
+            )
+            .values(**values)
+            .returning(Task)
+        )
+    ).scalar_one_or_none()
+    if task is None:
+        if await db.scalar(
+            sa.select(Task.id).where(Task.id == task_id, Task.workspace_id == context.workspace_id)
+        ):
+            raise conflict()
+        raise not_found("task")
+    record_domain_event(
+        db,
+        workspace_id=context.workspace_id,
+        event_type="task.updated",
+        entity_type="task",
+        entity_id=task.id,
+        actor_id=context.user_id,
+        payload={"fields": sorted(values.keys() - {"updated_at", "version"})},
+    )
+    await db.commit()
+    return task
+
+
+@router.get("/activity", response_model=ActivityPage)
+async def list_activity(
+    context: CurrentUser,
+    db: AsyncSession = Depends(get_session),
+    entity_type: str | None = Query(default=None, max_length=64),
+    entity_id: uuid.UUID | None = None,
+    cursor: str | None = None,
+    limit: int = Query(default=50, ge=1, le=100),
+) -> ActivityPage:
+    query = sa.select(ActivityEvent).where(ActivityEvent.workspace_id == context.workspace_id)
+    if entity_type:
+        query = query.where(ActivityEvent.entity_type == entity_type)
+    if entity_id:
+        query = query.where(ActivityEvent.entity_id == entity_id)
+    decoded = decode_cursor(cursor)
+    if decoded:
+        query = query.where(
+            sa.or_(
+                ActivityEvent.occurred_at < decoded.created_at,
+                sa.and_(
+                    ActivityEvent.occurred_at == decoded.created_at,
+                    ActivityEvent.id < decoded.entity_id,
+                ),
+            )
+        )
+    items = list(
+        (
+            await db.scalars(
+                query.order_by(ActivityEvent.occurred_at.desc(), ActivityEvent.id.desc()).limit(
+                    limit + 1
+                )
+            )
+        ).all()
+    )
+    has_more = len(items) > limit
+    visible = items[:limit]
+    next_cursor = (
+        encode_cursor(visible[-1].occurred_at, visible[-1].id) if has_more and visible else None
+    )
+    return ActivityPage(
+        items=[ActivityRead.model_validate(item) for item in visible],
+        next_cursor=next_cursor,
+    )
+
+
+async def _create_note(
+    db: AsyncSession,
+    *,
+    workspace_id: uuid.UUID,
+    actor_id: uuid.UUID,
+    entity_type: str,
+    entity_id: uuid.UUID,
+    body: str,
+) -> ActivityEvent:
+    activity = record_domain_event(
+        db,
+        workspace_id=workspace_id,
+        event_type=f"{entity_type}.note.created",
+        entity_type=entity_type,
+        entity_id=entity_id,
+        actor_id=actor_id,
+        payload={"body": body.strip()},
+    )
+    await db.commit()
+    return activity
+
+
+@router.post(
+    "/deals/{deal_id}/notes",
+    response_model=ActivityRead,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_deal_note(
+    deal_id: uuid.UUID,
+    payload: NoteCreate,
+    context: CurrentMutationUser,
+    db: AsyncSession = Depends(get_session),
+) -> ActivityEvent:
+    await _ensure_deal(db, context.workspace_id, deal_id)
+    return await _create_note(
+        db,
+        workspace_id=context.workspace_id,
+        actor_id=context.user_id,
+        entity_type="deal",
+        entity_id=deal_id,
+        body=payload.body,
+    )
+
+
+@router.post(
+    "/contacts/{contact_id}/notes",
+    response_model=ActivityRead,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_contact_note(
+    contact_id: uuid.UUID,
+    payload: NoteCreate,
+    context: CurrentMutationUser,
+    db: AsyncSession = Depends(get_session),
+) -> ActivityEvent:
+    await _ensure_contact(db, context.workspace_id, contact_id)
+    return await _create_note(
+        db,
+        workspace_id=context.workspace_id,
+        actor_id=context.user_id,
+        entity_type="contact",
+        entity_id=contact_id,
+        body=payload.body,
+    )
+
+
+@router.post(
+    "/companies/{company_id}/notes",
+    response_model=ActivityRead,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_company_note(
+    company_id: uuid.UUID,
+    payload: NoteCreate,
+    context: CurrentMutationUser,
+    db: AsyncSession = Depends(get_session),
+) -> ActivityEvent:
+    await _ensure_company(db, context.workspace_id, company_id)
+    return await _create_note(
+        db,
+        workspace_id=context.workspace_id,
+        actor_id=context.user_id,
+        entity_type="company",
+        entity_id=company_id,
+        body=payload.body,
+    )

@@ -1,0 +1,101 @@
+name: pulse-crm
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-pulse}
+      POSTGRES_USER: ${POSTGRES_USER:-pulse}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-pulse-local-password}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-pulse-local}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-pulse-local-minio-password}
+    ports:
+      - "${MINIO_API_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  minio-init:
+    image: minio/mc:latest
+    restart: "no"
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-pulse-local}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-pulse-local-minio-password}
+      MINIO_BUCKET: ${PULSE_S3_BUCKET:-pulse-local}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        mc alias set local http://minio:9000 "$${MINIO_ROOT_USER}" "$${MINIO_ROOT_PASSWORD}"
+        && mc mb --ignore-existing "local/$${MINIO_BUCKET}"
+        && mc anonymous set none "local/$${MINIO_BUCKET}"
+
+  mailpit:
+    image: axllent/mailpit:latest
+    restart: unless-stopped
+    ports:
+      - "${MAILPIT_SMTP_PORT:-1025}:1025"
+      - "${MAILPIT_WEB_PORT:-8025}:8025"
+
+  webapp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      PULSE_ENVIRONMENT: ${PULSE_ENVIRONMENT:-development}
+      PULSE_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-pulse}:${POSTGRES_PASSWORD:-pulse-local-password}@postgres:5432/${POSTGRES_DB:-pulse}
+      PULSE_SECRET_KEY: ${PULSE_SECRET_KEY:-development-only-change-this-secret-key}
+      PULSE_BOOTSTRAP_TOKEN: ${PULSE_BOOTSTRAP_TOKEN:-development-bootstrap-token-change-this}
+      PULSE_COOKIE_SECURE: ${PULSE_COOKIE_SECURE:-false}
+      PULSE_SESSION_TTL_HOURS: ${PULSE_SESSION_TTL_HOURS:-168}
+      PULSE_JOB_RUNNER_ENABLED: ${PULSE_JOB_RUNNER_ENABLED:-true}
+      PULSE_JOB_RUNNER_POLL_SECONDS: ${PULSE_JOB_RUNNER_POLL_SECONDS:-1}
+      PULSE_JOB_RUNNER_HEARTBEAT_TIMEOUT_SECONDS: ${PULSE_JOB_RUNNER_HEARTBEAT_TIMEOUT_SECONDS:-30}
+      PULSE_INTEGRATION_ENCRYPTION_KEY: ${PULSE_INTEGRATION_ENCRYPTION_KEY:-ZGV2ZWxvcG1lbnQtb25seS0zMi1ieXRlLWtleSEhISE=}
+      PULSE_INTEGRATION_ENCRYPTION_KEY_ID: ${PULSE_INTEGRATION_ENCRYPTION_KEY_ID:-primary}
+      PULSE_ALLOWED_HOSTS: '${PULSE_ALLOWED_HOSTS:-["localhost","127.0.0.1"]}'
+      PULSE_STATIC_DIR: /app/backend/static
+      PULSE_RUN_MIGRATIONS: ${PULSE_RUN_MIGRATIONS:-true}
+      PULSE_S3_ENDPOINT_URL: http://minio:9000
+      PULSE_S3_REGION: ${PULSE_S3_REGION:-ru-1}
+      PULSE_S3_BUCKET: ${PULSE_S3_BUCKET:-pulse-local}
+      PULSE_S3_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-pulse-local}
+      PULSE_S3_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-pulse-local-minio-password}
+      PORT: 8000
+    ports:
+      - "${PULSE_PORT:-8000}:8000"
+
+volumes:
+  postgres-data:
+  minio-data:

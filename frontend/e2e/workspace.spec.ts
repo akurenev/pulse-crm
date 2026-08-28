@@ -1,0 +1,70 @@
+import { expect, test } from "@playwright/test";
+
+test("creates a contact and switches to companies", async ({ page }) => {
+  await page.goto("/contacts");
+  await page.getByRole("button", { name: "Новый контакт" }).click();
+  const dialog = page.getByRole("dialog", { name: "Новый контакт" });
+  await dialog.getByLabel("Имя").fill("Мария");
+  await dialog.getByLabel("Фамилия").fill("Орлова");
+  await dialog.getByLabel("Email").fill("maria@example.ru");
+  await dialog.getByLabel("Телефон").fill("+7 999 555-44-33");
+  await dialog.getByRole("button", { name: "Сохранить" }).click();
+  await expect(page.getByText("Мария Орлова", { exact: true })).toBeVisible();
+
+  await page.getByRole("button", { name: "Компании" }).click();
+  await expect(page.getByRole("region", { name: "Список компаний" })).toBeVisible();
+});
+
+test("creates and completes a task", async ({ page }) => {
+  await page.goto("/tasks");
+  await page.getByRole("button", { name: "Новая задача" }).click();
+  const dialog = page.getByRole("dialog", { name: "Новая задача" });
+  await dialog.getByLabel("Название").fill("Проверить договор");
+  await dialog.getByLabel("Срок").fill("2030-09-01T12:30");
+  await dialog.getByRole("button", { name: "Создать задачу" }).click();
+  const task = page.getByRole("button", { name: /Проверить договор/ });
+  await expect(task).toBeVisible();
+  await task.click();
+  await expect(task).toHaveClass(/task-table-row--done/);
+});
+
+test("creates a disabled client notification rule with recorded consent", async ({ page }) => {
+  await page.goto("/settings");
+  await page.getByRole("tab", { name: /Оповещения/ }).click();
+  await page.getByRole("button", { name: "Новое правило" }).click();
+  const editor = page.locator(".settings-editor");
+  await editor.getByLabel("Название правила").fill("Повторная покупка — Анне");
+  await editor.getByLabel("Получатель").selectOption("client");
+  await editor.getByLabel("Клиент", { exact: true }).selectOption("c-1");
+  await editor.getByLabel("Основание согласия").fill("Checkbox формы заказа, 28.08.2026");
+  await editor.getByLabel(/Подтверждаю, что согласие/).check();
+  await editor.getByRole("button", { name: "Создать правило" }).click();
+  const rule = page.getByText("Повторная покупка — Анне", { exact: true });
+  await expect(rule).toBeVisible();
+  await expect(page.getByRole("button", { name: "Включить правило Повторная покупка — Анне" })).toHaveAttribute("aria-pressed", "false");
+});
+
+test("creates a deal field and makes it required for a pipeline stage", async ({ page }) => {
+  await page.goto("/settings");
+  await page.getByRole("button", { name: "Новое поле сделки" }).click();
+  let editor = page.locator(".settings-editor");
+  await editor.getByLabel("Название").fill("Причина обращения");
+  await editor.getByLabel("Системный ключ").fill("request_reason");
+  await editor.getByLabel("Тип").selectOption("select");
+  await editor.getByLabel("Варианты списка").fill("Повторная покупка\nРекомендация");
+  await editor.getByRole("button", { name: "Создать поле" }).click();
+  await expect(page.getByText("Причина обращения", { exact: true })).toBeVisible();
+
+  const stage = page.getByRole("button", { name: "Обязательные поля этапа Новый лид" });
+  await stage.click();
+  editor = page.locator(".settings-editor");
+  await editor.getByLabel(/^Название/).check();
+  await editor.getByLabel(/^Причина обращения/).check();
+  await editor.getByRole("button", { name: "Сохранить обязательность" }).click();
+  await expect(stage).toContainText("2 обязательных полей");
+
+  await stage.click();
+  editor = page.locator(".settings-editor");
+  await expect(editor.getByLabel(/^Название/)).toBeChecked();
+  await expect(editor.getByLabel(/^Причина обращения/)).toBeChecked();
+});

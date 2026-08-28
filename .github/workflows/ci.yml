@@ -1,0 +1,158 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Backend
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: pulse_test
+          POSTGRES_USER: pulse
+          POSTGRES_PASSWORD: pulse-test-password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U pulse -d pulse_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      PULSE_ENVIRONMENT: test
+      PULSE_DATABASE_URL: postgresql+psycopg://pulse:pulse-test-password@127.0.0.1:5432/pulse_test
+      PULSE_SECRET_KEY: ci-only-secret-key-with-at-least-32-characters
+      PULSE_BOOTSTRAP_TOKEN: ci-only-bootstrap-token-with-at-least-32-characters
+      PULSE_COOKIE_SECURE: "false"
+      PULSE_JOB_RUNNER_ENABLED: "false"
+      PULSE_ALLOWED_HOSTS: '["localhost","127.0.0.1","testserver"]'
+      PULSE_TEST_S3_ENDPOINT: http://127.0.0.1:9000
+      PULSE_TEST_S3_ACCESS_KEY_ID: pulse-ci
+      PULSE_TEST_S3_SECRET_ACCESS_KEY: pulse-ci-secret-password
+      PULSE_TEST_S3_BUCKET: pulse-ci
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: backend/pyproject.toml
+      - name: Install backend dependencies
+        run: python -m pip install -e "backend[dev]"
+      - name: Start S3-compatible MinIO
+        run: |
+          docker run --detach --name pulse-ci-minio \
+            --publish 9000:9000 \
+            --env MINIO_ROOT_USER=pulse-ci \
+            --env MINIO_ROOT_PASSWORD=pulse-ci-secret-password \
+            minio/minio:latest server /data
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:9000/minio/health/live >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs pulse-ci-minio
+          exit 1
+      - name: Lint
+        run: ruff check backend/app backend/tests
+      - name: Type check
+        run: mypy backend/app
+      - name: Apply migrations
+        run: alembic -c backend/alembic.ini upgrade head
+      - name: Check migration head
+        run: alembic -c backend/alembic.ini check
+      - name: Test
+        run: python -m pytest backend/tests
+
+  frontend:
+    name: Frontend
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install frontend dependencies
+        run: npm ci
+      - name: Lint
+        run: npm run lint
+      - name: Type check
+        run: npm run typecheck
+      - name: Unit tests
+        run: npm run test
+      - name: Build
+        run: npm run build
+
+  e2e:
+    name: Browser smoke test
+    runs-on: ubuntu-latest
+    needs:
+      - frontend
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install frontend dependencies
+        run: npm ci
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+      - name: Build
+        run: npm run build
+      - name: End-to-end tests
+        env:
+          PLAYWRIGHT_BASE_URL: http://127.0.0.1:4173
+        run: npm run test:e2e
+      - name: Upload Playwright report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: frontend/playwright-report/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  container:
+    name: Production image
+    runs-on: ubuntu-latest
+    needs:
+      - backend
+      - frontend
+      - e2e
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build production image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          push: false
+          tags: pulse-crm:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
