@@ -243,6 +243,7 @@ class Stage(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     stage_type: Mapped[StageType] = mapped_column(
         sa.Enum(StageType, native_enum=False), default=StageType.open, nullable=False
     )
+    version: Mapped[int] = mapped_column(sa.Integer, default=1, nullable=False)
 
 
 class Source(UUIDPrimaryKeyMixin, TimestampMixin, Base):

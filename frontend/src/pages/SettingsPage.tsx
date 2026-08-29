@@ -15,12 +15,14 @@ import {
   Mail,
   MessageCircle,
   Pause,
+  Pencil,
   Play,
   Plus,
   RefreshCcw,
   RotateCcw,
   Settings2,
   ShieldCheck,
+  Trash2,
   Upload,
   UserPlus,
   Users,
@@ -129,21 +131,106 @@ export default function SettingsPage() {
   );
 }
 
+type PipelineManagementEditor =
+  | { kind: "rename-pipeline"; pipeline: ApiPipeline }
+  | { kind: "add-stage"; pipeline: ApiPipeline }
+  | { kind: "rename-stage"; pipeline: ApiPipeline; stage: ApiStage };
+
 function PipelinesPanel({ currentPipeline, dealsCount }: { currentPipeline: Pipeline; dealsCount: number }) {
   const [editor, setEditor] = useState<"pipeline" | "custom-field" | null>(null);
+  const [managementEditor, setManagementEditor] = useState<PipelineManagementEditor | null>(null);
   const [selectedStage, setSelectedStage] = useState<{ pipelineName: string; stage: ApiStage } | null>(null);
   const [localPipelines, setLocalPipelines] = useState<ApiPipeline[]>([pipelineToApi(currentPipeline)]);
   const [localCustomFields, setLocalCustomFields] = useState<ApiCustomField[]>(demoDealFields);
   const [requiredByStage, setRequiredByStage] = useState<Record<string, ApiRequiredField[]>>({});
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [actionError, setActionError] = useState("");
   const pipelinesQuery = useQuery({ queryKey: ["settings", "pipelines"], queryFn: () => api.get<ApiPipeline[]>("/pipelines"), enabled: remoteEnabled });
   const customFieldsQuery = useQuery({ queryKey: ["settings", "custom-fields", "deal"], queryFn: () => api.get<ApiCustomField[]>("/custom-fields?entity_type=deal"), enabled: remoteEnabled });
   const pipelines = remoteEnabled ? pipelinesQuery.data ?? [] : localPipelines;
   const customFields = remoteEnabled ? customFieldsQuery.data ?? [] : localCustomFields;
 
+  async function handleMutationConflict(reason: unknown, fallback: string) {
+    if (remoteEnabled) await pipelinesQuery.refetch();
+    window.dispatchEvent(new Event("pulse:refresh"));
+    setManagementEditor(null);
+    setActionError(errorMessage(reason, fallback));
+  }
+
   async function created(createdPipeline: ApiPipeline) {
     if (remoteEnabled) await pipelinesQuery.refetch();
     else setLocalPipelines((items) => [...items, createdPipeline]);
+    window.dispatchEvent(new Event("pulse:refresh"));
     setEditor(null);
+  }
+
+  async function pipelineRenamed(updatedPipeline: ApiPipeline) {
+    if (remoteEnabled) await pipelinesQuery.refetch();
+    else setLocalPipelines((items) => items.map((item) => item.id === updatedPipeline.id ? updatedPipeline : item));
+    window.dispatchEvent(new Event("pulse:refresh"));
+    setManagementEditor(null);
+  }
+
+  async function stageSaved(pipelineId: string, savedStage: ApiStage, creating: boolean) {
+    if (remoteEnabled) {
+      await pipelinesQuery.refetch();
+    } else {
+      setLocalPipelines((items) => items.map((item) => {
+        if (item.id !== pipelineId) return item;
+        const stages = creating ? [...item.stages, savedStage] : item.stages.map((stage) => stage.id === savedStage.id ? savedStage : stage);
+        return { ...item, stages: normalizeDemoStages(stages) };
+      }));
+    }
+    window.dispatchEvent(new Event("pulse:refresh"));
+    setManagementEditor(null);
+  }
+
+  async function deleteStage(pipeline: ApiPipeline, stage: ApiStage) {
+    if (!window.confirm(`Удалить этап «${stage.name}»? Сделки на этом этапе могут помешать удалению.`)) return;
+    setDeletingId(stage.id);
+    setActionError("");
+    try {
+      if (remoteEnabled) {
+        await api.delete(`/stages/${stage.id}?expected_version=${stage.version}`);
+        await pipelinesQuery.refetch();
+      } else {
+        setLocalPipelines((items) => items.map((item) => item.id === pipeline.id ? { ...item, stages: normalizeDemoStages(item.stages.filter((itemStage) => itemStage.id !== stage.id)) } : item));
+      }
+      setRequiredByStage((current) => {
+        const next = { ...current };
+        delete next[stage.id];
+        return next;
+      });
+      if (selectedStage?.stage.id === stage.id) setSelectedStage(null);
+      window.dispatchEvent(new Event("pulse:refresh"));
+    } catch (reason) {
+      if (reason instanceof ApiError && reason.status === 409) await handleMutationConflict(reason, "Не удалось удалить этап. Перенесите сделки на другой этап и повторите.");
+      else setActionError(errorMessage(reason, "Не удалось удалить этап. Перенесите сделки на другой этап и повторите."));
+    } finally {
+      setDeletingId(null);
+    }
+  }
+
+  async function deletePipeline(pipeline: ApiPipeline) {
+    if (!window.confirm(`Удалить воронку «${pipeline.name}» вместе с её этапами? Действие нельзя отменить.`)) return;
+    setDeletingId(pipeline.id);
+    setActionError("");
+    try {
+      if (remoteEnabled) {
+        await api.delete(`/pipelines/${pipeline.id}?expected_version=${pipeline.version}`);
+        await pipelinesQuery.refetch();
+      } else {
+        setLocalPipelines((items) => items.filter((item) => item.id !== pipeline.id));
+      }
+      setManagementEditor(null);
+      if (selectedStage?.stage.pipeline_id === pipeline.id) setSelectedStage(null);
+      window.dispatchEvent(new Event("pulse:refresh"));
+    } catch (reason) {
+      if (reason instanceof ApiError && reason.status === 409) await handleMutationConflict(reason, "Не удалось удалить воронку. Сначала перенесите или удалите связанные сделки.");
+      else setActionError(errorMessage(reason, "Не удалось удалить воронку. Сначала перенесите или удалите связанные сделки."));
+    } finally {
+      setDeletingId(null);
+    }
   }
 
   async function customFieldCreated(createdField: ApiCustomField) {
@@ -159,13 +246,17 @@ function PipelinesPanel({ currentPipeline, dealsCount }: { currentPipeline: Pipe
 
   return (
     <>
-      <SettingsHeading title="Воронки и обязательные поля" action="Новая воронка" onAction={() => { setSelectedStage(null); setEditor((value) => value === "pipeline" ? null : "pipeline"); }} />
+      <SettingsHeading title="Воронки и обязательные поля" action="Новая воронка" onAction={() => { setManagementEditor(null); setSelectedStage(null); setActionError(""); setEditor((value) => value === "pipeline" ? null : "pipeline"); }} />
       <div className="settings-quick-actions" aria-label="Настройка полей сделки">
-        <Button compact onClick={() => { setSelectedStage(null); setEditor((value) => value === "custom-field" ? null : "custom-field"); }}><Plus size={15} /> Новое поле сделки</Button>
+        <Button compact onClick={() => { setManagementEditor(null); setSelectedStage(null); setActionError(""); setEditor((value) => value === "custom-field" ? null : "custom-field"); }}><Plus size={15} /> Новое поле сделки</Button>
       </div>
       {editor === "pipeline" ? <PipelineEditor position={pipelines.length} onCancel={() => setEditor(null)} onCreated={created} /> : null}
       {editor === "custom-field" ? <CustomFieldEditor onCancel={() => setEditor(null)} onCreated={customFieldCreated} /> : null}
+      {managementEditor?.kind === "rename-pipeline" ? <RenamePipelineEditor pipeline={managementEditor.pipeline} onCancel={() => setManagementEditor(null)} onConflict={(reason) => handleMutationConflict(reason, "Воронка уже изменена другим пользователем. Данные обновлены — повторите действие.")} onSaved={pipelineRenamed} /> : null}
+      {managementEditor?.kind === "add-stage" ? <StageEditor mode="create" pipeline={managementEditor.pipeline} onCancel={() => setManagementEditor(null)} onConflict={(reason) => handleMutationConflict(reason, "Состав воронки изменился. Данные обновлены — повторите добавление этапа.")} onSaved={(stage) => stageSaved(managementEditor.pipeline.id, stage, true)} /> : null}
+      {managementEditor?.kind === "rename-stage" ? <StageEditor mode="rename" pipeline={managementEditor.pipeline} stage={managementEditor.stage} onCancel={() => setManagementEditor(null)} onConflict={(reason) => handleMutationConflict(reason, "Этап уже изменён другим пользователем. Данные обновлены — повторите действие.")} onSaved={(stage) => stageSaved(managementEditor.pipeline.id, stage, false)} /> : null}
       {selectedStage ? <RequiredFieldsEditor pipelineName={selectedStage.pipelineName} stage={selectedStage.stage} customFields={customFields} demoFields={requiredByStage[selectedStage.stage.id] ?? []} onCancel={() => setSelectedStage(null)} onSaved={requiredFieldsSaved} /> : null}
+      {actionError ? <SettingsNotice tone="error">{actionError}</SettingsNotice> : null}
       {pipelinesQuery.isError ? <SettingsNotice tone="error">Не удалось загрузить список воронок.</SettingsNotice> : null}
       {customFieldsQuery.isError ? <SettingsNotice tone="error">Не удалось загрузить пользовательские поля сделок.</SettingsNotice> : null}
       <section className="settings-field-catalog" aria-label="Поля сделок">
@@ -178,12 +269,12 @@ function PipelinesPanel({ currentPipeline, dealsCount }: { currentPipeline: Pipe
       </section>
       {pipelines.map((pipeline) => (
         <section className="settings-section" key={pipeline.id}>
-          <header><div><strong>{pipeline.name}</strong><span>{pipeline.stages.length} этапов · {pipeline.id === currentPipeline.id ? `${dealsCount} активных сделок` : "активная воронка"}</span></div><ChevronRight size={20} /></header>
+          <header><div><strong>{pipeline.name}</strong><span>{pipeline.stages.length} этапов · {pipeline.id === currentPipeline.id ? `${dealsCount} активных сделок` : "активная воронка"}</span></div><div className="pipeline-management"><button type="button" className="icon-button" aria-label={`Переименовать воронку ${pipeline.name}`} title="Переименовать воронку" onClick={() => { setEditor(null); setSelectedStage(null); setActionError(""); setManagementEditor({ kind: "rename-pipeline", pipeline }); }}><Pencil size={16} /></button><button type="button" className="icon-button" aria-label={`Добавить этап в воронку ${pipeline.name}`} title="Добавить этап" onClick={() => { setEditor(null); setSelectedStage(null); setActionError(""); setManagementEditor({ kind: "add-stage", pipeline }); }}><Plus size={17} /></button><button type="button" className="icon-button pipeline-management__delete" aria-label={`Удалить воронку ${pipeline.name}`} title="Удалить воронку" disabled={deletingId === pipeline.id} onClick={() => void deletePipeline(pipeline)}><Trash2 size={16} /></button></div></header>
           <div className="stage-settings">
             {pipeline.stages.map((stage, index) => {
               const savedFields = requiredByStage[stage.id];
               const summary = savedFields ? savedFields.length ? `${savedFields.length} обязательных полей` : "Обязательные поля не выбраны" : "Настроить обязательные поля";
-              return <button type="button" key={stage.id} aria-label={`Обязательные поля этапа ${stage.name}`} disabled={remoteEnabled && (customFieldsQuery.isLoading || customFieldsQuery.isError)} onClick={() => { setEditor(null); setSelectedStage({ pipelineName: pipeline.name, stage }); }}><i className="stage-dot" style={{ backgroundColor: stage.color }} /><span>{index + 1}</span><strong>{stage.name}</strong><small>{customFieldsQuery.isLoading && remoteEnabled ? "Загружаем поля…" : summary}</small><ChevronRight size={16} aria-hidden="true" /></button>;
+              return <div className="stage-setting-row" key={stage.id}><button type="button" className="stage-setting-main" aria-label={`Обязательные поля этапа ${stage.name}`} disabled={remoteEnabled && (customFieldsQuery.isLoading || customFieldsQuery.isError)} onClick={() => { setEditor(null); setManagementEditor(null); setActionError(""); setSelectedStage({ pipelineName: pipeline.name, stage }); }}><i className="stage-dot" style={{ backgroundColor: stage.color }} /><span>{index + 1}</span><strong>{stage.name}</strong><small>{customFieldsQuery.isLoading && remoteEnabled ? "Загружаем поля…" : summary}</small><ChevronRight size={16} aria-hidden="true" /></button><div className="stage-setting-actions"><button type="button" className="icon-button" aria-label={`Переименовать этап ${stage.name}`} title="Переименовать этап" onClick={() => { setEditor(null); setSelectedStage(null); setActionError(""); setManagementEditor({ kind: "rename-stage", pipeline, stage }); }}><Pencil size={15} /></button>{stage.stage_type === "open" ? <button type="button" className="icon-button stage-setting-actions__delete" aria-label={`Удалить этап ${stage.name}`} title="Удалить этап" disabled={deletingId === stage.id} onClick={() => void deleteStage(pipeline, stage)}><Trash2 size={15} /></button> : null}</div></div>;
             })}
           </div>
         </section>
@@ -227,6 +318,91 @@ function PipelineEditor({ position, onCancel, onCreated }: { position: number; o
         <p className="settings-form-help">Будут созданы три рабочих этапа, а также системные этапы успешного и неуспешного закрытия.</p>
         {error ? <p className="form-error" role="alert">{error}</p> : null}
         <EditorActions saving={saving} onCancel={onCancel} submitLabel="Создать воронку" />
+      </form>
+    </SettingsEditor>
+  );
+}
+
+function RenamePipelineEditor({ pipeline, onCancel, onConflict, onSaved }: { pipeline: ApiPipeline; onCancel: () => void; onConflict: (reason: unknown) => void | Promise<void>; onSaved: (pipeline: ApiPipeline) => void | Promise<void> }) {
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const data = new FormData(event.currentTarget);
+    const name = String(data.get("name")).trim();
+    setSaving(true);
+    setError("");
+    try {
+      const updated = remoteEnabled
+        ? await api.patch<ApiPipeline>(`/pipelines/${pipeline.id}`, { name, expected_version: pipeline.version })
+        : { ...pipeline, name, version: pipeline.version + 1 };
+      await onSaved(updated);
+    } catch (reason) {
+      if (reason instanceof ApiError && reason.status === 409) await onConflict(reason);
+      else setError(errorMessage(reason, "Не удалось переименовать воронку. Проверьте уникальность названия и обновите страницу."));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <SettingsEditor title={`Переименовать · ${pipeline.name}`} icon={<Pencil size={18} />} onCancel={onCancel}>
+      <form onSubmit={(event) => void submit(event)}>
+        <div className="settings-form-grid"><label className="field"><span>Название воронки</span><input name="name" required maxLength={160} defaultValue={pipeline.name} autoFocus /></label></div>
+        {error ? <p className="form-error" role="alert">{error}</p> : null}
+        <EditorActions saving={saving} onCancel={onCancel} submitLabel="Сохранить название" />
+      </form>
+    </SettingsEditor>
+  );
+}
+
+type StageEditorProps =
+  | { mode: "create"; pipeline: ApiPipeline; onCancel: () => void; onConflict: (reason: unknown) => void | Promise<void>; onSaved: (stage: ApiStage) => void | Promise<void> }
+  | { mode: "rename"; pipeline: ApiPipeline; stage: ApiStage; onCancel: () => void; onConflict: (reason: unknown) => void | Promise<void>; onSaved: (stage: ApiStage) => void | Promise<void> };
+
+function StageEditor(props: StageEditorProps) {
+  const stage = props.mode === "rename" ? props.stage : null;
+  const [color, setColor] = useState(stage?.color ?? "#4B96F8");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const data = new FormData(event.currentTarget);
+    const name = String(data.get("name")).trim();
+    setSaving(true);
+    setError("");
+    try {
+      let saved: ApiStage;
+      if (props.mode === "create") {
+        saved = remoteEnabled
+          ? await api.post<ApiStage>(`/pipelines/${props.pipeline.id}/stages`, { name, color, stage_type: "open" })
+          : demoStage(props.pipeline, name, color);
+      } else {
+        saved = remoteEnabled
+          ? await api.patch<ApiStage>(`/stages/${props.stage.id}`, { name, color, expected_version: props.stage.version })
+          : { ...props.stage, name, color, version: props.stage.version + 1 };
+      }
+      await props.onSaved(saved);
+    } catch (reason) {
+      if (reason instanceof ApiError && reason.status === 409) await props.onConflict(reason);
+      else setError(errorMessage(reason, props.mode === "create" ? "Не удалось добавить этап. Проверьте название и повторите." : "Не удалось изменить этап. Обновите страницу и повторите."));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <SettingsEditor title={props.mode === "create" ? `Новый этап · ${props.pipeline.name}` : `Изменить этап · ${stage?.name}`} icon={props.mode === "create" ? <Plus size={19} /> : <Pencil size={18} />} onCancel={props.onCancel}>
+      <form onSubmit={(event) => void submit(event)}>
+        <div className="settings-form-grid">
+          <label className="field"><span>Название этапа</span><input name="name" required maxLength={120} defaultValue={stage?.name ?? ""} placeholder="Например, Согласование" autoFocus /></label>
+          <label className="field stage-color-field"><span>Цвет этапа</span><span><input aria-label="Цвет этапа" name="color" type="color" value={color} onChange={(event) => setColor(event.target.value.toUpperCase())} /><code>{color}</code></span></label>
+        </div>
+        <p className="settings-form-help">Новый этап добавляется в конец рабочих этапов перед успешным и неуспешным закрытием.</p>
+        {error ? <p className="form-error" role="alert">{error}</p> : null}
+        <EditorActions saving={saving} onCancel={props.onCancel} submitLabel={props.mode === "create" ? "Добавить этап" : "Сохранить этап"} />
       </form>
     </SettingsEditor>
   );
@@ -882,7 +1058,21 @@ function errorMessage(reason: unknown, fallback: string): string {
   if (details && typeof details === "object" && "detail" in details) {
     const detail = (details as { detail?: unknown }).detail;
     if (typeof detail === "string") return detail;
-    if (detail && typeof detail === "object" && "message" in detail && typeof (detail as { message?: unknown }).message === "string") return (detail as { message: string }).message;
+    if (detail && typeof detail === "object") {
+      const code = "code" in detail && typeof (detail as { code?: unknown }).code === "string" ? (detail as { code: string }).code : "";
+      const friendlyMessages: Record<string, string> = {
+        version_conflict: "Запись уже изменена другим пользователем. Данные обновлены — повторите действие.",
+        pipeline_name_conflict: "Воронка с таким названием уже существует.",
+        pipeline_stage_limit: "В одной воронке может быть не более 50 этапов.",
+        stage_not_open: "Удалять можно только рабочие этапы.",
+        stage_in_use: "Этап используется сделками или настройками. Сначала перенесите связанные данные.",
+        last_open_stage: "В воронке должен остаться хотя бы один рабочий этап.",
+        last_active_pipeline: "Нельзя удалить последнюю активную воронку.",
+        pipeline_in_use: "Воронка используется сделками или интеграциями. Сначала перенесите связанные данные.",
+      };
+      if (friendlyMessages[code]) return friendlyMessages[code];
+      if ("message" in detail && typeof (detail as { message?: unknown }).message === "string") return (detail as { message: string }).message;
+    }
   }
   return fallback;
 }
@@ -897,8 +1087,10 @@ function demoTemplate(name: string, channel: ApiNotificationChannel, body: strin
 function demoCustomField(payload: { entity_type: "deal"; key: string; name: string; field_type: ApiCustomFieldType; options: string[] }): ApiCustomField { return { id: crypto.randomUUID(), is_active: true, ...payload }; }
 function demoRequiredFields(fields: Array<{ built_in_key: string } | { field_definition_id: string }>): ApiRequiredField[] { return fields.map((field) => ({ id: crypto.randomUUID(), built_in_key: "built_in_key" in field ? field.built_in_key : null, field_definition_id: "field_definition_id" in field ? field.field_definition_id : null })); }
 function demoImport(entityType: string, dryRun: boolean, userMapping: Record<string, string>): ApiImportJob { const now = new Date().toISOString(); return { id: crypto.randomUUID(), provider: "amocrm", status: "running", dry_run: dryRun, entity_type: entityType, cursor: {}, user_mapping: userMapping, counts: {}, report_object_key: null, started_at: now, completed_at: null, last_error: null, version: 1, created_at: now, updated_at: now }; }
-function pipelineToApi(pipeline: Pipeline): ApiPipeline { return { id: pipeline.id, name: pipeline.name, position: 0, is_active: true, version: 1, stages: pipeline.stages.map((stage, position) => ({ id: stage.id, pipeline_id: pipeline.id, name: stage.name, color: stage.color === "blue" ? "#4B96F8" : stage.color === "violet" ? "#6D5DF7" : stage.color === "green" ? "#20B878" : "#F5A313", position, stage_type: stage.stageType ?? "open" })) }; }
-function demoPipeline(name: string, position: number): ApiPipeline { const id = crypto.randomUUID(); const stages = [{ name: "Новый лид", color: "#4B96F8", stage_type: "open" as const }, { name: "Связались", color: "#6D5DF7", stage_type: "open" as const }, { name: "Предложение", color: "#20B878", stage_type: "open" as const }, { name: "Успешно реализовано", color: "#16A36D", stage_type: "won" as const }, { name: "Закрыто и не реализовано", color: "#929AAA", stage_type: "lost" as const }]; return { id, name, position, is_active: true, version: 1, stages: stages.map((stage, stagePosition) => ({ id: crypto.randomUUID(), pipeline_id: id, position: stagePosition, ...stage })) }; }
+function demoStage(pipeline: ApiPipeline, name: string, color: string): ApiStage { return { id: crypto.randomUUID(), pipeline_id: pipeline.id, name, color, position: pipeline.stages.filter((stage) => stage.stage_type === "open").length, stage_type: "open", version: 1 }; }
+function normalizeDemoStages(stages: ApiStage[]): ApiStage[] { return [...stages.filter((stage) => stage.stage_type === "open"), ...stages.filter((stage) => stage.stage_type !== "open")].map((stage, position) => ({ ...stage, position })); }
+function pipelineToApi(pipeline: Pipeline): ApiPipeline { return { id: pipeline.id, name: pipeline.name, position: 0, is_active: true, version: 1, stages: pipeline.stages.map((stage, position) => ({ id: stage.id, pipeline_id: pipeline.id, name: stage.name, color: stage.color === "blue" ? "#4B96F8" : stage.color === "violet" ? "#6D5DF7" : stage.color === "green" ? "#20B878" : "#F5A313", position, stage_type: stage.stageType ?? "open", version: 1 })) }; }
+function demoPipeline(name: string, position: number): ApiPipeline { const id = crypto.randomUUID(); const stages = [{ name: "Новый лид", color: "#4B96F8", stage_type: "open" as const }, { name: "Связались", color: "#6D5DF7", stage_type: "open" as const }, { name: "Предложение", color: "#20B878", stage_type: "open" as const }, { name: "Успешно реализовано", color: "#16A36D", stage_type: "won" as const }, { name: "Закрыто и не реализовано", color: "#929AAA", stage_type: "lost" as const }]; return { id, name, position, is_active: true, version: 1, stages: stages.map((stage, stagePosition) => ({ id: crypto.randomUUID(), pipeline_id: id, position: stagePosition, version: 1, ...stage })) }; }
 function countSummary(counts: Record<string, number>): string { const total = Object.values(counts).reduce((sum, value) => sum + value, 0); return total ? `${total.toLocaleString("ru-RU")} обработано` : "ожидает первую страницу"; }
 function importEntityLabel(entityType: string | null): string { return importEntities.find(([value]) => value === entityType)?.[1] ?? entityType ?? "Все сущности"; }
 function fieldTypeLabel(fieldType: ApiCustomFieldType): string { return { text: "Текст", number: "Число", date: "Дата", boolean: "Флаг", select: "Список" }[fieldType]; }

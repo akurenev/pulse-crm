@@ -68,3 +68,39 @@ test("creates a deal field and makes it required for a pipeline stage", async ({
   await expect(editor.getByLabel(/^Название/)).toBeChecked();
   await expect(editor.getByLabel(/^Причина обращения/)).toBeChecked();
 });
+
+test("renames a pipeline and manages its open stages", async ({ page }) => {
+  await page.goto("/settings");
+  const pipeline = page.locator(".settings-section").first();
+
+  await pipeline.getByRole("button", { name: "Переименовать воронку Повторные продажи" }).click();
+  let editor = page.locator(".settings-editor");
+  await editor.getByLabel("Название воронки").fill("Продажи и продления");
+  await editor.getByRole("button", { name: "Сохранить название" }).click();
+  await expect(pipeline.getByText("Продажи и продления", { exact: true })).toBeVisible();
+
+  await pipeline.getByRole("button", { name: "Добавить этап в воронку Продажи и продления" }).click();
+  editor = page.locator(".settings-editor");
+  await editor.getByLabel("Название этапа").fill("Согласование договора");
+  await editor.getByRole("button", { name: "Добавить этап" }).click();
+  await expect(pipeline.getByRole("button", { name: "Обязательные поля этапа Согласование договора" })).toBeVisible();
+
+  await pipeline.getByRole("button", { name: "Переименовать этап Согласование договора" }).click();
+  editor = page.locator(".settings-editor");
+  await editor.getByLabel("Название этапа").fill("Договор согласован");
+  await editor.getByRole("button", { name: "Сохранить этап" }).click();
+  await expect(pipeline.getByRole("button", { name: "Обязательные поля этапа Договор согласован" })).toBeVisible();
+
+  page.once("dialog", (dialog) => void dialog.accept());
+  await pipeline.getByRole("button", { name: "Удалить этап Договор согласован" }).click();
+  await expect(pipeline.getByRole("button", { name: "Обязательные поля этапа Договор согласован" })).toHaveCount(0);
+
+  await page.getByRole("button", { name: "Новая воронка" }).click();
+  editor = page.locator(".settings-editor");
+  await editor.getByLabel("Название воронки").fill("Воронка для удаления");
+  await editor.getByRole("button", { name: "Создать воронку" }).click();
+  const removablePipeline = page.locator(".settings-section").filter({ hasText: "Воронка для удаления" });
+  page.once("dialog", (dialog) => void dialog.accept());
+  await removablePipeline.getByRole("button", { name: "Удалить воронку Воронка для удаления" }).click();
+  await expect(removablePipeline).toHaveCount(0);
+});

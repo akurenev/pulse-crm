@@ -671,6 +671,8 @@ class PulseAmoWriter(ImportEntityWriter):
             if external_numeric_id == 143
             else StageType.open
         )
+        if existing_internal_id is not None:
+            model.version += 1
         await session.flush()
         return model.id
 

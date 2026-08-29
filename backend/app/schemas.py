@@ -3,7 +3,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 from decimal import Decimal
-from typing import Any, Self
+from typing import Any, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
 
@@ -163,12 +163,34 @@ class StageRead(ORMModel):
     color: str
     position: int
     stage_type: StageType
+    version: int
 
 
 class PipelineCreate(BaseModel):
     name: str = Field(min_length=1, max_length=160)
     position: int = Field(default=0, ge=0)
     stages: list[StageCreate] = Field(default_factory=list, max_length=50)
+
+    @model_validator(mode="after")
+    def require_open_stage(self) -> Self:
+        if not any(stage.stage_type is StageType.open for stage in self.stages):
+            raise ValueError("pipeline requires at least one open stage")
+        return self
+
+
+class PipelineUpdate(VersionedUpdate):
+    name: str = Field(min_length=1, max_length=160)
+
+
+class StageAppendCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    color: str = Field(default="#64748B", pattern=r"^#[0-9A-Fa-f]{6}$")
+    stage_type: Literal[StageType.open] = StageType.open
+
+
+class StageUpdate(VersionedUpdate):
+    name: str = Field(min_length=1, max_length=120)
+    color: str | None = Field(default=None, pattern=r"^#[0-9A-Fa-f]{6}$")
 
 
 class PipelineRead(ORMModel):

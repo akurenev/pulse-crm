@@ -1,13 +1,32 @@
 from __future__ import annotations
 
+import uuid
 from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
+import sqlalchemy as sa
+
+from app.db import SessionLocal
+from app.integrations.models import (
+    ChannelConnection,
+    ChannelKind,
+    ExternalEntityMap,
+    Form,
+    NotificationAudience,
+    NotificationRule,
+    NotificationTemplate,
+    WebhookEndpoint,
+)
+from app.models import ActivityEvent, OutboxEvent, Pipeline, RealtimeEvent, Stage, Workspace
 
 
 def csrf(auth: dict[str, object]) -> dict[str, str]:
     return {"X-CSRF-Token": str(auth["csrf_token"])}
+
+
+def as_uuid(value: object) -> uuid.UUID:
+    return uuid.UUID(str(value))
 
 
 @pytest.mark.asyncio
@@ -281,3 +300,594 @@ async def test_foreign_workspace_records_are_not_visible(
 
     response = await client.get(f"/api/v1/companies/{foreign_id}")
     assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_pipeline_and_stage_management_versions_ordering_and_events(
+    client: httpx.AsyncClient, owner_auth: dict[str, object]
+) -> None:
+    headers = csrf(owner_auth)
+    pipeline = (await client.get("/api/v1/pipelines")).json()[0]
+
+    renamed_pipeline = await client.patch(
+        f"/api/v1/pipelines/{pipeline['id']}",
+        headers=headers,
+        json={"name": "  Основные продажи  ", "expected_version": pipeline["version"]},
+    )
+    assert renamed_pipeline.status_code == 200, renamed_pipeline.text
+    assert renamed_pipeline.json()["name"] == "Основные продажи"
+    assert renamed_pipeline.json()["version"] == pipeline["version"] + 1
+
+    stale_pipeline = await client.patch(
+        f"/api/v1/pipelines/{pipeline['id']}",
+        headers=headers,
+        json={"name": "Устаревшее имя", "expected_version": pipeline["version"]},
+    )
+    assert stale_pipeline.status_code == 409
+    assert stale_pipeline.json()["detail"]["code"] == "version_conflict"
+
+    created_stage = await client.post(
+        f"/api/v1/pipelines/{pipeline['id']}/stages",
+        headers=headers,
+        json={"name": "  Согласование  ", "color": "#aabbcc", "stage_type": "open"},
+    )
+    assert created_stage.status_code == 201, created_stage.text
+    stage = created_stage.json()
+    assert stage["name"] == "Согласование"
+    assert stage["color"] == "#AABBCC"
+    assert stage["stage_type"] == "open"
+    assert stage["version"] == 1
+
+    after_create = (await client.get("/api/v1/pipelines")).json()[0]
+    assert after_create["version"] == renamed_pipeline.json()["version"] + 1
+    assert [item["position"] for item in after_create["stages"]] == list(
+        range(len(after_create["stages"]))
+    )
+    assert [item["stage_type"] for item in after_create["stages"]] == [
+        "open",
+        "open",
+        "open",
+        "won",
+        "lost",
+    ]
+
+    renamed_stage = await client.patch(
+        f"/api/v1/stages/{stage['id']}",
+        headers=headers,
+        json={
+            "name": "  Договор  ",
+            "color": "#112233",
+            "expected_version": stage["version"],
+        },
+    )
+    assert renamed_stage.status_code == 200, renamed_stage.text
+    assert renamed_stage.json()["name"] == "Договор"
+    assert renamed_stage.json()["color"] == "#112233"
+    assert renamed_stage.json()["version"] == stage["version"] + 1
+
+    stale_stage = await client.patch(
+        f"/api/v1/stages/{stage['id']}",
+        headers=headers,
+        json={"name": "Старое", "expected_version": stage["version"]},
+    )
+    assert stale_stage.status_code == 409
+    assert stale_stage.json()["detail"]["code"] == "version_conflict"
+
+    workspace_id = as_uuid(owner_auth["workspace"]["id"])
+    stage_id = as_uuid(stage["id"])
+    async with SessionLocal() as db:
+        db.add(
+            ExternalEntityMap(
+                workspace_id=workspace_id,
+                provider="amocrm",
+                entity_type="stages",
+                external_id="amo-stage-42",
+                internal_id=stage_id,
+                fingerprint="f" * 64,
+            )
+        )
+        await db.commit()
+
+    stale_delete = await client.delete(
+        f"/api/v1/stages/{stage['id']}",
+        headers=headers,
+        params={"expected_version": stage["version"]},
+    )
+    assert stale_delete.status_code == 409
+    assert stale_delete.json()["detail"]["code"] == "version_conflict"
+
+    deleted = await client.delete(
+        f"/api/v1/stages/{stage['id']}",
+        headers=headers,
+        params={"expected_version": renamed_stage.json()["version"]},
+    )
+    assert deleted.status_code == 204, deleted.text
+    after_delete = (await client.get("/api/v1/pipelines")).json()[0]
+    assert after_delete["version"] == after_create["version"] + 1
+    assert all(item["id"] != stage["id"] for item in after_delete["stages"])
+
+    async with SessionLocal() as db:
+        assert (
+            await db.scalar(
+                sa.select(ExternalEntityMap.id).where(
+                    ExternalEntityMap.workspace_id == workspace_id,
+                    ExternalEntityMap.internal_id == stage_id,
+                )
+            )
+            is None
+        )
+        activity_count = await db.scalar(
+            sa.select(sa.func.count())
+            .select_from(ActivityEvent)
+            .where(
+                ActivityEvent.entity_id == stage_id,
+                ActivityEvent.event_type.in_(
+                    ["stage.created", "stage.updated", "stage.deleted"]
+                ),
+            )
+        )
+        outbox_count = await db.scalar(
+            sa.select(sa.func.count())
+            .select_from(OutboxEvent)
+            .where(
+                OutboxEvent.aggregate_id == stage_id,
+                OutboxEvent.event_type.in_(
+                    ["stage.created", "stage.updated", "stage.deleted"]
+                ),
+            )
+        )
+        realtime_count = await db.scalar(
+            sa.select(sa.func.count())
+            .select_from(RealtimeEvent)
+            .where(
+                RealtimeEvent.workspace_id == workspace_id,
+                RealtimeEvent.event_type.in_(
+                    ["stage.created", "stage.updated", "stage.deleted"]
+                ),
+            )
+        )
+    assert activity_count == outbox_count == realtime_count == 3
+
+
+@pytest.mark.asyncio
+async def test_stage_deletion_safety_and_integration_references(
+    client: httpx.AsyncClient, owner_auth: dict[str, object]
+) -> None:
+    headers = csrf(owner_auth)
+    pipeline = (await client.get("/api/v1/pipelines")).json()[0]
+    first_open, second_open = [
+        stage for stage in pipeline["stages"] if stage["stage_type"] == "open"
+    ]
+    terminal = next(stage for stage in pipeline["stages"] if stage["stage_type"] == "won")
+
+    terminal_delete = await client.delete(
+        f"/api/v1/stages/{terminal['id']}",
+        headers=headers,
+        params={"expected_version": terminal["version"]},
+    )
+    assert terminal_delete.status_code == 409
+    assert terminal_delete.json()["detail"]["code"] == "stage_not_open"
+
+    deal = await client.post(
+        "/api/v1/deals",
+        headers=headers,
+        json={
+            "title": "Stage blocker",
+            "pipeline_id": pipeline["id"],
+            "stage_id": first_open["id"],
+        },
+    )
+    assert deal.status_code == 201, deal.text
+    occupied_delete = await client.delete(
+        f"/api/v1/stages/{first_open['id']}",
+        headers=headers,
+        params={"expected_version": first_open["version"]},
+    )
+    assert occupied_delete.status_code == 409
+    assert occupied_delete.json()["detail"]["code"] == "stage_in_use"
+    assert {"deals", "deal_stage_history"}.issubset(
+        occupied_delete.json()["detail"]["references"]
+    )
+
+    workspace_id = as_uuid(owner_auth["workspace"]["id"])
+    pipeline_id = as_uuid(pipeline["id"])
+    second_open_id = as_uuid(second_open["id"])
+    async with SessionLocal() as db:
+        template = NotificationTemplate(
+            workspace_id=workspace_id,
+            name="Stage reference template",
+            channel="email",
+            body_template="Test",
+        )
+        db.add(template)
+        await db.flush()
+        db.add_all(
+            [
+                ChannelConnection(
+                    workspace_id=workspace_id,
+                    kind=ChannelKind.email,
+                    name="Stage routing",
+                    default_pipeline_id=pipeline_id,
+                    default_stage_id=second_open_id,
+                ),
+                NotificationRule(
+                    workspace_id=workspace_id,
+                    template_id=template.id,
+                    name="Stage rule",
+                    event_type="deal.stage_changed",
+                    audience=NotificationAudience.employee,
+                    channel="email",
+                    pipeline_id=pipeline_id,
+                    stage_id=second_open_id,
+                ),
+                Form(
+                    workspace_id=workspace_id,
+                    slug="stage-reference-form",
+                    title="Stage form",
+                    pipeline_id=pipeline_id,
+                    stage_id=second_open_id,
+                ),
+                WebhookEndpoint(
+                    workspace_id=workspace_id,
+                    slug="stage-reference-webhook",
+                    name="Stage webhook",
+                    encrypted_secret=b"secret",
+                    pipeline_id=pipeline_id,
+                    stage_id=second_open_id,
+                ),
+            ]
+        )
+        await db.commit()
+
+    integration_delete = await client.delete(
+        f"/api/v1/stages/{second_open['id']}",
+        headers=headers,
+        params={"expected_version": second_open["version"]},
+    )
+    assert integration_delete.status_code == 409
+    assert integration_delete.json()["detail"]["code"] == "stage_in_use"
+    assert set(integration_delete.json()["detail"]["references"]) == {
+        "channel_connections",
+        "notification_rules",
+        "forms",
+        "webhook_endpoints",
+    }
+    pipeline_delete = await client.delete(
+        f"/api/v1/pipelines/{pipeline['id']}",
+        headers=headers,
+        params={"expected_version": pipeline["version"]},
+    )
+    assert pipeline_delete.status_code == 409
+    assert pipeline_delete.json()["detail"]["code"] == "pipeline_in_use"
+    assert set(pipeline_delete.json()["detail"]["references"]) == {
+        "deals",
+        "deal_stage_history",
+        "channel_connections",
+        "notification_rules",
+        "forms",
+        "webhook_endpoints",
+    }
+
+
+@pytest.mark.asyncio
+async def test_stage_delete_keeps_one_open_stage(
+    client: httpx.AsyncClient, owner_auth: dict[str, object]
+) -> None:
+    headers = csrf(owner_auth)
+    pipeline = (await client.get("/api/v1/pipelines")).json()[0]
+    first_open, last_open = [
+        stage for stage in pipeline["stages"] if stage["stage_type"] == "open"
+    ]
+
+    deleted = await client.delete(
+        f"/api/v1/stages/{first_open['id']}",
+        headers=headers,
+        params={"expected_version": first_open["version"]},
+    )
+    assert deleted.status_code == 204, deleted.text
+    blocked = await client.delete(
+        f"/api/v1/stages/{last_open['id']}",
+        headers=headers,
+        params={"expected_version": last_open["version"]},
+    )
+    assert blocked.status_code == 409
+    assert blocked.json()["detail"]["code"] == "last_open_stage"
+
+
+@pytest.mark.asyncio
+async def test_pipeline_delete_versions_usage_last_active_and_amo_maps(
+    client: httpx.AsyncClient, owner_auth: dict[str, object]
+) -> None:
+    headers = csrf(owner_auth)
+    default_pipeline = (await client.get("/api/v1/pipelines")).json()[0]
+    disposable = await client.post(
+        "/api/v1/pipelines",
+        headers=headers,
+        json={
+            "name": "Disposable",
+            "position": 1,
+            "stages": [
+                {"name": "Open", "position": 0, "stage_type": "open"},
+                {"name": "Won", "position": 1, "stage_type": "won"},
+            ],
+        },
+    )
+    assert disposable.status_code == 201, disposable.text
+    disposable_pipeline = disposable.json()
+
+    workspace_id = as_uuid(owner_auth["workspace"]["id"])
+    disposable_pipeline_id = as_uuid(disposable_pipeline["id"])
+    async with SessionLocal() as db:
+        maps = [
+            ExternalEntityMap(
+                workspace_id=workspace_id,
+                provider="amocrm",
+                entity_type="pipelines",
+                external_id="amo-pipeline-disposable",
+                internal_id=disposable_pipeline_id,
+                fingerprint="p" * 64,
+            )
+        ]
+        maps.extend(
+            ExternalEntityMap(
+                workspace_id=workspace_id,
+                provider="amocrm",
+                entity_type="stages",
+                external_id=f"amo-stage-{index}",
+                internal_id=as_uuid(stage["id"]),
+                fingerprint=str(index) * 64,
+            )
+            for index, stage in enumerate(disposable_pipeline["stages"], start=1)
+        )
+        db.add_all(maps)
+        await db.commit()
+
+    stale = await client.delete(
+        f"/api/v1/pipelines/{disposable_pipeline['id']}",
+        headers=headers,
+        params={"expected_version": disposable_pipeline["version"] + 1},
+    )
+    assert stale.status_code == 409
+    assert stale.json()["detail"]["code"] == "version_conflict"
+
+    deleted = await client.delete(
+        f"/api/v1/pipelines/{disposable_pipeline['id']}",
+        headers=headers,
+        params={"expected_version": disposable_pipeline["version"]},
+    )
+    assert deleted.status_code == 204, deleted.text
+    async with SessionLocal() as db:
+        assert (
+            await db.scalar(
+                sa.select(sa.func.count())
+                .select_from(ExternalEntityMap)
+                .where(ExternalEntityMap.workspace_id == workspace_id)
+            )
+            == 0
+        )
+        assert await db.get(Pipeline, disposable_pipeline_id) is None
+        assert not (
+            await db.scalars(
+                sa.select(Stage).where(Stage.pipeline_id == disposable_pipeline_id)
+            )
+        ).all()
+
+    last_active = await client.delete(
+        f"/api/v1/pipelines/{default_pipeline['id']}",
+        headers=headers,
+        params={"expected_version": default_pipeline["version"]},
+    )
+    assert last_active.status_code == 409
+    assert last_active.json()["detail"]["code"] == "last_active_pipeline"
+
+    second = await client.post(
+        "/api/v1/pipelines",
+        headers=headers,
+        json={
+            "name": "Keep alive",
+            "position": 2,
+            "stages": [{"name": "Open", "position": 0, "stage_type": "open"}],
+        },
+    )
+    assert second.status_code == 201, second.text
+    duplicate_name = await client.patch(
+        f"/api/v1/pipelines/{default_pipeline['id']}",
+        headers=headers,
+        json={
+            "name": second.json()["name"],
+            "expected_version": default_pipeline["version"],
+        },
+    )
+    assert duplicate_name.status_code == 409
+    assert duplicate_name.json()["detail"]["code"] == "pipeline_name_conflict"
+    deal = await client.post(
+        "/api/v1/deals",
+        headers=headers,
+        json={
+            "title": "Pipeline blocker",
+            "pipeline_id": default_pipeline["id"],
+            "stage_id": default_pipeline["stages"][0]["id"],
+        },
+    )
+    assert deal.status_code == 201, deal.text
+    in_use = await client.delete(
+        f"/api/v1/pipelines/{default_pipeline['id']}",
+        headers=headers,
+        params={"expected_version": default_pipeline["version"]},
+    )
+    assert in_use.status_code == 409
+    assert in_use.json()["detail"]["code"] == "pipeline_in_use"
+    assert {"deals", "deal_stage_history"}.issubset(in_use.json()["detail"]["references"])
+
+
+@pytest.mark.asyncio
+async def test_pipeline_management_is_admin_only_and_workspace_scoped(
+    client: httpx.AsyncClient, owner_auth: dict[str, object]
+) -> None:
+    headers = csrf(owner_auth)
+    async with SessionLocal() as db:
+        other_workspace = Workspace(name="Foreign CRM", slug="foreign-crm")
+        db.add(other_workspace)
+        await db.flush()
+        foreign_pipeline = Pipeline(
+            workspace_id=other_workspace.id,
+            name="Foreign pipeline",
+            position=0,
+        )
+        db.add(foreign_pipeline)
+        await db.flush()
+        foreign_stage = Stage(
+            workspace_id=other_workspace.id,
+            pipeline_id=foreign_pipeline.id,
+            name="Foreign stage",
+            position=0,
+        )
+        db.add(foreign_stage)
+        await db.commit()
+        foreign_pipeline_id = uuid.UUID(str(foreign_pipeline.id))
+        foreign_stage_id = uuid.UUID(str(foreign_stage.id))
+
+    foreign_responses = [
+        await client.patch(
+            f"/api/v1/pipelines/{foreign_pipeline_id}",
+            headers=headers,
+            json={"name": "No access", "expected_version": 1},
+        ),
+        await client.post(
+            f"/api/v1/pipelines/{foreign_pipeline_id}/stages",
+            headers=headers,
+            json={"name": "No access"},
+        ),
+        await client.patch(
+            f"/api/v1/stages/{foreign_stage_id}",
+            headers=headers,
+            json={"name": "No access", "expected_version": 1},
+        ),
+        await client.delete(
+            f"/api/v1/stages/{foreign_stage_id}",
+            headers=headers,
+            params={"expected_version": 1},
+        ),
+        await client.delete(
+            f"/api/v1/pipelines/{foreign_pipeline_id}",
+            headers=headers,
+            params={"expected_version": 1},
+        ),
+    ]
+    assert [response.status_code for response in foreign_responses] == [404] * 5
+
+    pipeline = (await client.get("/api/v1/pipelines")).json()[0]
+    invitation = await client.post(
+        "/api/v1/invitations",
+        headers=headers,
+        json={"email": "pipeline-manager@example.com", "role": "manager"},
+    )
+    assert invitation.status_code == 201, invitation.text
+    manager = await client.post(
+        "/api/v1/auth/accept-invitation",
+        json={
+            "token": invitation.json()["token"],
+            "full_name": "Pipeline Manager",
+            "password": "a secure pipeline manager password",
+        },
+    )
+    assert manager.status_code == 201, manager.text
+    manager_headers = csrf(manager.json())
+    stage = pipeline["stages"][0]
+    manager_responses = [
+        await client.patch(
+            f"/api/v1/pipelines/{pipeline['id']}",
+            headers=manager_headers,
+            json={"name": "Denied", "expected_version": pipeline["version"]},
+        ),
+        await client.post(
+            f"/api/v1/pipelines/{pipeline['id']}/stages",
+            headers=manager_headers,
+            json={"name": "Denied"},
+        ),
+        await client.patch(
+            f"/api/v1/stages/{stage['id']}",
+            headers=manager_headers,
+            json={"name": "Denied", "expected_version": stage["version"]},
+        ),
+        await client.delete(
+            f"/api/v1/stages/{stage['id']}",
+            headers=manager_headers,
+            params={"expected_version": stage["version"]},
+        ),
+        await client.delete(
+            f"/api/v1/pipelines/{pipeline['id']}",
+            headers=manager_headers,
+            params={"expected_version": pipeline["version"]},
+        ),
+    ]
+    assert [response.status_code for response in manager_responses] == [403] * 5
+    assert all(response.json()["detail"] == "insufficient role" for response in manager_responses)
+
+
+@pytest.mark.asyncio
+async def test_stage_creation_validation_and_limit(
+    client: httpx.AsyncClient, owner_auth: dict[str, object]
+) -> None:
+    headers = csrf(owner_auth)
+    pipeline = (await client.get("/api/v1/pipelines")).json()[0]
+
+    blank_pipeline = await client.patch(
+        f"/api/v1/pipelines/{pipeline['id']}",
+        headers=headers,
+        json={"name": "   ", "expected_version": pipeline["version"]},
+    )
+    blank_stage = await client.post(
+        f"/api/v1/pipelines/{pipeline['id']}/stages",
+        headers=headers,
+        json={"name": "   "},
+    )
+    terminal_stage = await client.post(
+        f"/api/v1/pipelines/{pipeline['id']}/stages",
+        headers=headers,
+        json={"name": "Another won", "stage_type": "won"},
+    )
+    blank_pipeline_create = await client.post(
+        "/api/v1/pipelines",
+        headers=headers,
+        json={
+            "name": "   ",
+            "stages": [{"name": "Open", "position": 0, "stage_type": "open"}],
+        },
+    )
+    no_open_pipeline = await client.post(
+        "/api/v1/pipelines",
+        headers=headers,
+        json={
+            "name": "No open stage",
+            "stages": [{"name": "Won", "position": 0, "stage_type": "won"}],
+        },
+    )
+    assert {
+        blank_pipeline.status_code,
+        blank_stage.status_code,
+        terminal_stage.status_code,
+        blank_pipeline_create.status_code,
+        no_open_pipeline.status_code,
+    } == {422}
+
+    full_pipeline = await client.post(
+        "/api/v1/pipelines",
+        headers=headers,
+        json={
+            "name": "Fifty stages",
+            "position": 2,
+            "stages": [
+                {"name": f"Stage {index}", "position": index, "stage_type": "open"}
+                for index in range(50)
+            ],
+        },
+    )
+    assert full_pipeline.status_code == 201, full_pipeline.text
+    overflow = await client.post(
+        f"/api/v1/pipelines/{full_pipeline.json()['id']}/stages",
+        headers=headers,
+        json={"name": "Stage 51"},
+    )
+    assert overflow.status_code == 409
+    assert overflow.json()["detail"]["code"] == "pipeline_stage_limit"

@@ -7,7 +7,7 @@ import re
 import uuid
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any
+from typing import Any, cast
 
 import sqlalchemy as sa
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -222,7 +222,7 @@ async def grant_contact_consent(
             )
             if consent is None:
                 raise exc
-            return consent
+            return cast(ContactChannelConsent, consent)
         changed = True
     elif consent.status is ConsentStatus.revoked:
         consent.address = payload.address

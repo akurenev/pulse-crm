@@ -11,7 +11,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_session
 from app.integrations.identity import IdentityNormalizationError, sync_contact_points
-from app.integrations.models import PurchaseSchedule, PurchaseScheduleStatus
+from app.integrations.models import (
+    ChannelConnection,
+    ExternalEntityMap,
+    Form,
+    NotificationRule,
+    PurchaseSchedule,
+    PurchaseScheduleStatus,
+    WebhookEndpoint,
+)
 from app.integrations.purchases import create_purchase_schedule
 from app.models import (
     ActivityEvent,
@@ -52,11 +60,14 @@ from app.schemas import (
     NoteCreate,
     PipelineCreate,
     PipelineRead,
+    PipelineUpdate,
     RequiredFieldRead,
     RequiredFieldsReplace,
     SourceRead,
+    StageAppendCreate,
     StageRead,
     StageTransition,
+    StageUpdate,
     TaskCreate,
     TaskPage,
     TaskRead,
@@ -86,6 +97,15 @@ def conflict() -> HTTPException:
         status_code=status.HTTP_409_CONFLICT,
         detail={"code": "version_conflict", "message": "record was modified by another user"},
     )
+
+
+def deletion_conflict(
+    code: str, message: str, references: list[str] | None = None
+) -> HTTPException:
+    detail: dict[str, Any] = {"code": code, "message": message}
+    if references:
+        detail["references"] = references
+    return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=detail)
 
 
 def _cursor_condition(model: Any, cursor_value: str | None) -> Any | None:
@@ -148,6 +168,47 @@ async def _ensure_deal(db: AsyncSession, workspace_id: uuid.UUID, entity_id: uui
     return entity
 
 
+async def _ensure_pipeline(
+    db: AsyncSession,
+    workspace_id: uuid.UUID,
+    entity_id: uuid.UUID,
+    *,
+    for_update: bool = False,
+) -> Pipeline:
+    query = sa.select(Pipeline).where(
+        Pipeline.id == entity_id,
+        Pipeline.workspace_id == workspace_id,
+    )
+    if for_update:
+        query = query.with_for_update()
+    entity = await db.scalar(query)
+    if entity is None:
+        raise not_found("pipeline")
+    return entity
+
+
+async def _ensure_stage(
+    db: AsyncSession,
+    workspace_id: uuid.UUID,
+    entity_id: uuid.UUID,
+    *,
+    pipeline_id: uuid.UUID | None = None,
+    for_update: bool = False,
+) -> Stage:
+    query = sa.select(Stage).where(
+        Stage.id == entity_id,
+        Stage.workspace_id == workspace_id,
+    )
+    if pipeline_id is not None:
+        query = query.where(Stage.pipeline_id == pipeline_id)
+    if for_update:
+        query = query.with_for_update()
+    entity = await db.scalar(query)
+    if entity is None:
+        raise not_found("stage")
+    return entity
+
+
 async def _ensure_member(db: AsyncSession, workspace_id: uuid.UUID, user_id: uuid.UUID) -> None:
     member_id = await db.scalar(
         sa.select(Membership.id).where(
@@ -156,6 +217,123 @@ async def _ensure_member(db: AsyncSession, workspace_id: uuid.UUID, user_id: uui
     )
     if member_id is None:
         raise not_found("workspace member")
+
+
+def _clean_resource_name(value: str, entity: str) -> str:
+    name = value.strip()
+    if not name:
+        raise HTTPException(status_code=422, detail=f"{entity} name cannot be blank")
+    return name
+
+
+async def _has_reference(db: AsyncSession, *conditions: Any) -> bool:
+    return bool(await db.scalar(sa.select(sa.exists().where(*conditions))))
+
+
+async def _stage_references(
+    db: AsyncSession, workspace_id: uuid.UUID, stage_id: uuid.UUID
+) -> list[str]:
+    checks = {
+        "deals": (
+            Deal.workspace_id == workspace_id,
+            Deal.stage_id == stage_id,
+        ),
+        "deal_stage_history": (
+            DealStageHistory.workspace_id == workspace_id,
+            sa.or_(
+                DealStageHistory.from_stage_id == stage_id,
+                DealStageHistory.to_stage_id == stage_id,
+            ),
+        ),
+        "channel_connections": (
+            ChannelConnection.workspace_id == workspace_id,
+            ChannelConnection.default_stage_id == stage_id,
+        ),
+        "notification_rules": (
+            NotificationRule.workspace_id == workspace_id,
+            NotificationRule.stage_id == stage_id,
+        ),
+        "forms": (
+            Form.workspace_id == workspace_id,
+            Form.stage_id == stage_id,
+        ),
+        "webhook_endpoints": (
+            WebhookEndpoint.workspace_id == workspace_id,
+            WebhookEndpoint.stage_id == stage_id,
+        ),
+    }
+    return [name for name, conditions in checks.items() if await _has_reference(db, *conditions)]
+
+
+async def _pipeline_references(
+    db: AsyncSession, workspace_id: uuid.UUID, pipeline_id: uuid.UUID
+) -> list[str]:
+    stage_ids = sa.select(Stage.id).where(
+        Stage.workspace_id == workspace_id,
+        Stage.pipeline_id == pipeline_id,
+    )
+    checks = {
+        "deals": (
+            Deal.workspace_id == workspace_id,
+            sa.or_(Deal.pipeline_id == pipeline_id, Deal.stage_id.in_(stage_ids)),
+        ),
+        "deal_stage_history": (
+            DealStageHistory.workspace_id == workspace_id,
+            sa.or_(
+                DealStageHistory.from_stage_id.in_(stage_ids),
+                DealStageHistory.to_stage_id.in_(stage_ids),
+            ),
+        ),
+        "channel_connections": (
+            ChannelConnection.workspace_id == workspace_id,
+            sa.or_(
+                ChannelConnection.default_pipeline_id == pipeline_id,
+                ChannelConnection.default_stage_id.in_(stage_ids),
+            ),
+        ),
+        "notification_rules": (
+            NotificationRule.workspace_id == workspace_id,
+            sa.or_(
+                NotificationRule.pipeline_id == pipeline_id,
+                NotificationRule.stage_id.in_(stage_ids),
+            ),
+        ),
+        "forms": (
+            Form.workspace_id == workspace_id,
+            sa.or_(Form.pipeline_id == pipeline_id, Form.stage_id.in_(stage_ids)),
+        ),
+        "webhook_endpoints": (
+            WebhookEndpoint.workspace_id == workspace_id,
+            sa.or_(
+                WebhookEndpoint.pipeline_id == pipeline_id,
+                WebhookEndpoint.stage_id.in_(stage_ids),
+            ),
+        ),
+    }
+    return [name for name, conditions in checks.items() if await _has_reference(db, *conditions)]
+
+
+async def _pipeline_read(db: AsyncSession, pipeline: Pipeline) -> PipelineRead:
+    stages = list(
+        (
+            await db.scalars(
+                sa.select(Stage)
+                .where(
+                    Stage.workspace_id == pipeline.workspace_id,
+                    Stage.pipeline_id == pipeline.id,
+                )
+                .order_by(Stage.position, Stage.created_at)
+            )
+        ).all()
+    )
+    return PipelineRead(
+        id=pipeline.id,
+        name=pipeline.name,
+        position=pipeline.position,
+        is_active=pipeline.is_active,
+        version=pipeline.version,
+        stages=[StageRead.model_validate(stage) for stage in stages],
+    )
 
 
 @router.get("/companies", response_model=CompanyPage)
@@ -440,13 +618,22 @@ async def create_pipeline(
     if len(set(positions)) != len(positions):
         raise HTTPException(status_code=422, detail="stage positions must be unique")
     pipeline = Pipeline(
-        workspace_id=context.workspace_id, name=payload.name.strip(), position=payload.position
+        workspace_id=context.workspace_id,
+        name=_clean_resource_name(payload.name, "pipeline"),
+        position=payload.position,
     )
     db.add(pipeline)
     try:
         await db.flush()
         stages = [
-            Stage(workspace_id=context.workspace_id, pipeline_id=pipeline.id, **item.model_dump())
+            Stage(
+                workspace_id=context.workspace_id,
+                pipeline_id=pipeline.id,
+                name=_clean_resource_name(item.name, "stage"),
+                color=item.color.upper(),
+                position=item.position,
+                stage_type=item.stage_type,
+            )
             for item in payload.stages
         ]
         db.add_all(stages)
@@ -476,6 +663,377 @@ async def create_pipeline(
             for item in sorted(stages, key=lambda item: item.position)
         ],
     )
+
+
+@router.patch("/pipelines/{pipeline_id}", response_model=PipelineRead)
+async def update_pipeline(
+    pipeline_id: uuid.UUID,
+    payload: PipelineUpdate,
+    context: CurrentAdmin,
+    db: AsyncSession = Depends(get_session),
+) -> PipelineRead:
+    name = _clean_resource_name(payload.name, "pipeline")
+    try:
+        pipeline = (
+            await db.execute(
+                sa.update(Pipeline)
+                .where(
+                    Pipeline.id == pipeline_id,
+                    Pipeline.workspace_id == context.workspace_id,
+                    Pipeline.version == payload.expected_version,
+                )
+                .values(name=name, version=Pipeline.version + 1, updated_at=datetime.now(UTC))
+                .returning(Pipeline)
+            )
+        ).scalar_one_or_none()
+    except IntegrityError as exc:
+        await db.rollback()
+        raise deletion_conflict(
+            "pipeline_name_conflict",
+            "a pipeline with this name already exists",
+        ) from exc
+    if pipeline is None:
+        if await db.scalar(
+            sa.select(Pipeline.id).where(
+                Pipeline.id == pipeline_id,
+                Pipeline.workspace_id == context.workspace_id,
+            )
+        ):
+            raise conflict()
+        raise not_found("pipeline")
+    record_domain_event(
+        db,
+        workspace_id=context.workspace_id,
+        event_type="pipeline.updated",
+        entity_type="pipeline",
+        entity_id=pipeline.id,
+        actor_id=context.user_id,
+        payload={"name": name, "version": pipeline.version},
+    )
+    try:
+        await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        raise deletion_conflict(
+            "pipeline_name_conflict",
+            "a pipeline with this name already exists",
+        ) from exc
+    return await _pipeline_read(db, pipeline)
+
+
+@router.post(
+    "/pipelines/{pipeline_id}/stages",
+    response_model=StageRead,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_stage(
+    pipeline_id: uuid.UUID,
+    payload: StageAppendCreate,
+    context: CurrentAdmin,
+    db: AsyncSession = Depends(get_session),
+) -> Stage:
+    name = _clean_resource_name(payload.name, "stage")
+    pipeline = await _ensure_pipeline(
+        db,
+        context.workspace_id,
+        pipeline_id,
+        for_update=True,
+    )
+    stages = list(
+        (
+            await db.scalars(
+                sa.select(Stage)
+                .where(
+                    Stage.workspace_id == context.workspace_id,
+                    Stage.pipeline_id == pipeline.id,
+                )
+                .order_by(Stage.position)
+                .with_for_update()
+            )
+        ).all()
+    )
+    if len(stages) >= 50:
+        raise deletion_conflict(
+            "pipeline_stage_limit",
+            "a pipeline cannot contain more than 50 stages",
+        )
+
+    original_positions = {existing.id: existing.position for existing in stages}
+    offset = (stages[-1].position + 2) if stages else 1
+    for existing in stages:
+        existing.position += offset
+    await db.flush()
+
+    insert_at = next(
+        (
+            index
+            for index, existing in enumerate(stages)
+            if existing.stage_type is not StageType.open
+        ),
+        len(stages),
+    )
+    stage = Stage(
+        workspace_id=context.workspace_id,
+        pipeline_id=pipeline.id,
+        name=name,
+        color=payload.color.upper(),
+        position=insert_at,
+        stage_type=StageType.open,
+    )
+    ordered_stages = [*stages[:insert_at], stage, *stages[insert_at:]]
+    for position, existing in enumerate(ordered_stages):
+        existing.position = position
+        if existing is not stage and original_positions[existing.id] != position:
+            existing.version += 1
+    db.add(stage)
+    pipeline.version += 1
+    pipeline.updated_at = datetime.now(UTC)
+    await db.flush()
+    record_domain_event(
+        db,
+        workspace_id=context.workspace_id,
+        event_type="stage.created",
+        entity_type="stage",
+        entity_id=stage.id,
+        actor_id=context.user_id,
+        payload={"pipeline_id": str(pipeline.id), "position": stage.position},
+    )
+    await db.commit()
+    return stage
+
+
+@router.patch("/stages/{stage_id}", response_model=StageRead)
+async def update_stage(
+    stage_id: uuid.UUID,
+    payload: StageUpdate,
+    context: CurrentAdmin,
+    db: AsyncSession = Depends(get_session),
+) -> Stage:
+    name = _clean_resource_name(payload.name, "stage")
+    values: dict[str, Any] = {
+        "name": name,
+        "version": Stage.version + 1,
+        "updated_at": datetime.now(UTC),
+    }
+    if payload.color is not None:
+        values["color"] = payload.color.upper()
+    changed_fields = ["name"]
+    if payload.color is not None:
+        changed_fields.append("color")
+    stage = (
+        await db.execute(
+            sa.update(Stage)
+            .where(
+                Stage.id == stage_id,
+                Stage.workspace_id == context.workspace_id,
+                Stage.version == payload.expected_version,
+            )
+            .values(**values)
+            .returning(Stage)
+        )
+    ).scalar_one_or_none()
+    if stage is None:
+        if await db.scalar(
+            sa.select(Stage.id).where(
+                Stage.id == stage_id,
+                Stage.workspace_id == context.workspace_id,
+            )
+        ):
+            raise conflict()
+        raise not_found("stage")
+    record_domain_event(
+        db,
+        workspace_id=context.workspace_id,
+        event_type="stage.updated",
+        entity_type="stage",
+        entity_id=stage.id,
+        actor_id=context.user_id,
+        payload={
+            "fields": changed_fields,
+            "pipeline_id": str(stage.pipeline_id),
+            "version": stage.version,
+        },
+    )
+    await db.commit()
+    return stage
+
+
+@router.delete("/stages/{stage_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_stage(
+    stage_id: uuid.UUID,
+    context: CurrentAdmin,
+    db: AsyncSession = Depends(get_session),
+    expected_version: int = Query(ge=1),
+) -> None:
+    stage = await _ensure_stage(
+        db,
+        context.workspace_id,
+        stage_id,
+    )
+    pipeline = await _ensure_pipeline(
+        db,
+        context.workspace_id,
+        stage.pipeline_id,
+        for_update=True,
+    )
+    stage = await _ensure_stage(
+        db,
+        context.workspace_id,
+        stage_id,
+        pipeline_id=pipeline.id,
+        for_update=True,
+    )
+    if stage.version != expected_version:
+        raise conflict()
+    if stage.stage_type is not StageType.open:
+        raise deletion_conflict(
+            "stage_not_open",
+            "only open stages can be deleted",
+        )
+    references = await _stage_references(db, context.workspace_id, stage.id)
+    if references:
+        raise deletion_conflict(
+            "stage_in_use",
+            "stage is in use and cannot be deleted",
+            references,
+        )
+    open_stage_count = await db.scalar(
+        sa.select(sa.func.count())
+        .select_from(Stage)
+        .where(
+            Stage.workspace_id == context.workspace_id,
+            Stage.pipeline_id == stage.pipeline_id,
+            Stage.stage_type == StageType.open,
+        )
+    )
+    if not open_stage_count or open_stage_count <= 1:
+        raise deletion_conflict(
+            "last_open_stage",
+            "a pipeline must keep at least one open stage",
+        )
+
+    deleted_name = stage.name
+    pipeline_id = stage.pipeline_id
+    await db.execute(
+        sa.delete(ExternalEntityMap).where(
+            ExternalEntityMap.workspace_id == context.workspace_id,
+            ExternalEntityMap.entity_type == "stages",
+            ExternalEntityMap.internal_id == stage.id,
+        )
+    )
+    await db.delete(stage)
+    pipeline.version += 1
+    pipeline.updated_at = datetime.now(UTC)
+    record_domain_event(
+        db,
+        workspace_id=context.workspace_id,
+        event_type="stage.deleted",
+        entity_type="stage",
+        entity_id=stage.id,
+        actor_id=context.user_id,
+        payload={"name": deleted_name, "pipeline_id": str(pipeline_id)},
+    )
+    try:
+        await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        raise deletion_conflict(
+            "stage_in_use",
+            "stage is in use and cannot be deleted",
+            ["database_constraints"],
+        ) from exc
+
+
+@router.delete("/pipelines/{pipeline_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_pipeline(
+    pipeline_id: uuid.UUID,
+    context: CurrentAdmin,
+    db: AsyncSession = Depends(get_session),
+    expected_version: int = Query(ge=1),
+) -> None:
+    pipeline = await _ensure_pipeline(
+        db,
+        context.workspace_id,
+        pipeline_id,
+        for_update=True,
+    )
+    if pipeline.version != expected_version:
+        raise conflict()
+    references = await _pipeline_references(db, context.workspace_id, pipeline.id)
+    if references:
+        raise deletion_conflict(
+            "pipeline_in_use",
+            "pipeline is in use and cannot be deleted",
+            references,
+        )
+    active_pipeline_count = await db.scalar(
+        sa.select(sa.func.count())
+        .select_from(Pipeline)
+        .where(
+            Pipeline.workspace_id == context.workspace_id,
+            Pipeline.is_active.is_(True),
+        )
+    )
+    if pipeline.is_active and (not active_pipeline_count or active_pipeline_count <= 1):
+        raise deletion_conflict(
+            "last_active_pipeline",
+            "a workspace must keep at least one active pipeline",
+        )
+
+    stage_ids = list(
+        (
+            await db.scalars(
+                sa.select(Stage.id).where(
+                    Stage.workspace_id == context.workspace_id,
+                    Stage.pipeline_id == pipeline.id,
+                )
+            )
+        ).all()
+    )
+    mapping_filter = sa.and_(
+        ExternalEntityMap.entity_type == "pipelines",
+        ExternalEntityMap.internal_id == pipeline.id,
+    )
+    if stage_ids:
+        mapping_filter = sa.or_(
+            mapping_filter,
+            sa.and_(
+                ExternalEntityMap.entity_type == "stages",
+                ExternalEntityMap.internal_id.in_(stage_ids),
+            ),
+        )
+    deleted_name = pipeline.name
+    try:
+        await db.execute(
+            sa.delete(ExternalEntityMap).where(
+                ExternalEntityMap.workspace_id == context.workspace_id,
+                mapping_filter,
+            )
+        )
+        await db.execute(
+            sa.delete(Stage).where(
+                Stage.workspace_id == context.workspace_id,
+                Stage.pipeline_id == pipeline.id,
+            )
+        )
+        await db.delete(pipeline)
+        record_domain_event(
+            db,
+            workspace_id=context.workspace_id,
+            event_type="pipeline.deleted",
+            entity_type="pipeline",
+            entity_id=pipeline.id,
+            actor_id=context.user_id,
+            payload={"name": deleted_name, "stage_count": len(stage_ids)},
+        )
+        await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        raise deletion_conflict(
+            "pipeline_in_use",
+            "pipeline is in use and cannot be deleted",
+            ["database_constraints"],
+        ) from exc
 
 
 @router.get("/sources", response_model=list[SourceRead])

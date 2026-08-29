@@ -9,7 +9,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
-from typing import Any
+from typing import Any, cast
 
 import sqlalchemy as sa
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -792,7 +792,7 @@ async def _ensure_source(
     )
     if source_id is None:  # pragma: no cover - database constraint guard
         raise RuntimeError("inbound source could not be loaded")
-    return source_id
+    return cast(uuid.UUID, source_id)
 
 
 def _insert_for(session: AsyncSession, model: type[Any]) -> Any:
@@ -936,19 +936,22 @@ async def _find_open_deal(
 ) -> Deal | None:
     if contact_id is None:
         return None
-    return await session.scalar(
-        sa.select(Deal)
-        .join(DealContact, DealContact.deal_id == Deal.id)
-        .join(Stage, Stage.id == Deal.stage_id)
-        .where(
-            Deal.workspace_id == workspace_id,
-            Deal.pipeline_id == pipeline_id,
-            Deal.deleted_at.is_(None),
-            DealContact.contact_id == contact_id,
-            Stage.stage_type == StageType.open,
-        )
-        .order_by(Deal.last_activity_at.desc(), Deal.created_at.desc())
-        .limit(1)
+    return cast(
+        Deal | None,
+        await session.scalar(
+            sa.select(Deal)
+            .join(DealContact, DealContact.deal_id == Deal.id)
+            .join(Stage, Stage.id == Deal.stage_id)
+            .where(
+                Deal.workspace_id == workspace_id,
+                Deal.pipeline_id == pipeline_id,
+                Deal.deleted_at.is_(None),
+                DealContact.contact_id == contact_id,
+                Stage.stage_type == StageType.open,
+            )
+            .order_by(Deal.last_activity_at.desc(), Deal.created_at.desc())
+            .limit(1)
+        ),
     )
 
 

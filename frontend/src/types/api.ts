@@ -34,6 +34,7 @@ export interface ApiStage {
   color: string;
   position: number;
   stage_type: "open" | "won" | "lost";
+  version: number;
 }
 
 export interface ApiPipeline {
