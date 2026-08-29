@@ -34,9 +34,7 @@ jobs:
           --health-retries 20
     env:
       PULSE_ENVIRONMENT: test
-      PULSE_DATABASE_URL: postgresql+psycopg://pulse:pulse-test-password@127.0.0.1:5432/pulse_test
       PULSE_SECRET_KEY: ci-only-secret-key-with-at-least-32-characters
-      PULSE_BOOTSTRAP_TOKEN: ci-only-bootstrap-token-with-at-least-32-characters
       PULSE_COOKIE_SECURE: "false"
       PULSE_JOB_RUNNER_ENABLED: "false"
       PULSE_ALLOWED_HOSTS: '["localhost","127.0.0.1","testserver"]'
@@ -73,8 +71,12 @@ jobs:
       - name: Type check
         run: mypy backend/app
       - name: Apply migrations
+        env:
+          PULSE_DATABASE_URL: postgresql+psycopg://pulse:pulse-test-password@127.0.0.1:5432/pulse_test
         run: alembic -c backend/alembic.ini upgrade head
       - name: Check migration head
+        env:
+          PULSE_DATABASE_URL: postgresql+psycopg://pulse:pulse-test-password@127.0.0.1:5432/pulse_test
         run: alembic -c backend/alembic.ini check
       - name: Test
         run: python -m pytest backend/tests
