@@ -13,6 +13,13 @@ import type { TaskItem } from "../types/crm";
 
 type TaskFilter = "all" | "today" | "overdue" | "upcoming";
 
+const taskFilterLabels: Record<TaskFilter, string> = {
+  all: "Все",
+  today: "Сегодня",
+  overdue: "Просрочено",
+  upcoming: "Предстоящие",
+};
+
 export default function TasksPage() {
   const { deals } = useCrm();
   const [tasks, setTasks] = useState<TaskItem[]>(() => seedTasks);
@@ -122,14 +129,19 @@ export default function TasksPage() {
 
   return (
     <div className="page tasks-page">
-      <header className="page-header"><div><h1>Задачи</h1><p>План работы команды и контроль сроков</p></div><Button variant="primary" onClick={() => setCreateOpen(true)}><Plus size={17} /> Новая задача</Button></header>
+      <header className="page-header"><div><h1>Задачи</h1><p>План работы команды и контроль сроков</p></div><Button variant="primary" className="tasks-page__desktop-add" onClick={() => setCreateOpen(true)} aria-controls="new-task-dialog"><Plus size={17} /> Новая задача</Button></header>
       <div className="content-toolbar tasks-toolbar">
-        <div className="segment-control">
+        <div className="segment-control tasks-filter-segments" role="group" aria-label="Статус задач">
           {(["all", "today", "overdue", "upcoming"] as const).map((value) => {
-            const labels = { all: "Все", today: "Сегодня", overdue: "Просрочено", upcoming: "Предстоящие" };
-            return <button key={value} type="button" className={filter === value ? "is-active" : ""} onClick={() => setFilter(value)}>{labels[value]}</button>;
+            return <button key={value} type="button" className={filter === value ? "is-active" : ""} aria-pressed={filter === value} onClick={() => setFilter(value)}>{taskFilterLabels[value]}</button>;
           })}
         </div>
+        <label className="select-control tasks-filter-select">
+          <span className="sr-only">Статус задач</span>
+          <select aria-label="Статус задач на мобильном" value={filter} onChange={(event) => setFilter(event.target.value as TaskFilter)}>
+            {(Object.entries(taskFilterLabels) as Array<[TaskFilter, string]>).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+          </select>
+        </label>
         <label className="search-control"><Search size={18} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Поиск по задачам" /></label>
       </div>
       {taskQuery.isLoading || userQuery.isLoading ? <div className="route-loading" role="status">Загружаем задачи…</div> : null}
@@ -146,10 +158,11 @@ export default function TasksPage() {
         ))}
         {!visible.length ? <p className="empty-copy">Задачи не найдены</p> : null}
       </section> : null}
+      <button type="button" className="mobile-fab tasks-page__mobile-add" onClick={() => setCreateOpen(true)} aria-label="Добавить задачу" aria-controls="new-task-dialog"><Plus size={26} aria-hidden="true" /></button>
       <Dialog.Root open={createOpen} onOpenChange={setCreateOpen}>
         <Dialog.Portal>
           <Dialog.Overlay className="dialog-overlay" />
-          <Dialog.Content className="dialog-content">
+          <Dialog.Content id="new-task-dialog" className="dialog-content">
             <div className="dialog-header"><div><Dialog.Title>Новая задача</Dialog.Title><Dialog.Description>Задайте срок, напоминание и исполнителя.</Dialog.Description></div><Dialog.Close className="icon-button" aria-label="Закрыть"><X size={20} /></Dialog.Close></div>
             <form className="form-stack" onSubmit={(event) => void createTask(event)}>
               <label className="field"><span>Название</span><input name="title" required autoFocus /></label>

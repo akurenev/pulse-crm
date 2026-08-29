@@ -1,6 +1,7 @@
 import { lazy, Suspense, type ReactNode } from "react";
 import { Navigate, Outlet, Route, Routes } from "react-router-dom";
 
+import { PwaInstallPrompt } from "./components/PwaInstallPrompt";
 import { AppShell } from "./components/layout/AppShell";
 import { DealsPage } from "./features/deals/DealsPage";
 import { useAuth } from "./state/auth-store";
@@ -16,24 +17,28 @@ const AcceptInvitationPage = lazy(() => import("./pages/AcceptInvitationPage"));
 const loadingFallback = <div className="route-loading" role="status">Загружаем рабочее пространство…</div>;
 
 export default function App() {
+  const { status } = useAuth();
   return (
-    <Suspense fallback={loadingFallback}>
-      <Routes>
-        <Route path="/login" element={<LoginPage />} />
-        <Route path="/accept-invitation" element={<AcceptInvitationPage />} />
-        <Route element={<AuthGate />}>
-          <Route element={<AppShell />}>
-            <Route index element={<DashboardPage />} />
-            <Route path="deals" element={<DealsPage />} />
-            <Route path="contacts" element={<ContactsPage />} />
-            <Route path="tasks" element={<TasksPage />} />
-            <Route path="activity" element={<ActivityPage />} />
-            <Route path="settings" element={<AdminOnly><SettingsPage /></AdminOnly>} />
+    <>
+      <Suspense fallback={loadingFallback}>
+        <Routes>
+          <Route path="/login" element={<LoginPage />} />
+          <Route path="/accept-invitation" element={<AcceptInvitationPage />} />
+          <Route element={<AuthGate />}>
+            <Route element={<AppShell />}>
+              <Route index element={<DashboardPage />} />
+              <Route path="deals" element={<DealsPage />} />
+              <Route path="contacts" element={<ContactsPage />} />
+              <Route path="tasks" element={<TasksPage />} />
+              <Route path="activity" element={<ActivityPage />} />
+              <Route path="settings" element={<AdminOnly><SettingsPage /></AdminOnly>} />
+            </Route>
           </Route>
-        </Route>
-        <Route path="*" element={<Navigate to="/" replace />} />
-      </Routes>
-    </Suspense>
+          <Route path="*" element={<Navigate to="/" replace />} />
+        </Routes>
+      </Suspense>
+      <PwaInstallPrompt enabled={status === "authenticated"} />
+    </>
   );
 }
 

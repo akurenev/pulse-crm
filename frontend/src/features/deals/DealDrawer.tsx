@@ -5,16 +5,19 @@ import {
   CalendarDays,
   Building2,
   Check,
+  ChevronDown,
   Circle,
   Mail,
   Paperclip,
+  Pencil,
   Phone,
   Send,
   Tag,
   UserRound,
+  UserRoundCheck,
   X,
 } from "lucide-react";
-import { useDeferredValue, useState, type FormEvent } from "react";
+import { useDeferredValue, useId, useState, type FormEvent } from "react";
 
 import { Avatar } from "../../components/Avatar";
 import { api, remoteEnabled } from "../../lib/api";
@@ -100,11 +103,11 @@ export function DealDrawer({ deal, pipeline, onClose, onMove, onSetNextPurchase,
         <Dialog.Overlay className="drawer-overlay" />
         <Dialog.Content className="deal-drawer" aria-describedby={undefined}>
           <header className="deal-drawer__header">
-            <div>
+            <div className="deal-drawer__identity">
               <Dialog.Title>{deal.title}</Dialog.Title>
               <strong>{formatMoney(deal.amount)}</strong>
             </div>
-            <label className="stage-select">
+            <label className="stage-select deal-drawer__stage">
               <span className="sr-only">Этап сделки</span>
               <select value={deal.stageId} onChange={(event) => void onMove(deal.id, event.target.value)}>
                 {pipeline.stages.map((stage) => <option key={stage.id} value={stage.id}>{stage.name}</option>)}
@@ -125,28 +128,28 @@ export function DealDrawer({ deal, pipeline, onClose, onMove, onSetNextPurchase,
 
             <div className="deal-drawer__scroll">
               <Tabs.Content value="details" className="drawer-section">
-                <dl className="details-list">
-                  <div>
-                    <dt><UserRound size={17} /> Контакт</dt>
-                    <dd><ContactPicker deal={deal} onSave={onSetContact} /></dd>
+                <dl className="details-list deal-details">
+                  <div className="deal-details__row deal-details__row--contact">
+                    <dt className="deal-details__label"><UserRound size={17} aria-hidden="true" /><span className="deal-details__label-text">Контакт</span></dt>
+                    <dd className="deal-details__value"><ContactPicker deal={deal} onSave={onSetContact} /></dd>
                   </div>
-                  {deal.phone ? <div><dt><Phone size={17} /> Телефон</dt><dd>{deal.phone}</dd></div> : null}
-                  {deal.email ? <div><dt><Mail size={17} /> Email</dt><dd>{deal.email}</dd></div> : null}
-                  <div>
-                    <dt><Building2 size={17} /> Компания</dt>
-                    <dd><CompanyPicker deal={deal} onSave={onSetCompany} /></dd>
+                  {deal.phone ? <div className="deal-details__row deal-details__row--phone"><dt className="deal-details__label"><Phone size={17} aria-hidden="true" /><span className="deal-details__label-text">Телефон</span></dt><dd className="deal-details__value"><a href={`tel:${deal.phone}`}>{deal.phone}</a></dd></div> : null}
+                  {deal.email ? <div className="deal-details__row deal-details__row--email"><dt className="deal-details__label"><Mail size={17} aria-hidden="true" /><span className="deal-details__label-text">Email</span></dt><dd className="deal-details__value"><a href={`mailto:${deal.email}`}>{deal.email}</a></dd></div> : null}
+                  <div className="deal-details__row deal-details__row--company">
+                    <dt className="deal-details__label"><Building2 size={17} aria-hidden="true" /><span className="deal-details__label-text">Компания</span></dt>
+                    <dd className="deal-details__value"><CompanyPicker deal={deal} onSave={onSetCompany} /></dd>
                   </div>
-                  <div>
-                    <dt>Ответственный</dt>
-                    <dd className="owner-line"><Avatar user={deal.assignee} size="sm" /> {deal.assignee.name}</dd>
+                  <div className="deal-details__row deal-details__row--owner">
+                    <dt className="deal-details__label"><UserRoundCheck size={17} aria-hidden="true" /><span className="deal-details__label-text">Ответственный</span></dt>
+                    <dd className="owner-line deal-details__value"><Avatar user={deal.assignee} size="sm" /> <span>{deal.assignee.name}</span></dd>
                   </div>
-                  <div>
-                    <dt><Tag size={17} /> Теги</dt>
-                    <dd><DealTagsEditor key={deal.id} deal={deal} onSave={onSetTags} /></dd>
+                  <div className="deal-details__row deal-details__row--tags">
+                    <dt className="deal-details__label"><Tag size={17} aria-hidden="true" /><span className="deal-details__label-text">Теги</span></dt>
+                    <dd className="deal-details__value"><DealTagsEditor key={deal.id} deal={deal} onSave={onSetTags} /></dd>
                   </div>
-                  <div>
-                    <dt><CalendarDays size={17} /> Следующая покупка</dt>
-                    <dd><NextPurchaseEditor key={deal.id} deal={deal} onSave={onSetNextPurchase} /></dd>
+                  <div className="deal-details__row deal-details__row--next-purchase">
+                    <dt className="deal-details__label"><CalendarDays size={17} aria-hidden="true" /><span className="deal-details__label-text">Следующая покупка</span></dt>
+                    <dd className="deal-details__value"><NextPurchaseEditor key={deal.id} deal={deal} onSave={onSetNextPurchase} /></dd>
                   </div>
                 </dl>
                 <CustomFieldsEditor key={deal.id} deal={deal} onSave={onSetCustomFields} />
@@ -245,7 +248,7 @@ function ContactPicker({ deal, onSave }: { deal: Deal; onSave: DealDrawerProps["
   }
 
   if (!editing) {
-    return <span className="relation-value"><span>{deal.contactName ?? "Не указан"}</span>{remoteEnabled ? <button type="button" onClick={() => setEditing(true)}>Изменить</button> : null}</span>;
+    return <span className="relation-value"><span>{deal.contactName ?? "Не указан"}</span>{remoteEnabled ? <EditFieldButton label="Изменить контакт сделки" onClick={() => setEditing(true)} /> : null}</span>;
   }
   return <span className="relation-picker">
     <input autoFocus aria-label="Поиск контакта" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Имя, телефон или email" />
@@ -284,7 +287,7 @@ function CompanyPicker({ deal, onSave }: { deal: Deal; onSave: DealDrawerProps["
   }
 
   if (!editing) {
-    return <span className="relation-value"><span>{deal.companyName ?? "Не указана"}</span>{remoteEnabled ? <button type="button" onClick={() => setEditing(true)}>Изменить</button> : null}</span>;
+    return <span className="relation-value"><span>{deal.companyName ?? "Не указана"}</span>{remoteEnabled ? <EditFieldButton label="Изменить компанию сделки" onClick={() => setEditing(true)} /> : null}</span>;
   }
   return <span className="relation-picker">
     <input autoFocus aria-label="Поиск компании" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Название, телефон или email" />
@@ -323,7 +326,7 @@ function DealTagsEditor({ deal, onSave }: { deal: Deal; onSave: DealDrawerProps[
   }
 
   if (!editing) {
-    return <span className="deal-tags-editor__display"><span className="deal-tags-list">{deal.tags.length ? deal.tags.map((tag) => <span className="deal-tag" key={tag}>{tag}</span>) : <small>Нет тегов</small>}</span><button type="button" aria-label="Изменить теги сделки" onClick={startEditing}>Изменить</button></span>;
+    return <span className="deal-tags-editor__display"><span className="deal-tags-list">{deal.tags.length ? deal.tags.map((tag) => <span className="deal-tag" key={tag}>{tag}</span>) : <small>Нет тегов</small>}</span><EditFieldButton label="Изменить теги сделки" onClick={startEditing} /></span>;
   }
 
   return <form className="deal-tags-editor" onSubmit={(event) => void submit(event)}>
@@ -332,6 +335,14 @@ function DealTagsEditor({ deal, onSave }: { deal: Deal; onSave: DealDrawerProps[
     <span><button type="button" disabled={saving} onClick={() => setEditing(false)}>Отмена</button><button type="submit" aria-label="Сохранить теги сделки" disabled={saving}>{saving ? "Сохраняем…" : "Сохранить"}</button></span>
     {error ? <small className="message-error" role="alert">{error}</small> : null}
   </form>;
+}
+
+function EditFieldButton({ label, onClick }: { label: string; onClick: () => void }) {
+  return (
+    <button type="button" className="deal-field-edit icon-button" aria-label={label} title={label} onClick={onClick}>
+      <Pencil size={15} aria-hidden="true" />
+    </button>
+  );
 }
 
 function CustomFieldsEditor({ deal, onSave }: { deal: Deal; onSave: DealDrawerProps["onSetCustomFields"] }) {
@@ -343,6 +354,8 @@ function CustomFieldsEditor({ deal, onSave }: { deal: Deal; onSave: DealDrawerPr
   const [draft, setDraft] = useState<Record<string, unknown>>(() => ({ ...(deal.customFields ?? {}) }));
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
+  const [expanded, setExpanded] = useState(true);
+  const contentId = useId();
 
   if (!remoteEnabled) return null;
   if (definitions.isLoading) return <section className="custom-fields-editor"><p className="empty-copy">Загружаем поля сделки…</p></section>;
@@ -373,18 +386,33 @@ function CustomFieldsEditor({ deal, onSave }: { deal: Deal; onSave: DealDrawerPr
     }
   }
 
-  return <section className="custom-fields-editor">
-    <header><h3>Поля сделки</h3></header>
-    <form onSubmit={(event) => void submit(event)}>
-      {(definitions.data ?? []).map((definition) => <label className="field" key={definition.id}>
-        <span>{definition.name}</span>
-        {definition.field_type === "boolean" ? <input type="checkbox" checked={Boolean(draft[definition.key])} onChange={(event) => setDraft((current) => ({ ...current, [definition.key]: event.target.checked }))} />
-          : definition.field_type === "select" ? <select value={String(draft[definition.key] ?? "")} onChange={(event) => setDraft((current) => ({ ...current, [definition.key]: event.target.value }))}><option value="">Не выбрано</option>{definition.options.map((option) => <option key={option} value={option}>{option}</option>)}</select>
-            : <input type={definition.field_type === "number" ? "number" : definition.field_type === "date" ? "date" : "text"} value={String(draft[definition.key] ?? "")} onChange={(event) => setDraft((current) => ({ ...current, [definition.key]: event.target.value }))} />}
-      </label>)}
-      <button type="submit" disabled={saving}>{saving ? "Сохраняем…" : "Сохранить поля"}</button>
-      {error ? <small className="message-error" role="alert">{error}</small> : null}
-    </form>
+  return <section className={`custom-fields-editor${expanded ? " custom-fields-editor--expanded" : " custom-fields-editor--collapsed"}`}>
+    <header className="custom-fields-editor__header">
+      <h3>
+        <button
+          type="button"
+          className="custom-fields-editor__toggle"
+          aria-expanded={expanded}
+          aria-controls={contentId}
+          onClick={() => setExpanded((value) => !value)}
+        >
+          <span>Поля сделки</span>
+          <ChevronDown className={`custom-fields-editor__chevron${expanded ? " custom-fields-editor__chevron--expanded" : ""}`} size={18} aria-hidden="true" />
+        </button>
+      </h3>
+    </header>
+    <div id={contentId} className="custom-fields-editor__content" hidden={!expanded}>
+      <form onSubmit={(event) => void submit(event)}>
+        {(definitions.data ?? []).map((definition) => <label className="field custom-fields-editor__field" key={definition.id}>
+          <span className="custom-fields-editor__label">{definition.name}</span>
+          {definition.field_type === "boolean" ? <input type="checkbox" checked={Boolean(draft[definition.key])} onChange={(event) => setDraft((current) => ({ ...current, [definition.key]: event.target.checked }))} />
+            : definition.field_type === "select" ? <select value={String(draft[definition.key] ?? "")} onChange={(event) => setDraft((current) => ({ ...current, [definition.key]: event.target.value }))}><option value="">Не выбрано</option>{definition.options.map((option) => <option key={option} value={option}>{option}</option>)}</select>
+              : <input type={definition.field_type === "number" ? "number" : definition.field_type === "date" ? "date" : "text"} value={String(draft[definition.key] ?? "")} onChange={(event) => setDraft((current) => ({ ...current, [definition.key]: event.target.value }))} />}
+        </label>)}
+        <button type="submit" disabled={saving}>{saving ? "Сохраняем…" : "Сохранить поля"}</button>
+        {error ? <small className="message-error" role="alert">{error}</small> : null}
+      </form>
+    </div>
   </section>;
 }
 

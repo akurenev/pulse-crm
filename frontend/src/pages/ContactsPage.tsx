@@ -1,6 +1,6 @@
 import * as Dialog from "@radix-ui/react-dialog";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { Building2, Plus, Search, Users, X } from "lucide-react";
+import { Building2, ChevronLeft, ChevronRight, Plus, Search, Users, X } from "lucide-react";
 import { useDeferredValue, useMemo, useState, type FormEvent } from "react";
 
 import { Avatar } from "../components/Avatar";
@@ -10,6 +10,15 @@ import { api, remoteEnabled } from "../lib/api";
 import { formatLongDate, formatMoney } from "../lib/format";
 import type { ApiActivity, ApiCompany, ApiContact, ApiDeal, CursorPage } from "../types/api";
 import type { Contact } from "../types/crm";
+
+const CLIENTS_PAGE_SIZE = 25;
+
+function listPagePath(collection: "contacts" | "companies", cursor: string | null, search: string) {
+  const params = new URLSearchParams({ limit: String(CLIENTS_PAGE_SIZE) });
+  if (cursor) params.set("cursor", cursor);
+  if (search) params.set("search", search);
+  return `/${collection}?${params.toString()}`;
+}
 
 export default function ContactsPage() {
   const queryClient = useQueryClient();
@@ -35,15 +44,19 @@ export default function ContactsPage() {
   const [saveError, setSaveError] = useState("");
   const [noteSaving, setNoteSaving] = useState(false);
   const [noteError, setNoteError] = useState("");
+  const [contactCursors, setContactCursors] = useState<Array<string | null>>([null]);
+  const [companyCursors, setCompanyCursors] = useState<Array<string | null>>([null]);
   const deferred = useDeferredValue(search.toLocaleLowerCase("ru"));
+  const contactCursor = contactCursors.at(-1) ?? null;
+  const companyCursor = companyCursors.at(-1) ?? null;
   const remoteContacts = useQuery({
-    queryKey: ["contacts", deferred],
-    queryFn: () => api.get<CursorPage<ApiContact>>(`/contacts?limit=100${deferred ? `&search=${encodeURIComponent(deferred)}` : ""}`),
+    queryKey: ["contacts", deferred, contactCursor],
+    queryFn: () => api.get<CursorPage<ApiContact>>(listPagePath("contacts", contactCursor, deferred)),
     enabled: remoteEnabled,
   });
   const remoteCompanies = useQuery({
-    queryKey: ["companies", deferred],
-    queryFn: () => api.get<CursorPage<ApiCompany>>(`/companies?limit=100${deferred ? `&search=${encodeURIComponent(deferred)}` : ""}`),
+    queryKey: ["companies", deferred, companyCursor],
+    queryFn: () => api.get<CursorPage<ApiCompany>>(listPagePath("companies", companyCursor, deferred)),
     enabled: remoteEnabled && view === "companies",
   });
   const sourceContacts = useMemo<Contact[]>(() => {
@@ -74,6 +87,12 @@ export default function ContactsPage() {
   );
   const loading = view === "contacts" ? remoteContacts.isLoading : remoteCompanies.isLoading;
   const failed = view === "contacts" ? remoteContacts.isError : remoteCompanies.isError;
+  const fetching = view === "contacts" ? remoteContacts.isFetching : remoteCompanies.isFetching;
+  const activeCursors = view === "contacts" ? contactCursors : companyCursors;
+  const nextCursor = view === "contacts" ? remoteContacts.data?.next_cursor : remoteCompanies.data?.next_cursor;
+  const currentPage = activeCursors.length;
+  const showPagination = remoteEnabled && (currentPage > 1 || Boolean(nextCursor));
+  const visibleRecordCount = view === "contacts" ? sourceContacts.length : sourceCompanies.length;
   const selectedEntityId = selectedContact?.id ?? selectedCompany?.id ?? null;
   const selectedEntityType = selectedContact ? "contact" : selectedCompany ? "company" : null;
   const detailActivityQuery = useQuery({
@@ -110,6 +129,7 @@ export default function ContactsPage() {
             tags: [],
             custom_fields: {},
           });
+          setContactCursors([null]);
           await queryClient.invalidateQueries({ queryKey: ["contacts"] });
         } else {
           const email = String(data.get("email") ?? "").trim();
@@ -123,6 +143,7 @@ export default function ContactsPage() {
             tags: [],
             custom_fields: {},
           });
+          setCompanyCursors([null]);
           await queryClient.invalidateQueries({ queryKey: ["companies"] });
         }
       } else if (view === "contacts") {
@@ -163,6 +184,30 @@ export default function ContactsPage() {
     }
   }
 
+  function updateSearch(value: string) {
+    setSearch(value);
+    setContactCursors([null]);
+    setCompanyCursors([null]);
+  }
+
+  function showNextPage() {
+    if (!nextCursor) return;
+    if (view === "contacts") {
+      setContactCursors((cursors) => cursors.at(-1) === nextCursor ? cursors : [...cursors, nextCursor]);
+    } else {
+      setCompanyCursors((cursors) => cursors.at(-1) === nextCursor ? cursors : [...cursors, nextCursor]);
+    }
+  }
+
+  function showPreviousPage() {
+    const previous = (cursors: Array<string | null>) => cursors.length > 1 ? cursors.slice(0, -1) : cursors;
+    if (view === "contacts") {
+      setContactCursors(previous);
+    } else {
+      setCompanyCursors(previous);
+    }
+  }
+
   async function createNote(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const form = event.currentTarget;
@@ -189,11 +234,11 @@ export default function ContactsPage() {
   return (
     <div className="page contacts-page">
       <header className="page-header">
-        <div><h1>Клиенты</h1><p>{view === "contacts" ? sourceContacts.length : sourceCompanies.length} записей в рабочей базе</p></div>
-        <Button variant="primary" onClick={() => setDialogOpen(true)}><Plus size={17} /> {view === "contacts" ? "Новый контакт" : "Новая компания"}</Button>
+        <div><h1>Клиенты</h1><p>{remoteEnabled ? `Страница ${currentPage} · ${visibleRecordCount} записей` : `${visibleRecordCount} записей в рабочей базе`}</p></div>
+        <Button className="contacts-page__desktop-add" variant="primary" aria-controls="new-client-dialog" onClick={() => setDialogOpen(true)}><Plus size={17} /> {view === "contacts" ? "Новый контакт" : "Новая компания"}</Button>
       </header>
       <div className="content-toolbar">
-        <label className="search-control"><Search size={18} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Имя, компания, тег, телефон или email" /></label>
+        <label className="search-control"><Search size={18} /><input value={search} onChange={(event) => updateSearch(event.target.value)} placeholder="Имя, компания, тег, телефон или email" /></label>
         <div className="view-switch" aria-label="Тип клиентов"><button className={view === "contacts" ? "is-active" : ""} type="button" aria-label="Контакты" onClick={() => setView("contacts")}><Users size={18} /></button><button className={view === "companies" ? "is-active" : ""} type="button" aria-label="Компании" onClick={() => setView("companies")}><Building2 size={18} /></button></div>
       </div>
 
@@ -223,11 +268,25 @@ export default function ContactsPage() {
           </button>
         ))}
       </section> : null}
+      {!loading && showPagination ? <nav className="list-pagination" aria-label={view === "contacts" ? "Пагинация контактов" : "Пагинация компаний"}>
+        <Button compact className="list-pagination__button" onClick={showPreviousPage} disabled={currentPage === 1 || fetching} aria-label="Предыдущая страница"><ChevronLeft size={16} /> Назад</Button>
+        <span className="list-pagination__status" aria-live="polite">Страница {currentPage}</span>
+        <Button compact className="list-pagination__button" onClick={showNextPage} disabled={!nextCursor || fetching} aria-label="Следующая страница">Далее <ChevronRight size={16} /></Button>
+      </nav> : null}
+      <button
+        className="mobile-fab contacts-page__mobile-add"
+        type="button"
+        aria-label={view === "contacts" ? "Добавить контакт" : "Добавить компанию"}
+        aria-controls="new-client-dialog"
+        onClick={() => setDialogOpen(true)}
+      >
+        <Plus aria-hidden="true" size={24} />
+      </button>
 
       <Dialog.Root open={dialogOpen} onOpenChange={setDialogOpen}>
         <Dialog.Portal>
           <Dialog.Overlay className="dialog-overlay" />
-          <Dialog.Content className="dialog-content">
+          <Dialog.Content id="new-client-dialog" className="dialog-content">
             <div className="dialog-header"><div><Dialog.Title>{view === "contacts" ? "Новый контакт" : "Новая компания"}</Dialog.Title><Dialog.Description>Запись будет доступна всей команде.</Dialog.Description></div><Dialog.Close className="icon-button" aria-label="Закрыть"><X size={20} /></Dialog.Close></div>
             <form className="form-stack" onSubmit={(event) => void createEntity(event)}>
               {view === "contacts" ? <><label className="field"><span>Имя</span><input name="first_name" required autoFocus /></label><label className="field"><span>Фамилия</span><input name="last_name" /></label></> : <label className="field"><span>Название</span><input name="name" required autoFocus /></label>}

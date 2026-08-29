@@ -1,0 +1,53 @@
+{
+  "id": "/",
+  "name": "Pulse CRM",
+  "short_name": "Pulse CRM",
+  "description": "Продажи, клиенты, задачи и повторные покупки",
+  "lang": "ru",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#f6f8fb",
+  "theme_color": "#4f46f5",
+  "orientation": "any",
+  "categories": ["business", "productivity"],
+  "icons": [
+    {
+      "src": "/icons/pulse-crm.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    },
+    {
+      "src": "/icons/pulse-crm-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/icons/pulse-crm-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/icons/pulse-crm-maskable-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ],
+  "shortcuts": [
+    {
+      "name": "Сделки",
+      "short_name": "Сделки",
+      "url": "/deals"
+    },
+    {
+      "name": "Задачи",
+      "short_name": "Задачи",
+      "url": "/tasks"
+    }
+  ],
+  "prefer_related_applications": false
+}

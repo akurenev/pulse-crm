@@ -9,7 +9,7 @@ import {
 } from "@dnd-kit/core";
 import { sortableKeyboardCoordinates } from "@dnd-kit/sortable";
 import { Columns3, Filter, List, Plus, Search } from "lucide-react";
-import { useDeferredValue, useEffect, useMemo, useState } from "react";
+import { useDeferredValue, useEffect, useId, useMemo, useState } from "react";
 
 import { Avatar } from "../../components/Avatar";
 import { Button } from "../../components/Button";
@@ -54,6 +54,7 @@ export function DealsPage() {
   const deferredSearch = useDeferredValue(search.trim().toLocaleLowerCase("ru"));
   const [createOpen, setCreateOpen] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
+  const kanbanScrollHintId = useId();
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 8 } }),
     useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
@@ -133,7 +134,7 @@ export function DealsPage() {
             {sourceOptions.map(([code, label]) => <option key={code} value={code}>{label}</option>)}
           </select>
         </label>
-        <button type="button" className="mobile-add" onClick={() => setCreateOpen(true)} aria-label="Новая сделка"><Plus size={23} /></button>
+        <button type="button" className="mobile-add mobile-fab" onClick={() => setCreateOpen(true)} aria-label="Новая сделка"><Plus size={23} aria-hidden="true" /></button>
         <div className="view-switch mobile-layout-switch" aria-label="Вид сделок на мобильном">
           <button type="button" className={layout === "list" ? "is-active" : ""} aria-label="Список" onClick={() => setLayout("list")}><List size={18} /></button>
           <button type="button" className={layout === "kanban" ? "is-active" : ""} aria-label="Kanban" onClick={() => setLayout("kanban")}><Columns3 size={18} /></button>
@@ -146,7 +147,14 @@ export function DealsPage() {
       {error ? <div className="load-error" role="alert">{error}</div> : null}
 
       {!loading && !error && layout === "kanban" ? <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={(event) => void handleDragEnd(event)}>
-        <div className="kanban" aria-label="Воронка продаж">
+        <div
+          className="kanban kanban--mobile-scroll"
+          role="region"
+          aria-label="Воронка продаж"
+          aria-describedby={kanbanScrollHintId}
+          tabIndex={0}
+        >
+          <p id={kanbanScrollHintId} className="sr-only">Прокручивайте воронку по горизонтали, чтобы увидеть остальные этапы.</p>
           {pipeline.stages.map((stage) => (
             <StageColumn
               key={stage.id}
@@ -166,12 +174,33 @@ export function DealsPage() {
       {!loading && !error && layout === "list" ? <section className="data-table deals-list" role="region" aria-label="Список сделок">
         <div className="data-table__header"><span>Сделка</span><span>Этап</span><span>Сумма</span><span>Источник и срок</span><span>Ответственный</span></div>
         {visibleDeals.map((deal) => (
-          <button className="data-row" type="button" key={deal.id} onClick={() => selectDeal(deal.id)}>
-            <span className="data-row__primary"><span className="company-avatar">{deal.title.slice(0, 1)}</span><span><strong>{deal.title}</strong><small>{deal.tags.length ? `${deal.subtitle} · ${deal.tags.join(" · ")}` : deal.subtitle}</small></span></span>
-            <span><strong>{pipeline.stages.find((stage) => stage.id === deal.stageId)?.name ?? "Без этапа"}</strong><small>{pipeline.name}</small></span>
-            <span><strong>{formatMoney(deal.amount)}</strong><small>{deal.currency}</small></span>
-            <span><SourceBadge source={deal.source} label={deal.sourceLabel} /><small>до {formatShortDate(deal.dueDate)}</small></span>
-            <span className="owner-line"><Avatar user={deal.assignee} size="sm" /><span>{deal.assignee.name}</span></span>
+          <button
+            className="data-row deals-list__row"
+            type="button"
+            key={deal.id}
+            aria-label={`Открыть сделку ${deal.title}. Этап ${pipeline.stages.find((stage) => stage.id === deal.stageId)?.name ?? "Без этапа"}. Сумма ${formatMoney(deal.amount)}. Источник ${deal.sourceLabel}. Срок ${formatShortDate(deal.dueDate)}. Ответственный ${deal.assignee.name}`}
+            onClick={() => selectDeal(deal.id)}
+          >
+            <span className="data-row__primary deals-list__deal" data-label="Сделка">
+              <span className="company-avatar" aria-hidden="true">{deal.title.slice(0, 1)}</span>
+              <span className="deals-list__identity">
+                <strong title={deal.title}>{deal.title}</strong>
+                <small title={deal.tags.length ? `${deal.subtitle} · ${deal.tags.join(" · ")}` : deal.subtitle}>{deal.tags.length ? `${deal.subtitle} · ${deal.tags.join(" · ")}` : deal.subtitle}</small>
+              </span>
+            </span>
+            <span className="deals-list__stage" data-label="Этап">
+              <strong>{pipeline.stages.find((stage) => stage.id === deal.stageId)?.name ?? "Без этапа"}</strong>
+              <small>{pipeline.name}</small>
+            </span>
+            <span className="deals-list__amount" data-label="Сумма">
+              <strong>{formatMoney(deal.amount)}</strong>
+              <small>{deal.currency}</small>
+            </span>
+            <span className="deals-list__source" data-label="Источник и срок">
+              <SourceBadge source={deal.source} label={deal.sourceLabel} />
+              <small className="deals-list__due-date">до <time dateTime={deal.dueDate}>{formatShortDate(deal.dueDate)}</time></small>
+            </span>
+            <span className="owner-line deals-list__owner" data-label="Ответственный"><Avatar user={deal.assignee} size="sm" /><span>{deal.assignee.name}</span></span>
           </button>
         ))}
       </section> : null}

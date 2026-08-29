@@ -76,6 +76,58 @@ async def test_contact_company_and_task_crud(
 
 
 @pytest.mark.asyncio
+async def test_company_and_contact_lists_support_cursor_pagination(
+    client: httpx.AsyncClient, owner_auth: dict[str, object]
+) -> None:
+    headers = csrf(owner_auth)
+    company_ids: set[str] = set()
+    contact_ids: set[str] = set()
+    for index in range(3):
+        company = await client.post(
+            "/api/v1/companies",
+            headers=headers,
+            json={"name": f"Cursor test company {index}"},
+        )
+        contact = await client.post(
+            "/api/v1/contacts",
+            headers=headers,
+            json={"first_name": "Cursor", "last_name": f"Test contact {index}"},
+        )
+        assert company.status_code == 201, company.text
+        assert contact.status_code == 201, contact.text
+        company_ids.add(company.json()["id"])
+        contact_ids.add(contact.json()["id"])
+
+    for collection, expected_ids in (
+        ("companies", company_ids),
+        ("contacts", contact_ids),
+    ):
+        first = await client.get(
+            f"/api/v1/{collection}", params={"limit": 2, "search": "Cursor"}
+        )
+        assert first.status_code == 200, first.text
+        assert len(first.json()["items"]) == 2
+        assert first.json()["next_cursor"]
+
+        second = await client.get(
+            f"/api/v1/{collection}",
+            params={
+                "limit": 2,
+                "search": "Cursor",
+                "cursor": first.json()["next_cursor"],
+            },
+        )
+        assert second.status_code == 200, second.text
+        assert len(second.json()["items"]) == 1
+        assert second.json()["next_cursor"] is None
+
+        listed_ids = {
+            item["id"] for item in [*first.json()["items"], *second.json()["items"]]
+        }
+        assert listed_ids == expected_ids
+
+
+@pytest.mark.asyncio
 async def test_deal_tags_round_trip_through_create_list_get_and_update(
     client: httpx.AsyncClient, owner_auth: dict[str, object]
 ) -> None:
