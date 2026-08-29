@@ -39,7 +39,10 @@ export function DealsPage() {
     setDealSearch,
     setDealCustomFields,
     nextCursorByStage,
+    loadedStageIds,
+    stageLoadErrorByStage,
     loadingStageId,
+    loadStageDeals,
     loadMoreDeals,
     addDeal,
     sendMessage,
@@ -148,7 +151,7 @@ export function DealsPage() {
 
       {!loading && !error && layout === "kanban" ? <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={(event) => void handleDragEnd(event)}>
         <div
-          className="kanban kanban--mobile-scroll"
+          className="kanban kanban--single-row kanban--mobile-scroll"
           role="region"
           aria-label="Воронка продаж"
           aria-describedby={kanbanScrollHintId}
@@ -163,8 +166,12 @@ export function DealsPage() {
               selectedDealId={selectedDealId}
               onSelect={selectDeal}
               onAdd={() => setCreateOpen(true)}
+              deferred={!loadedStageIds[stage.id] && (stage.stageType === "won" || stage.stageType === "lost")}
+              loadError={stageLoadErrorByStage[stage.id]}
               hasMore={Boolean(nextCursorByStage[stage.id])}
               loadingMore={loadingStageId === stage.id}
+              requestsBusy={Boolean(loadingStageId)}
+              onLoadDeferred={() => loadStageDeals(stage.id)}
               onLoadMore={() => loadMoreDeals(stage.id)}
             />
           ))}

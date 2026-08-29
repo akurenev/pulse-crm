@@ -37,6 +37,8 @@ from app.models import (
     CustomFieldDefinition,
     Deal,
     DealContact,
+    FieldEntity,
+    FieldType,
     Membership,
     Pipeline,
     Role,
@@ -459,6 +461,70 @@ async def test_workspace_writer_imports_full_domain_and_reruns_without_duplicate
         backfilled = await db.get(Deal, deal.id)
         assert backfilled is not None
         assert backfilled.tags == ["Повторная"]
+
+
+@pytest.mark.asyncio
+async def test_writer_does_not_reactivate_locally_deleted_custom_field() -> None:
+    async with SessionLocal() as db:
+        workspace = Workspace(name="Writer tombstone", slug="amocrm-writer-tombstone")
+        db.add(workspace)
+        await db.flush()
+        field = CustomFieldDefinition(
+            workspace_id=workspace.id,
+            entity_type=FieldEntity.deal,
+            key="amo_501",
+            name="Архивный номер",
+            field_type=FieldType.text,
+            is_active=False,
+        )
+        job = ImportJob(
+            workspace_id=workspace.id,
+            provider="amocrm",
+            status=ImportStatus.running,
+            dry_run=False,
+            entity_type="custom_fields",
+        )
+        db.add_all([field, job])
+        await db.flush()
+        db.add(
+            ExternalEntityMap(
+                workspace_id=workspace.id,
+                import_job_id=job.id,
+                provider="amocrm",
+                entity_type="custom_fields",
+                external_id="deal:501",
+                internal_id=field.id,
+                fingerprint="previous-import",
+            )
+        )
+        await db.flush()
+
+        result = await apply_import_page(
+            db,
+            job=job,
+            page=AmoPage(
+                entity_type="custom_fields",
+                entities=[
+                    AmoEntity(
+                        "custom_fields",
+                        "deal:501",
+                        {
+                            "id": 501,
+                            "name": "Номер заказа из amoCRM",
+                            "type": "text",
+                            "is_deleted": False,
+                        },
+                    )
+                ],
+                next_cursor=None,
+            ),
+            writer=PulseAmoWriter(),
+        )
+
+        await db.refresh(field)
+        assert result.updated == 1
+        assert field.name == "Номер заказа из amoCRM"
+        assert field.is_active is False
 
 
 def test_amo_tags_are_normalized_deduplicated_and_bounded() -> None:

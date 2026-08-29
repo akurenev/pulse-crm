@@ -2,10 +2,12 @@ import { cleanup, fireEvent, render, screen, within } from "@testing-library/rea
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { DndContext } from "@dnd-kit/core";
 
 import { CrmProvider } from "../../state/crm-store";
 import { DealsPage } from "./DealsPage";
+import { StageColumn } from "./StageColumn";
 
 afterEach(cleanup);
 
@@ -28,7 +30,7 @@ describe("DealsPage", () => {
     renderPage();
 
     const kanban = screen.getByRole("region", { name: "Воронка продаж" });
-    expect(kanban).toHaveClass("kanban--mobile-scroll");
+    expect(kanban).toHaveClass("kanban--single-row", "kanban--mobile-scroll");
     expect(kanban).toHaveAttribute("tabindex", "0");
     expect(document.getElementById(kanban.getAttribute("aria-describedby")!)).toHaveTextContent("Прокручивайте воронку по горизонтали");
 
@@ -38,6 +40,60 @@ describe("DealsPage", () => {
     await user.click(collapse);
     expect(collapse).toHaveAttribute("aria-expanded", "false");
     expect(within(firstStage).getByText("Анна Смирнова")).not.toBeVisible();
+  });
+
+  it("должен загружать финальный этап только по кнопке с его точным именем", async () => {
+    const user = userEvent.setup();
+    const loadStage = vi.fn().mockResolvedValue(undefined);
+
+    render(
+      <DndContext>
+        <StageColumn
+          stage={{ id: "won", name: "Успешно реализовано", color: "green", stageType: "won" }}
+          deals={[]}
+          selectedDealId={null}
+          onSelect={vi.fn()}
+          onAdd={vi.fn()}
+          deferred
+          loadError={null}
+          hasMore={false}
+          loadingMore={false}
+          onLoadDeferred={loadStage}
+          onLoadMore={vi.fn()}
+        />
+      </DndContext>,
+    );
+
+    const stage = screen.getByRole("region", { name: "Успешно реализовано" });
+    const button = within(stage).getByRole("button", { name: "Загрузить этап «Успешно реализовано»" });
+    expect(button).toHaveTextContent(/^Успешно реализовано$/);
+    expect(within(stage).queryByRole("button", { name: /Добавить сделку/ })).not.toBeInTheDocument();
+
+    await user.click(button);
+    expect(loadStage).toHaveBeenCalledOnce();
+  });
+
+  it("блокирует кнопки этапов, пока уже выполняется другой запрос", () => {
+    render(
+      <DndContext>
+        <StageColumn
+          stage={{ id: "lost", name: "Закрыто и не реализовано", color: "amber", stageType: "lost" }}
+          deals={[]}
+          selectedDealId={null}
+          onSelect={vi.fn()}
+          onAdd={vi.fn()}
+          deferred
+          loadError={null}
+          hasMore={false}
+          loadingMore={false}
+          requestsBusy
+          onLoadDeferred={vi.fn()}
+          onLoadMore={vi.fn()}
+        />
+      </DndContext>,
+    );
+
+    expect(screen.getByRole("button", { name: "Загрузить этап «Закрыто и не реализовано»" })).toBeDisabled();
   });
 
   it("provides stable mobile hooks for the add action and compact list rows", async () => {

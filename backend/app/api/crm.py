@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, Literal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import sqlalchemy as sa
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -38,6 +39,7 @@ from app.models import (
     StageType,
     Task,
     TaskStatus,
+    User,
 )
 from app.pagination import decode_cursor, encode_cursor
 from app.schemas import (
@@ -1161,6 +1163,43 @@ async def create_custom_field(
     return field
 
 
+@router.delete("/custom-fields/{field_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_custom_field(
+    field_id: uuid.UUID,
+    context: CurrentAdmin,
+    db: AsyncSession = Depends(get_session),
+) -> None:
+    field = await db.scalar(
+        sa.select(CustomFieldDefinition)
+        .where(
+            CustomFieldDefinition.id == field_id,
+            CustomFieldDefinition.workspace_id == context.workspace_id,
+            CustomFieldDefinition.is_active.is_(True),
+        )
+        .with_for_update()
+    )
+    if field is None:
+        raise not_found("custom field")
+
+    await db.execute(
+        sa.delete(StageRequiredField).where(
+            StageRequiredField.workspace_id == context.workspace_id,
+            StageRequiredField.field_definition_id == field.id,
+        )
+    )
+    field.is_active = False
+    record_domain_event(
+        db,
+        workspace_id=context.workspace_id,
+        event_type="custom_field.deleted",
+        entity_type="custom_field",
+        entity_id=field.id,
+        actor_id=context.user_id,
+        payload={"entity_type": field.entity_type.value, "key": field.key, "name": field.name},
+    )
+    await db.commit()
+
+
 @router.get("/stages/{stage_id}/required-fields", response_model=list[RequiredFieldRead])
 async def list_required_fields(
     stage_id: uuid.UUID,
@@ -1212,17 +1251,21 @@ async def replace_required_fields(
     ):
         raise HTTPException(status_code=422, detail="required fields must be unique")
     if definition_ids:
-        count = await db.scalar(
-            sa.select(sa.func.count())
-            .select_from(CustomFieldDefinition)
-            .where(
-                CustomFieldDefinition.id.in_(definition_ids),
-                CustomFieldDefinition.workspace_id == context.workspace_id,
-                CustomFieldDefinition.entity_type == FieldEntity.deal,
-                CustomFieldDefinition.is_active.is_(True),
-            )
+        active_definition_ids = set(
+            (
+                await db.scalars(
+                    sa.select(CustomFieldDefinition.id)
+                    .where(
+                        CustomFieldDefinition.id.in_(definition_ids),
+                        CustomFieldDefinition.workspace_id == context.workspace_id,
+                        CustomFieldDefinition.entity_type == FieldEntity.deal,
+                        CustomFieldDefinition.is_active.is_(True),
+                    )
+                    .with_for_update()
+                )
+            ).all()
         )
-        if count != len(definition_ids):
+        if active_definition_ids != set(definition_ids):
             raise HTTPException(status_code=422, detail="unknown or non-deal custom field")
     await db.execute(
         sa.delete(StageRequiredField).where(
@@ -1737,7 +1780,11 @@ async def transition_deal_stage(
             sa.select(StageRequiredField, CustomFieldDefinition)
             .outerjoin(
                 CustomFieldDefinition,
-                CustomFieldDefinition.id == StageRequiredField.field_definition_id,
+                sa.and_(
+                    CustomFieldDefinition.id == StageRequiredField.field_definition_id,
+                    CustomFieldDefinition.workspace_id == context.workspace_id,
+                    CustomFieldDefinition.is_active.is_(True),
+                ),
             )
             .where(
                 StageRequiredField.stage_id == target.id,
@@ -1829,9 +1876,12 @@ async def list_tasks(
     context: CurrentUser,
     db: AsyncSession = Depends(get_session),
     task_status: TaskStatus | None = Query(default=None, alias="status"),
+    scope: Literal["all", "today", "overdue", "upcoming"] = "all",
+    include_completed: bool = False,
+    search: str | None = Query(default=None, min_length=1, max_length=120),
     overdue: bool = False,
     cursor: str | None = None,
-    limit: int = Query(default=50, ge=1, le=100),
+    limit: int = Query(default=25, ge=1, le=100),
 ) -> TaskPage:
     await enforce_cursor_page_budget(
         db,
@@ -1843,6 +1893,44 @@ async def list_tasks(
     query = sa.select(Task).where(Task.workspace_id == context.workspace_id)
     if task_status:
         query = query.where(Task.status == task_status)
+    elif include_completed:
+        query = query.where(
+            Task.status.in_((TaskStatus.open, TaskStatus.completed, TaskStatus.cancelled))
+        )
+    else:
+        query = query.where(Task.status == TaskStatus.open)
+
+    if search and (term := search.strip()):
+        pattern = _literal_contains_pattern(term)
+        query = query.join(User, User.id == Task.assignee_id).where(
+            sa.or_(
+                Task.title.ilike(pattern, escape="\\"),
+                Task.description.ilike(pattern, escape="\\"),
+                User.full_name.ilike(pattern, escape="\\"),
+            )
+        )
+
+    if scope != "all":
+        try:
+            workspace_timezone = ZoneInfo(context.workspace.timezone)
+        except (ValueError, ZoneInfoNotFoundError):
+            workspace_timezone = ZoneInfo("UTC")
+        now = datetime.now(UTC)
+        local_now = now.astimezone(workspace_timezone)
+        today_start = datetime.combine(
+            local_now.date(), datetime.min.time(), tzinfo=workspace_timezone
+        ).astimezone(UTC)
+        tomorrow_start = datetime.combine(
+            local_now.date() + timedelta(days=1),
+            datetime.min.time(),
+            tzinfo=workspace_timezone,
+        ).astimezone(UTC)
+        if scope == "today":
+            query = query.where(Task.due_at >= today_start, Task.due_at < tomorrow_start)
+        elif scope == "overdue":
+            query = query.where(Task.due_at < now)
+        else:
+            query = query.where(Task.due_at >= tomorrow_start)
     if overdue:
         query = query.where(Task.status == TaskStatus.open, Task.due_at < sa.func.now())
     if (condition := _cursor_condition(Task, cursor)) is not None:

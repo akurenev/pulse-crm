@@ -168,6 +168,15 @@ class Invitation(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
 class Company(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "companies"
+    __table_args__ = (
+        sa.Index(
+            "ix_companies_workspace_deleted_created_id",
+            "workspace_id",
+            "deleted_at",
+            "created_at",
+            "id",
+        ),
+    )
 
     workspace_id: Mapped[uuid.UUID] = mapped_column(
         UUID_TYPE, sa.ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False, index=True
@@ -188,6 +197,13 @@ class Contact(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         sa.Index("ix_contacts_company_id", "company_id"),
         sa.Index("ix_contacts_workspace_email", "workspace_id", "primary_email"),
         sa.Index("ix_contacts_workspace_phone", "workspace_id", "primary_phone"),
+        sa.Index(
+            "ix_contacts_workspace_deleted_created_id",
+            "workspace_id",
+            "deleted_at",
+            "created_at",
+            "id",
+        ),
     )
 
     workspace_id: Mapped[uuid.UUID] = mapped_column(
@@ -311,6 +327,15 @@ class Deal(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "deals"
     __table_args__ = (
         sa.Index("ix_deals_workspace_pipeline_stage", "workspace_id", "pipeline_id", "stage_id"),
+        sa.Index(
+            "ix_deals_workspace_pipeline_stage_deleted_created_id",
+            "workspace_id",
+            "pipeline_id",
+            "stage_id",
+            "deleted_at",
+            "created_at",
+            "id",
+        ),
         sa.Index("ix_deals_company_id", "company_id"),
         sa.Index("ix_deals_assignee_id", "assignee_id"),
         sa.Index("ix_deals_source_id", "source_id"),
@@ -401,6 +426,13 @@ class Task(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "tasks"
     __table_args__ = (
         sa.Index("ix_tasks_workspace_status_due", "workspace_id", "status", "due_at"),
+        sa.Index(
+            "ix_tasks_workspace_status_created_id",
+            "workspace_id",
+            "status",
+            "created_at",
+            "id",
+        ),
         sa.Index("ix_tasks_assignee_id", "assignee_id"),
         sa.Index("ix_tasks_deal_id", "deal_id"),
         sa.Index("ix_tasks_contact_id", "contact_id"),

@@ -1,5 +1,5 @@
 import * as Tabs from "@radix-ui/react-tabs";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AlertTriangle,
   Bot,
@@ -137,6 +137,7 @@ type PipelineManagementEditor =
   | { kind: "rename-stage"; pipeline: ApiPipeline; stage: ApiStage };
 
 function PipelinesPanel({ currentPipeline, dealsCount }: { currentPipeline: Pipeline; dealsCount: number }) {
+  const queryClient = useQueryClient();
   const [editor, setEditor] = useState<"pipeline" | "custom-field" | null>(null);
   const [managementEditor, setManagementEditor] = useState<PipelineManagementEditor | null>(null);
   const [selectedStage, setSelectedStage] = useState<{ pipelineName: string; stage: ApiStage } | null>(null);
@@ -146,7 +147,7 @@ function PipelinesPanel({ currentPipeline, dealsCount }: { currentPipeline: Pipe
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [actionError, setActionError] = useState("");
   const pipelinesQuery = useQuery({ queryKey: ["settings", "pipelines"], queryFn: () => api.get<ApiPipeline[]>("/pipelines"), enabled: remoteEnabled });
-  const customFieldsQuery = useQuery({ queryKey: ["settings", "custom-fields", "deal"], queryFn: () => api.get<ApiCustomField[]>("/custom-fields?entity_type=deal"), enabled: remoteEnabled });
+  const customFieldsQuery = useQuery({ queryKey: ["deal-custom-fields"], queryFn: () => api.get<ApiCustomField[]>("/custom-fields?entity_type=deal"), enabled: remoteEnabled });
   const pipelines = remoteEnabled ? pipelinesQuery.data ?? [] : localPipelines;
   const customFields = remoteEnabled ? customFieldsQuery.data ?? [] : localCustomFields;
 
@@ -239,6 +240,32 @@ function PipelinesPanel({ currentPipeline, dealsCount }: { currentPipeline: Pipe
     setEditor(null);
   }
 
+  async function deleteCustomField(field: ApiCustomField) {
+    if (!window.confirm(`Удалить поле «${field.name}»? Оно исчезнет из карточек и обязательных полей этапов. Уже сохранённые значения сделок останутся в базе.`)) return;
+    setDeletingId(field.id);
+    setActionError("");
+    try {
+      if (remoteEnabled) {
+        await api.delete(`/custom-fields/${field.id}`);
+        await queryClient.invalidateQueries({ queryKey: ["deal-custom-fields"] });
+      } else {
+        setLocalCustomFields((items) => items.filter((item) => item.id !== field.id));
+      }
+      setRequiredByStage((current) => Object.fromEntries(
+        Object.entries(current).map(([stageId, fields]) => [
+          stageId,
+          fields.filter((required) => required.field_definition_id !== field.id),
+        ]),
+      ));
+      setSelectedStage(null);
+      window.dispatchEvent(new Event("pulse:refresh"));
+    } catch (reason) {
+      setActionError(errorMessage(reason, "Не удалось удалить пользовательское поле."));
+    } finally {
+      setDeletingId(null);
+    }
+  }
+
   function requiredFieldsSaved(stageId: string, fields: ApiRequiredField[]) {
     setRequiredByStage((current) => ({ ...current, [stageId]: fields }));
     setSelectedStage(null);
@@ -262,7 +289,7 @@ function PipelinesPanel({ currentPipeline, dealsCount }: { currentPipeline: Pipe
       <section className="settings-field-catalog" aria-label="Поля сделок">
         <header><div><strong>Пользовательские поля сделок</strong><span>Доступны в карточке и в правилах обязательности этапов.</span></div><em>{customFields.length}</em></header>
         <div>
-          {customFields.map((field) => <span className="settings-field-chip" key={field.id}><strong>{field.name}</strong><small>{fieldTypeLabel(field.field_type)} · {field.key}</small></span>)}
+          {customFields.map((field) => <span className="settings-field-chip" key={field.id}><span className="settings-field-chip__copy"><strong>{field.name}</strong><small>{fieldTypeLabel(field.field_type)} · {field.key}</small></span><button type="button" className="icon-button settings-field-chip__delete" aria-label={`Удалить поле сделки ${field.name}`} title="Удалить поле" disabled={deletingId === field.id} onClick={() => void deleteCustomField(field)}><Trash2 size={14} /></button></span>)}
           {!customFields.length && !customFieldsQuery.isLoading ? <small>Пока используются только встроенные поля.</small> : null}
           {customFieldsQuery.isLoading ? <small>Загружаем поля…</small> : null}
         </div>

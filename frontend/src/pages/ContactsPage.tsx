@@ -1,7 +1,7 @@
 import * as Dialog from "@radix-ui/react-dialog";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { Building2, ChevronLeft, ChevronRight, Plus, Search, Users, X } from "lucide-react";
-import { useDeferredValue, useMemo, useState, type FormEvent } from "react";
+import { keepPreviousData, useQuery, useQueryClient } from "@tanstack/react-query";
+import { Building2, ChevronLeft, ChevronRight, Plus, RefreshCw, Search, Users, X } from "lucide-react";
+import { useEffect, useMemo, useState, type FormEvent } from "react";
 
 import { Avatar } from "../components/Avatar";
 import { Button } from "../components/Button";
@@ -12,6 +12,18 @@ import type { ApiActivity, ApiCompany, ApiContact, ApiDeal, CursorPage } from ".
 import type { Contact } from "../types/crm";
 
 const CLIENTS_PAGE_SIZE = 25;
+const CLIENT_SEARCH_DELAY_MS = 350;
+
+function useDebouncedValue(value: string, delay: number) {
+  const [debouncedValue, setDebouncedValue] = useState(value);
+
+  useEffect(() => {
+    const timeout = window.setTimeout(() => setDebouncedValue(value), delay);
+    return () => window.clearTimeout(timeout);
+  }, [delay, value]);
+
+  return debouncedValue;
+}
 
 function listPagePath(collection: "contacts" | "companies", cursor: string | null, search: string) {
   const params = new URLSearchParams({ limit: String(CLIENTS_PAGE_SIZE) });
@@ -46,18 +58,29 @@ export default function ContactsPage() {
   const [noteError, setNoteError] = useState("");
   const [contactCursors, setContactCursors] = useState<Array<string | null>>([null]);
   const [companyCursors, setCompanyCursors] = useState<Array<string | null>>([null]);
-  const deferred = useDeferredValue(search.toLocaleLowerCase("ru"));
+  const normalizedSearch = search.trim().toLocaleLowerCase("ru");
+  const debouncedSearch = useDebouncedValue(normalizedSearch, CLIENT_SEARCH_DELAY_MS);
   const contactCursor = contactCursors.at(-1) ?? null;
   const companyCursor = companyCursors.at(-1) ?? null;
   const remoteContacts = useQuery({
-    queryKey: ["contacts", deferred, contactCursor],
-    queryFn: () => api.get<CursorPage<ApiContact>>(listPagePath("contacts", contactCursor, deferred)),
-    enabled: remoteEnabled,
+    queryKey: ["contacts", debouncedSearch, contactCursor],
+    queryFn: ({ signal }) => api.get<CursorPage<ApiContact>>(
+      listPagePath("contacts", contactCursor, debouncedSearch),
+      { signal },
+    ),
+    enabled: remoteEnabled && view === "contacts",
+    placeholderData: keepPreviousData,
+    staleTime: 30_000,
   });
   const remoteCompanies = useQuery({
-    queryKey: ["companies", deferred, companyCursor],
-    queryFn: () => api.get<CursorPage<ApiCompany>>(listPagePath("companies", companyCursor, deferred)),
+    queryKey: ["companies", debouncedSearch, companyCursor],
+    queryFn: ({ signal }) => api.get<CursorPage<ApiCompany>>(
+      listPagePath("companies", companyCursor, debouncedSearch),
+      { signal },
+    ),
     enabled: remoteEnabled && view === "companies",
+    placeholderData: keepPreviousData,
+    staleTime: 30_000,
   });
   const sourceContacts = useMemo<Contact[]>(() => {
     if (!remoteEnabled) return demoContacts;
@@ -70,20 +93,20 @@ export default function ContactsPage() {
       tags: contact.tags,
       deals: 0,
       revenue: 0,
-      assignee: users.ak,
+      assignee: null,
     }));
   }, [demoContacts, remoteContacts.data]);
   const visibleContacts = useMemo(
-    () => sourceContacts.filter((contact) => `${contact.name} ${contact.company} ${contact.email} ${contact.phone} ${contact.tags.join(" ")}`.toLocaleLowerCase("ru").includes(deferred)),
-    [deferred, sourceContacts],
+    () => sourceContacts.filter((contact) => `${contact.name} ${contact.company} ${contact.email} ${contact.phone} ${contact.tags.join(" ")}`.toLocaleLowerCase("ru").includes(normalizedSearch)),
+    [normalizedSearch, sourceContacts],
   );
   const sourceCompanies = useMemo<ApiCompany[]>(() => {
     if (remoteEnabled) return remoteCompanies.data?.items ?? [];
     return demoCompanies;
   }, [demoCompanies, remoteCompanies.data]);
   const visibleCompanies = useMemo(
-    () => sourceCompanies.filter((company) => `${company.name} ${company.email ?? ""} ${company.phone ?? ""} ${company.tags.join(" ")}`.toLocaleLowerCase("ru").includes(deferred)),
-    [deferred, sourceCompanies],
+    () => sourceCompanies.filter((company) => `${company.name} ${company.email ?? ""} ${company.phone ?? ""} ${company.tags.join(" ")}`.toLocaleLowerCase("ru").includes(normalizedSearch)),
+    [normalizedSearch, sourceCompanies],
   );
   const loading = view === "contacts" ? remoteContacts.isLoading : remoteCompanies.isLoading;
   const failed = view === "contacts" ? remoteContacts.isError : remoteCompanies.isError;
@@ -208,6 +231,14 @@ export default function ContactsPage() {
     }
   }
 
+  function retryActiveList() {
+    if (view === "contacts") {
+      void remoteContacts.refetch();
+    } else {
+      void remoteCompanies.refetch();
+    }
+  }
+
   async function createNote(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const form = event.currentTarget;
@@ -243,7 +274,10 @@ export default function ContactsPage() {
       </div>
 
       {loading ? <div className="route-loading" role="status">Загружаем клиентов…</div> : null}
-      {failed ? <div className="load-error" role="alert">Не удалось загрузить клиентов</div> : null}
+      {failed ? <div className="load-error load-error--action" role="alert">
+        <span>Не удалось загрузить {view === "contacts" ? "контакты" : "компании"}. Проверьте соединение и попробуйте ещё раз.</span>
+        <Button compact onClick={retryActiveList} disabled={fetching}><RefreshCw size={15} /> {fetching ? "Повторяем…" : "Повторить"}</Button>
+      </div> : null}
       {!loading && !failed && view === "contacts" ? <section className="data-table" role="region" aria-label="Список контактов">
         <div className="data-table__header"><span>Клиент</span><span>Контакты</span><span>Сделки</span><span>Следующая покупка</span><span>Ответственный</span></div>
         {visibleContacts.map((contact) => (
@@ -252,7 +286,7 @@ export default function ContactsPage() {
             <span className="data-row__contact"><strong>{contact.phone}</strong><small>{contact.email}</small></span>
             <span>{remoteEnabled ? <><strong>—</strong><small>см. карточку</small></> : <><strong>{contact.deals}</strong><small>{formatMoney(contact.revenue)}</small></>}</span>
             <span>{contact.nextPurchaseAt ? formatLongDate(contact.nextPurchaseAt) : "Не запланирована"}</span>
-            <span className="owner-line"><Avatar user={contact.assignee} size="sm" /><span>{contact.assignee.name}</span></span>
+            {contact.assignee ? <span className="owner-line"><Avatar user={contact.assignee} size="sm" /><span>{contact.assignee.name}</span></span> : <span className="owner-line owner-line--unassigned">Не назначен</span>}
           </button>
         ))}
       </section> : null}
@@ -323,7 +357,7 @@ export default function ContactsPage() {
               <div><small>Телефон</small><strong>{selectedContact.phone}</strong></div>
               <div><small>Email</small><strong>{selectedContact.email}</strong></div>
               <div><small>Компания</small><strong>{selectedContact.company}</strong></div>
-              <div><small>Ответственный</small><strong>{selectedContact.assignee.name}</strong></div>
+              <div><small>Ответственный</small><strong>{selectedContact.assignee?.name ?? "Не назначен"}</strong></div>
               <div className="record-detail-grid__wide"><small>Теги</small><strong>{selectedContact.tags.length ? selectedContact.tags.join(", ") : "Нет тегов"}</strong></div>
               <div><small>Покупок</small><strong>{remoteEnabled ? selectedPurchases.length : selectedContact.deals}</strong></div>
               <div><small>Покупок на сумму</small><strong>{formatMoney(remoteEnabled ? selectedRevenue : selectedContact.revenue)}</strong></div>

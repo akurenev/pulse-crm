@@ -83,7 +83,7 @@ export interface Contact {
   deals: number;
   revenue: number;
   nextPurchaseAt?: string;
-  assignee: UserSummary;
+  assignee: UserSummary | null;
 }
 
 export interface TaskItem {

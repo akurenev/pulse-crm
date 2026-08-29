@@ -765,9 +765,19 @@ class PulseAmoWriter(ImportEntityWriter):
             target = FieldEntity(target_name)
         except ValueError as exc:
             raise AmoImportError("amoCRM custom field has an invalid entity type") from exc
-        model = await _scoped_existing(
-            session, CustomFieldDefinition, workspace_id, existing_internal_id
+        model = (
+            await session.scalar(
+                sa.select(CustomFieldDefinition)
+                .where(
+                    CustomFieldDefinition.id == existing_internal_id,
+                    CustomFieldDefinition.workspace_id == workspace_id,
+                )
+                .with_for_update()
+            )
+            if existing_internal_id is not None
+            else None
         )
+        was_active = model is None or model.is_active
         external_field_id = entity.external_id.split(":", 1)[-1]
         key = f"amo_{external_field_id}"[:64]
         if model is None:
@@ -784,7 +794,9 @@ class PulseAmoWriter(ImportEntityWriter):
         model.name = _required_text(entity.data.get("name"), f"Поле {external_field_id}")[:120]
         model.field_type = _amo_field_type(str(entity.data.get("type") or "text"))
         model.options = _field_options(entity.data)
-        model.is_active = not bool(entity.data.get("is_deleted"))
+        # A locally deleted field is a tombstone: later amoCRM imports may refresh
+        # its metadata and mapping, but must not make the field visible again.
+        model.is_active = was_active and not bool(entity.data.get("is_deleted"))
         await session.flush()
         return model.id
 

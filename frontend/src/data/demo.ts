@@ -18,10 +18,12 @@ export const pipeline: Pipeline = {
   id: "pipeline-repeat-sales",
   name: "Повторные продажи",
   stages: [
-    { id: "new", name: "Новый лид", color: "blue" },
-    { id: "contacted", name: "Связались", color: "violet" },
-    { id: "proposal", name: "Предложение", color: "green" },
-    { id: "payment", name: "Ожидаем оплату", color: "amber" },
+    { id: "new", name: "Новый лид", color: "blue", stageType: "open" },
+    { id: "contacted", name: "Связались", color: "violet", stageType: "open" },
+    { id: "proposal", name: "Предложение", color: "green", stageType: "open" },
+    { id: "payment", name: "Ожидаем оплату", color: "amber", stageType: "open" },
+    { id: "won", name: "Успешно реализовано", color: "green", stageType: "won" },
+    { id: "lost", name: "Закрыто и не реализовано", color: "amber", stageType: "lost" },
   ],
 };
 

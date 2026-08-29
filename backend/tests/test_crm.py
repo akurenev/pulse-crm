@@ -18,7 +18,16 @@ from app.integrations.models import (
     NotificationTemplate,
     WebhookEndpoint,
 )
-from app.models import ActivityEvent, OutboxEvent, Pipeline, RealtimeEvent, Stage, Workspace
+from app.models import (
+    ActivityEvent,
+    CustomFieldDefinition,
+    OutboxEvent,
+    Pipeline,
+    RealtimeEvent,
+    Stage,
+    Task,
+    Workspace,
+)
 
 
 def csrf(auth: dict[str, object]) -> dict[str, str]:
@@ -73,6 +82,165 @@ async def test_contact_company_and_task_crud(
     contacts = await client.get("/api/v1/contacts", params={"search": "ada"})
     assert len(companies.json()["items"]) == 1
     assert len(contacts.json()["items"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_task_list_hides_closed_before_cursor_pagination(
+    client: httpx.AsyncClient, owner_auth: dict[str, object]
+) -> None:
+    headers = csrf(owner_auth)
+    owner_id = (await client.get("/api/v1/users")).json()[0]["id"]
+    created: dict[str, dict[str, object]] = {}
+    for title, due_at in (
+        ("Past open task", datetime.now(UTC) - timedelta(days=2)),
+        ("Today open task", datetime.now(UTC)),
+        ("Future open task", datetime.now(UTC) + timedelta(days=2)),
+        ("Today completed task", datetime.now(UTC)),
+        ("Today cancelled task", datetime.now(UTC)),
+    ):
+        response = await client.post(
+            "/api/v1/tasks",
+            headers=headers,
+            json={"title": title, "due_at": due_at.isoformat(), "assignee_id": owner_id},
+        )
+        assert response.status_code == 201, response.text
+        created[title] = response.json()
+
+    completed = created["Today completed task"]
+    response = await client.patch(
+        f"/api/v1/tasks/{completed['id']}",
+        headers=headers,
+        json={"expected_version": completed["version"], "status": "completed"},
+    )
+    assert response.status_code == 200, response.text
+
+    cancelled = created["Today cancelled task"]
+    response = await client.patch(
+        f"/api/v1/tasks/{cancelled['id']}",
+        headers=headers,
+        json={"expected_version": cancelled["version"], "status": "cancelled"},
+    )
+    assert response.status_code == 200, response.text
+
+    first = await client.get("/api/v1/tasks", params={"limit": 2})
+    assert first.status_code == 200, first.text
+    assert len(first.json()["items"]) == 2
+    assert first.json()["next_cursor"]
+    assert all(item["status"] == "open" for item in first.json()["items"])
+
+    second = await client.get(
+        "/api/v1/tasks",
+        params={"limit": 2, "cursor": first.json()["next_cursor"]},
+    )
+    assert second.status_code == 200, second.text
+    assert len(second.json()["items"]) == 1
+    assert second.json()["next_cursor"] is None
+
+    visible_titles = {
+        item["title"] for item in [*first.json()["items"], *second.json()["items"]]
+    }
+    assert visible_titles == {"Past open task", "Today open task", "Future open task"}
+
+    with_completed = await client.get(
+        "/api/v1/tasks", params={"limit": 25, "include_completed": True}
+    )
+    assert with_completed.status_code == 200, with_completed.text
+    assert {item["title"] for item in with_completed.json()["items"]} == set(created)
+
+    completed_only = await client.get(
+        "/api/v1/tasks", params={"status": "completed"}
+    )
+    assert completed_only.status_code == 200, completed_only.text
+    assert [item["title"] for item in completed_only.json()["items"]] == [
+        "Today completed task"
+    ]
+
+    cancelled_only = await client.get("/api/v1/tasks", params={"status": "cancelled"})
+    assert cancelled_only.status_code == 200, cancelled_only.text
+    assert [item["title"] for item in cancelled_only.json()["items"]] == [
+        "Today cancelled task"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_task_list_defaults_to_pages_of_25(
+    client: httpx.AsyncClient, owner_auth: dict[str, object]
+) -> None:
+    workspace_id = as_uuid(owner_auth["workspace"]["id"])
+    owner_id = as_uuid(owner_auth["user"]["id"])
+    async with SessionLocal() as db:
+        db.add_all(
+            [
+                Task(
+                    workspace_id=workspace_id,
+                    title=f"Default page task {index}",
+                    due_at=datetime.now(UTC) + timedelta(days=1),
+                    assignee_id=owner_id,
+                )
+                for index in range(26)
+            ]
+        )
+        await db.commit()
+
+    first = await client.get("/api/v1/tasks")
+    assert first.status_code == 200, first.text
+    assert len(first.json()["items"]) == 25
+    assert first.json()["next_cursor"]
+
+    second = await client.get(
+        "/api/v1/tasks", params={"cursor": first.json()["next_cursor"]}
+    )
+    assert second.status_code == 200, second.text
+    assert len(second.json()["items"]) == 1
+    assert second.json()["next_cursor"] is None
+
+    searched = await client.get("/api/v1/tasks", params={"search": "task 25"})
+    assert searched.status_code == 200, searched.text
+    assert [item["title"] for item in searched.json()["items"]] == [
+        "Default page task 25"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_task_scopes_filter_by_workspace_day_before_pagination(
+    client: httpx.AsyncClient, owner_auth: dict[str, object]
+) -> None:
+    headers = csrf(owner_auth)
+    owner_id = (await client.get("/api/v1/users")).json()[0]["id"]
+    for title, due_at in (
+        ("Past task", datetime.now(UTC) - timedelta(days=2)),
+        ("Today task", datetime.now(UTC)),
+        ("Upcoming task", datetime.now(UTC) + timedelta(days=2)),
+    ):
+        response = await client.post(
+            "/api/v1/tasks",
+            headers=headers,
+            json={"title": title, "due_at": due_at.isoformat(), "assignee_id": owner_id},
+        )
+        assert response.status_code == 201, response.text
+
+    expected_by_scope = {
+        "today": {"Today task"},
+        "overdue": {"Past task", "Today task"},
+        "upcoming": {"Upcoming task"},
+    }
+    for scope, expected_titles in expected_by_scope.items():
+        response = await client.get(
+            "/api/v1/tasks", params={"scope": scope, "limit": 25}
+        )
+        assert response.status_code == 200, response.text
+        assert {item["title"] for item in response.json()["items"]} == expected_titles
+        assert response.json()["next_cursor"] is None
+
+    async with SessionLocal() as db:
+        await db.execute(
+            sa.update(Workspace)
+            .where(Workspace.id == as_uuid(owner_auth["workspace"]["id"]))
+            .values(timezone="Invalid/Timezone")
+        )
+        await db.commit()
+    invalid_timezone = await client.get("/api/v1/tasks", params={"scope": "today"})
+    assert invalid_timezone.status_code == 200, invalid_timezone.text
 
 
 @pytest.mark.asyncio
@@ -303,6 +471,122 @@ async def test_required_fields_block_stage_transition_and_versions_conflict(
         "deal.updated",
         "deal.stage_changed",
     }
+
+
+@pytest.mark.asyncio
+async def test_custom_field_delete_hides_definition_and_keeps_deal_values(
+    client: httpx.AsyncClient, owner_auth: dict[str, object]
+) -> None:
+    headers = csrf(owner_auth)
+    pipeline = (await client.get("/api/v1/pipelines")).json()[0]
+    initial_stage, target_stage = pipeline["stages"][:2]
+    custom_field = await client.post(
+        "/api/v1/custom-fields",
+        headers=headers,
+        json={
+            "entity_type": "deal",
+            "key": "legacy_reference",
+            "name": "Архивный номер",
+            "field_type": "text",
+        },
+    )
+    assert custom_field.status_code == 201, custom_field.text
+    field_id = custom_field.json()["id"]
+
+    required = await client.put(
+        f"/api/v1/stages/{target_stage['id']}/required-fields",
+        headers=headers,
+        json={"fields": [{"field_definition_id": field_id}]},
+    )
+    assert required.status_code == 200, required.text
+    deal = await client.post(
+        "/api/v1/deals",
+        headers=headers,
+        json={
+            "title": "Deal retaining deleted field value",
+            "pipeline_id": pipeline["id"],
+            "stage_id": initial_stage["id"],
+            "custom_fields": {"legacy_reference": "ARCH-42"},
+        },
+    )
+    assert deal.status_code == 201, deal.text
+
+    deleted = await client.delete(f"/api/v1/custom-fields/{field_id}", headers=headers)
+    assert deleted.status_code == 204, deleted.text
+
+    definitions = await client.get("/api/v1/custom-fields", params={"entity_type": "deal"})
+    assert definitions.status_code == 200, definitions.text
+    assert field_id not in {item["id"] for item in definitions.json()}
+    remaining_required = await client.get(
+        f"/api/v1/stages/{target_stage['id']}/required-fields"
+    )
+    assert remaining_required.status_code == 200, remaining_required.text
+    assert remaining_required.json() == []
+    loaded_deal = await client.get(f"/api/v1/deals/{deal.json()['id']}")
+    assert loaded_deal.status_code == 200, loaded_deal.text
+    assert loaded_deal.json()["custom_fields"]["legacy_reference"] == "ARCH-42"
+
+    repeated = await client.delete(f"/api/v1/custom-fields/{field_id}", headers=headers)
+    assert repeated.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_inactive_required_custom_field_does_not_block_stage_transition(
+    client: httpx.AsyncClient, owner_auth: dict[str, object]
+) -> None:
+    headers = csrf(owner_auth)
+    pipeline = (await client.get("/api/v1/pipelines")).json()[0]
+    initial_stage, target_stage = pipeline["stages"][:2]
+    custom_field = await client.post(
+        "/api/v1/custom-fields",
+        headers=headers,
+        json={
+            "entity_type": "deal",
+            "key": "inactive_requirement",
+            "name": "Неактивное обязательное поле",
+            "field_type": "text",
+        },
+    )
+    assert custom_field.status_code == 201, custom_field.text
+    required = await client.put(
+        f"/api/v1/stages/{target_stage['id']}/required-fields",
+        headers=headers,
+        json={"fields": [{"field_definition_id": custom_field.json()["id"]}]},
+    )
+    assert required.status_code == 200, required.text
+    deal = await client.post(
+        "/api/v1/deals",
+        headers=headers,
+        json={
+            "title": "Deal with stale inactive requirement",
+            "pipeline_id": pipeline["id"],
+            "stage_id": initial_stage["id"],
+        },
+    )
+    assert deal.status_code == 201, deal.text
+
+    async with SessionLocal() as db:
+        await db.execute(
+            sa.update(CustomFieldDefinition)
+            .where(CustomFieldDefinition.id == as_uuid(custom_field.json()["id"]))
+            .values(is_active=False)
+        )
+        await db.commit()
+
+    rejected_requirement = await client.put(
+        f"/api/v1/stages/{target_stage['id']}/required-fields",
+        headers=headers,
+        json={"fields": [{"field_definition_id": custom_field.json()["id"]}]},
+    )
+    assert rejected_requirement.status_code == 422, rejected_requirement.text
+
+    moved = await client.patch(
+        f"/api/v1/deals/{deal.json()['id']}/stage",
+        headers=headers,
+        json={"target_stage_id": target_stage["id"], "expected_version": 1},
+    )
+    assert moved.status_code == 200, moved.text
+    assert moved.json()["stage_id"] == target_stage["id"]
 
 
 @pytest.mark.asyncio

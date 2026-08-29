@@ -54,6 +54,10 @@ function renderPage() {
   );
 }
 
+function requestedPaths() {
+  return getMock.mock.calls.map(([path]) => path as string);
+}
+
 beforeEach(() => {
   getMock.mockReset();
   postMock.mockReset();
@@ -86,12 +90,13 @@ describe("ContactsPage pagination", () => {
     renderPage();
 
     expect(await screen.findByText("Первый Контакт")).toBeInTheDocument();
-    expect(getMock).toHaveBeenCalledWith("/contacts?limit=25");
+    expect(requestedPaths()).toContain("/contacts?limit=25");
+    expect(requestedPaths().some((path) => path.startsWith("/companies?"))).toBe(false);
 
     await user.click(screen.getByRole("button", { name: "Следующая страница" }));
     expect(await screen.findByText("Второй Контакт")).toBeInTheDocument();
     expect(screen.getByText("Страница 2")).toBeInTheDocument();
-    expect(getMock).toHaveBeenCalledWith("/contacts?limit=25&cursor=contacts-page-2");
+    expect(requestedPaths()).toContain("/contacts?limit=25&cursor=contacts-page-2");
 
     await user.click(screen.getByRole("button", { name: "Предыдущая страница" }));
     expect(await screen.findByText("Первый Контакт")).toBeInTheDocument();
@@ -104,7 +109,7 @@ describe("ContactsPage pagination", () => {
     expect(await screen.findByText("Первая компания")).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Следующая страница" }));
     expect(await screen.findByText("Вторая компания")).toBeInTheDocument();
-    expect(getMock).toHaveBeenCalledWith("/companies?limit=25&cursor=companies-page-2");
+    expect(requestedPaths()).toContain("/companies?limit=25&cursor=companies-page-2");
 
     await user.click(screen.getByRole("button", { name: "Контакты" }));
     expect(await screen.findByText("Второй Контакт")).toBeInTheDocument();
@@ -116,6 +121,30 @@ describe("ContactsPage pagination", () => {
     await waitFor(() => {
       expect(getMock.mock.calls.some(([path]) => path === "/contacts?limit=25&search=%D0%BF%D0%B5%D1%80%D0%B2%D1%8B%D0%B9")).toBe(true);
     });
+    expect(requestedPaths().filter((path) => path.includes("/contacts?") && path.includes("search=")).length).toBe(1);
+  });
+
+  it("shows no invented assignee for remote contacts and retries a failed request", async () => {
+    const user = userEvent.setup();
+    let contactAttempts = 0;
+    getMock.mockImplementation((path: string) => {
+      if (path.startsWith("/contacts?")) {
+        contactAttempts += 1;
+        if (contactAttempts === 1) return Promise.reject(new TypeError("Network request failed"));
+        return Promise.resolve({ items: [contact("contact-retry", "После повтора")], next_cursor: null });
+      }
+      return Promise.reject(new Error(`Unexpected GET ${path}`));
+    });
+
+    renderPage();
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("Проверьте соединение");
+    expect(screen.queryByText("Алексей Кузнецов")).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Повторить" }));
+
+    expect(await screen.findByText("После повтора Контакт")).toBeInTheDocument();
+    expect(screen.getByText("Не назначен")).toBeInTheDocument();
+    expect(contactAttempts).toBe(2);
   });
 
   it("opens the shared creation dialog from the mobile floating action", async () => {
