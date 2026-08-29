@@ -39,6 +39,7 @@ from app.models import (
     Pipeline,
     Role,
     Stage,
+    StageType,
     Task,
     User,
     Workspace,
@@ -88,9 +89,22 @@ async def test_v4_client_pages_official_resources_and_filters_common_notes() -> 
                                     "statuses": [
                                         {"id": 100, "name": "Новый", "sort": 10},
                                         {"id": 142, "name": "Успешно", "sort": 20},
+                                        {"id": 143, "name": "Закрыто", "sort": 30},
                                     ]
                                 },
-                            }
+                            },
+                            {
+                                "id": 20,
+                                "name": "Повторные продажи",
+                                "updated_at": 1_700_000_001,
+                                "_embedded": {
+                                    "statuses": [
+                                        {"id": 200, "name": "Новый", "sort": 10},
+                                        {"id": 142, "name": "Успешно", "sort": 20},
+                                        {"id": 143, "name": "Закрыто", "sort": 30},
+                                    ]
+                                },
+                            },
                         ]
                     }
                 },
@@ -126,8 +140,16 @@ async def test_v4_client_pages_official_resources_and_filters_common_notes() -> 
         custom_fields = await client.fetch_page(entity_type="custom_fields", cursor={}, limit=250)
         notes = await client.fetch_page(entity_type="notes", cursor={}, limit=250)
 
-    assert [entity.external_id for entity in pipelines.entities] == ["10"]
-    assert [entity.external_id for entity in stages.entities] == ["100", "142"]
+    assert [entity.external_id for entity in pipelines.entities] == ["10", "20"]
+    assert [entity.external_id for entity in stages.entities] == [
+        "10:100",
+        "10:142",
+        "10:143",
+        "20:200",
+        "20:142",
+        "20:143",
+    ]
+    assert len({entity.external_id for entity in stages.entities}) == len(stages.entities)
     assert stages.entities[0].data["pipeline_id"] == 10
     assert custom_fields.entities[0].external_id == "deal:500"
     assert custom_fields.next_cursor == {"partition": 1, "page": 1}
@@ -135,6 +157,23 @@ async def test_v4_client_pages_official_resources_and_filters_common_notes() -> 
     note_request = next(request for request in requests if request.url.path.endswith("/notes"))
     assert "filter[note_type]" not in note_request.url.params
     assert all(int(request.url.params["limit"]) <= 250 for request in requests)
+
+    async with SessionLocal() as db:
+        workspace = Workspace(name="Dry run", slug="amocrm-stage-dry-run")
+        db.add(workspace)
+        await db.flush()
+        job = ImportJob(
+            workspace_id=workspace.id,
+            provider="amocrm",
+            status=ImportStatus.running,
+            dry_run=True,
+            entity_type="stages",
+        )
+        db.add(job)
+        await db.flush()
+        result = await apply_import_page(db, job=job, page=stages, writer=PulseAmoWriter())
+        assert result.would_create == 6
+        assert result.done is True
 
 
 @pytest.mark.asyncio
@@ -175,7 +214,7 @@ async def test_workspace_writer_imports_full_domain_and_reruns_without_duplicate
             [
                 AmoEntity(
                     "stages",
-                    "100",
+                    "10:100",
                     {
                         "id": 100,
                         "pipeline_id": 10,
@@ -309,6 +348,194 @@ async def test_workspace_writer_imports_full_domain_and_reruns_without_duplicate
         refreshed = await db.get(Deal, deal.id)
         assert refreshed is not None
         assert refreshed.title == "Поставка кофе — обновлено"
+
+
+@pytest.mark.asyncio
+async def test_shared_system_stage_ids_remain_scoped_to_their_pipelines() -> None:
+    async with SessionLocal() as db:
+        workspace = Workspace(name="Shared stages", slug="amocrm-shared-stages")
+        db.add(workspace)
+        await db.flush()
+        writer = PulseAmoWriter()
+
+        async def apply(entity_type: str, entities: list[AmoEntity]) -> Any:
+            job = ImportJob(
+                workspace_id=workspace.id,
+                provider="amocrm",
+                status=ImportStatus.running,
+                dry_run=False,
+                entity_type=entity_type,
+            )
+            db.add(job)
+            await db.flush()
+            return await apply_import_page(
+                db,
+                job=job,
+                page=AmoPage(entity_type=entity_type, entities=entities, next_cursor=None),
+                writer=writer,
+            )
+
+        await apply(
+            "pipelines",
+            [
+                AmoEntity("pipelines", "10", {"id": 10, "name": "Основная", "sort": 1}),
+                AmoEntity("pipelines", "20", {"id": 20, "name": "Повторная", "sort": 2}),
+            ],
+        )
+        stages = [
+            AmoEntity(
+                "stages",
+                "10:142",
+                {
+                    "id": 142,
+                    "pipeline_id": 10,
+                    "name": "Успешно",
+                    "sort": 10_000,
+                    "color": "#CCFF66",
+                },
+            ),
+            AmoEntity(
+                "stages",
+                "20:142",
+                {
+                    "id": 142,
+                    "pipeline_id": 20,
+                    "name": "Успешно",
+                    "sort": 10_000,
+                    "color": "#CCFF66",
+                },
+            ),
+        ]
+        first_stage_result = await apply("stages", stages)
+        second_stage_result = await apply("stages", stages)
+        assert first_stage_result.created == 2
+        assert second_stage_result.unchanged == 2
+
+        await apply(
+            "deals",
+            [
+                AmoEntity(
+                    "deals",
+                    "40",
+                    {"id": 40, "name": "Сделка A", "pipeline_id": 10, "status_id": 142},
+                ),
+                AmoEntity(
+                    "deals",
+                    "50",
+                    {"id": 50, "name": "Сделка B", "pipeline_id": 20, "status_id": 142},
+                ),
+            ],
+        )
+        await db.commit()
+
+        stage_maps = list(
+            (
+                await db.scalars(
+                    sa.select(ExternalEntityMap).where(
+                        ExternalEntityMap.workspace_id == workspace.id,
+                        ExternalEntityMap.entity_type == "stages",
+                    )
+                )
+            ).all()
+        )
+        stage_ids = {mapping.external_id: mapping.internal_id for mapping in stage_maps}
+        assert stage_ids["10:142"] != stage_ids["20:142"]
+        assert await db.scalar(sa.select(sa.func.count()).select_from(Stage)) == 2
+        imported_stages = list((await db.scalars(sa.select(Stage))).all())
+        assert all(stage.stage_type is StageType.won for stage in imported_stages)
+
+        deals = {deal.title: deal for deal in (await db.scalars(sa.select(Deal))).all()}
+        assert deals["Сделка A"].stage_id == stage_ids["10:142"]
+        assert deals["Сделка B"].stage_id == stage_ids["20:142"]
+
+
+@pytest.mark.asyncio
+async def test_composite_stage_import_reuses_legacy_bare_stage_mapping() -> None:
+    async with SessionLocal() as db:
+        workspace = Workspace(name="Legacy stages", slug="amocrm-legacy-stages")
+        db.add(workspace)
+        await db.flush()
+        pipeline = Pipeline(workspace_id=workspace.id, name="Импорт", position=1)
+        db.add(pipeline)
+        await db.flush()
+        stage = Stage(
+            workspace_id=workspace.id,
+            pipeline_id=pipeline.id,
+            name="Старое название",
+            position=10_000,
+            stage_type=StageType.won,
+        )
+        db.add(stage)
+        await db.flush()
+        db.add_all(
+            [
+                ExternalEntityMap(
+                    workspace_id=workspace.id,
+                    provider="amocrm",
+                    entity_type="pipelines",
+                    external_id="10",
+                    internal_id=pipeline.id,
+                    fingerprint="a" * 64,
+                ),
+                ExternalEntityMap(
+                    workspace_id=workspace.id,
+                    provider="amocrm",
+                    entity_type="stages",
+                    external_id="142",
+                    internal_id=stage.id,
+                    fingerprint="b" * 64,
+                ),
+            ]
+        )
+        job = ImportJob(
+            workspace_id=workspace.id,
+            provider="amocrm",
+            status=ImportStatus.running,
+            dry_run=False,
+            entity_type="stages",
+        )
+        db.add(job)
+        await db.flush()
+
+        result = await apply_import_page(
+            db,
+            job=job,
+            page=AmoPage(
+                entity_type="stages",
+                entities=[
+                    AmoEntity(
+                        "stages",
+                        "10:142",
+                        {
+                            "id": 142,
+                            "pipeline_id": 10,
+                            "name": "Успешно",
+                            "sort": 10_000,
+                            "color": "#CCFF66",
+                        },
+                    )
+                ],
+                next_cursor=None,
+            ),
+            writer=PulseAmoWriter(),
+        )
+        await db.commit()
+
+        assert result.created == 1
+        assert await db.scalar(sa.select(sa.func.count()).select_from(Stage)) == 1
+        composite_map = await db.scalar(
+            sa.select(ExternalEntityMap).where(
+                ExternalEntityMap.workspace_id == workspace.id,
+                ExternalEntityMap.entity_type == "stages",
+                ExternalEntityMap.external_id == "10:142",
+            )
+        )
+        assert composite_map is not None
+        assert composite_map.internal_id == stage.id
+        refreshed = await db.get(Stage, stage.id)
+        assert refreshed is not None
+        assert refreshed.name == "Успешно"
+        assert refreshed.version == 2
 
 
 @pytest.mark.asyncio
@@ -528,9 +755,7 @@ async def test_final_import_page_enqueues_one_report_job() -> None:
         reports = list(
             (
                 await db.scalars(
-                    sa.select(BackgroundJob).where(
-                        BackgroundJob.job_type == "amo_import.report"
-                    )
+                    sa.select(BackgroundJob).where(BackgroundJob.job_type == "amo_import.report")
                 )
             ).all()
         )

@@ -530,7 +530,9 @@ def _next_page_cursor(payload: Mapping[str, Any], current_page: int) -> Mapping[
 
 def _amo_entity(entity_type: str, row: Mapping[str, Any]) -> AmoEntity:
     external_id: str
-    if entity_type == "custom_fields":
+    if entity_type == "stages":
+        external_id = _stage_external_id(row.get("pipeline_id"), row.get("id"))
+    elif entity_type == "custom_fields":
         parent = _field_parent_key(str(row.get("pulse_parent_entity", "")))
         external_id = f"{parent}:{row.get('id')}"
     elif entity_type == "notes":
@@ -552,6 +554,27 @@ def _amo_entity(entity_type: str, row: Mapping[str, Any]) -> AmoEntity:
         data=dict(row),
         source_updated_at=source_updated_at,
     )
+
+
+def _stage_external_id(pipeline_id: Any, status_id: Any) -> str:
+    if (
+        pipeline_id is None
+        or status_id is None
+        or isinstance(pipeline_id, bool)
+        or isinstance(status_id, bool)
+    ):
+        raise AmoAPIError(
+            "amoCRM stage has no pipeline or status identifier",
+            retryable=False,
+        )
+    pipeline_value = str(pipeline_id).strip()
+    status_value = str(status_id).strip()
+    if pipeline_value in {"", "None"} or status_value in {"", "None"}:
+        raise AmoAPIError(
+            "amoCRM stage has no pipeline or status identifier",
+            retryable=False,
+        )
+    return f"{pipeline_value}:{status_value}"
 
 
 def _field_parent_key(value: str) -> str:
@@ -644,6 +667,20 @@ class PulseAmoWriter(ImportEntityWriter):
             raise AmoImportDependencyError("amoCRM stage references an unimported pipeline")
         model = await _scoped_existing(session, Stage, workspace_id, existing_internal_id)
         if model is None:
+            legacy_internal_id = await _legacy_mapped_stage_internal_id(
+                session,
+                workspace_id=workspace_id,
+                pipeline_id=pipeline_id,
+                status_external_id=str(entity.data.get("id")),
+            )
+            model = await _scoped_existing(
+                session,
+                Stage,
+                workspace_id,
+                legacy_internal_id,
+            )
+        model_was_existing = model is not None
+        if model is None:
             position = _int_value(entity.data.get("sort"), 0)
             while await session.scalar(
                 sa.select(Stage.id).where(
@@ -671,7 +708,7 @@ class PulseAmoWriter(ImportEntityWriter):
             if external_numeric_id == 143
             else StageType.open
         )
-        if existing_internal_id is not None:
+        if model_was_existing:
             model.version += 1
         await session.flush()
         return model.id
@@ -830,18 +867,27 @@ class PulseAmoWriter(ImportEntityWriter):
         existing_internal_id: uuid.UUID | None,
         user_mapping: Mapping[str, str],
     ) -> uuid.UUID:
+        pipeline_external_id = str(entity.data.get("pipeline_id"))
+        status_external_id = str(entity.data.get("status_id"))
         pipeline_id = await _mapped_internal_id(
             session,
             workspace_id=workspace_id,
             entity_type="pipelines",
-            external_id=str(entity.data.get("pipeline_id")),
+            external_id=pipeline_external_id,
         )
         stage_id = await _mapped_internal_id(
             session,
             workspace_id=workspace_id,
             entity_type="stages",
-            external_id=str(entity.data.get("status_id")),
+            external_id=_stage_external_id(pipeline_external_id, status_external_id),
         )
+        if stage_id is None and pipeline_id is not None:
+            stage_id = await _legacy_mapped_stage_internal_id(
+                session,
+                workspace_id=workspace_id,
+                pipeline_id=pipeline_id,
+                status_external_id=status_external_id,
+            )
         if pipeline_id is None or stage_id is None:
             raise AmoImportDependencyError("amoCRM deal references an unimported pipeline or stage")
         model = await _scoped_existing(session, Deal, workspace_id, existing_internal_id)
@@ -1088,6 +1134,34 @@ async def _mapped_internal_id(
                 ExternalEntityMap.provider == AMO_PROVIDER,
                 ExternalEntityMap.entity_type == entity_type,
                 ExternalEntityMap.external_id == external_id,
+            )
+        ),
+    )
+
+
+async def _legacy_mapped_stage_internal_id(
+    session: AsyncSession,
+    *,
+    workspace_id: uuid.UUID,
+    pipeline_id: uuid.UUID,
+    status_external_id: str,
+) -> uuid.UUID | None:
+    """Resolve stage mappings written before stage IDs included the pipeline ID."""
+
+    if status_external_id in {"", "None"}:
+        return None
+    return cast(
+        uuid.UUID | None,
+        await session.scalar(
+            sa.select(Stage.id)
+            .join(ExternalEntityMap, ExternalEntityMap.internal_id == Stage.id)
+            .where(
+                Stage.workspace_id == workspace_id,
+                Stage.pipeline_id == pipeline_id,
+                ExternalEntityMap.workspace_id == workspace_id,
+                ExternalEntityMap.provider == AMO_PROVIDER,
+                ExternalEntityMap.entity_type == "stages",
+                ExternalEntityMap.external_id == status_external_id,
             )
         ),
     )
