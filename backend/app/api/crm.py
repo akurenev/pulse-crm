@@ -74,6 +74,7 @@ from app.schemas import (
     TaskUpdate,
 )
 from app.security import CurrentAdmin, CurrentMutationUser, CurrentUser
+from app.services.data_access import enforce_cursor_page_budget
 from app.services.events import record_domain_event
 
 router = APIRouter(tags=["crm"])
@@ -123,6 +124,47 @@ def _next_cursor(items: list[Any], limit: int) -> tuple[list[Any], str | None]:
     visible = items[:limit]
     cursor = encode_cursor(visible[-1].created_at, visible[-1].id) if has_more and visible else None
     return visible, cursor
+
+
+def _literal_contains_pattern(value: str) -> str:
+    escaped = value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
+
+
+def _tags_search_condition(tags: Any, term: str, dialect_name: str) -> Any:
+    if dialect_name == "postgresql":
+        tag_values = sa.func.jsonb_array_elements_text(tags).table_valued("value").alias()
+    elif dialect_name == "sqlite":
+        tag_values = sa.func.json_each(tags).table_valued("value").alias()
+    else:
+        raise RuntimeError(f"unsupported database dialect for tag search: {dialect_name}")
+    return sa.exists(
+        sa.select(1)
+        .select_from(tag_values)
+        .where(
+            sa.cast(tag_values.c.value, sa.String).ilike(
+                _literal_contains_pattern(term), escape="\\"
+            )
+        )
+    )
+
+
+def _json_object_values_search_condition(values: Any, term: str, dialect_name: str) -> Any:
+    if dialect_name == "postgresql":
+        object_values = sa.func.jsonb_each_text(values).table_valued("key", "value").alias()
+    elif dialect_name == "sqlite":
+        object_values = sa.func.json_each(values).table_valued("key", "value").alias()
+    else:
+        raise RuntimeError(f"unsupported database dialect for JSON search: {dialect_name}")
+    return sa.exists(
+        sa.select(1)
+        .select_from(object_values)
+        .where(
+            sa.cast(object_values.c.value, sa.String).ilike(
+                _literal_contains_pattern(term), escape="\\"
+            )
+        )
+    )
 
 
 async def _ensure_company(
@@ -344,11 +386,23 @@ async def list_companies(
     cursor: str | None = None,
     limit: int = Query(default=50, ge=1, le=100),
 ) -> CompanyPage:
+    await enforce_cursor_page_budget(
+        db,
+        workspace_id=context.workspace_id,
+        user_id=context.user_id,
+        resource="companies",
+        cursor=cursor,
+    )
     query = sa.select(Company).where(
         Company.workspace_id == context.workspace_id, Company.deleted_at.is_(None)
     )
-    if search:
-        query = query.where(Company.name.ilike(f"%{search.strip()}%"))
+    if search and (term := search.strip()):
+        query = query.where(
+            sa.or_(
+                Company.name.ilike(f"%{term}%"),
+                _tags_search_condition(Company.tags, term, db.get_bind().dialect.name),
+            )
+        )
     if (condition := _cursor_condition(Company, cursor)) is not None:
         query = query.where(condition)
     items = list(
@@ -443,11 +497,21 @@ async def list_contacts(
     cursor: str | None = None,
     limit: int = Query(default=50, ge=1, le=100),
 ) -> ContactPage:
+    await enforce_cursor_page_budget(
+        db,
+        workspace_id=context.workspace_id,
+        user_id=context.user_id,
+        resource="contacts",
+        cursor=cursor,
+    )
     query = sa.select(Contact).where(
         Contact.workspace_id == context.workspace_id, Contact.deleted_at.is_(None)
     )
-    if search:
-        term = f"%{search.strip()}%"
+    if search and (search_term := search.strip()):
+        term = f"%{search_term}%"
+        tags_match = _tags_search_condition(
+            Contact.tags, search_term, db.get_bind().dialect.name
+        )
         if db.get_bind().dialect.name == "postgresql":
             document = sa.func.to_tsvector(
                 sa.text("'simple'"),
@@ -460,7 +524,12 @@ async def list_contacts(
                 + sa.func.coalesce(Contact.primary_phone, ""),
             )
             query = query.where(
-                document.op("@@")(sa.func.websearch_to_tsquery(sa.text("'simple'"), search.strip()))
+                sa.or_(
+                    document.op("@@")(
+                        sa.func.websearch_to_tsquery(sa.text("'simple'"), search_term)
+                    ),
+                    tags_match,
+                )
             )
         else:
             query = query.where(
@@ -469,6 +538,7 @@ async def list_contacts(
                     Contact.last_name.ilike(term),
                     Contact.primary_email.ilike(term),
                     Contact.primary_phone.ilike(term),
+                    tags_match,
                 )
             )
     if (condition := _cursor_condition(Contact, cursor)) is not None:
@@ -1338,6 +1408,13 @@ async def list_contact_purchases(
     cursor: str | None = None,
     limit: int = Query(default=50, ge=1, le=100),
 ) -> DealPage:
+    await enforce_cursor_page_budget(
+        db,
+        workspace_id=context.workspace_id,
+        user_id=context.user_id,
+        resource="contact_purchases",
+        cursor=cursor,
+    )
     await _ensure_contact(db, context.workspace_id, contact_id)
     query = (
         sa.select(Deal)
@@ -1374,6 +1451,13 @@ async def list_deals(
     cursor: str | None = None,
     limit: int = Query(default=50, ge=1, le=100),
 ) -> DealPage:
+    await enforce_cursor_page_budget(
+        db,
+        workspace_id=context.workspace_id,
+        user_id=context.user_id,
+        resource="deals",
+        cursor=cursor,
+    )
     query = sa.select(Deal).where(
         Deal.workspace_id == context.workspace_id, Deal.deleted_at.is_(None)
     )
@@ -1381,15 +1465,45 @@ async def list_deals(
         query = query.where(Deal.pipeline_id == pipeline_id)
     if stage_id:
         query = query.where(Deal.stage_id == stage_id)
-    if search:
-        if db.get_bind().dialect.name == "postgresql":
+    if search and (term := search.strip()):
+        dialect_name = db.get_bind().dialect.name
+        literal_pattern = _literal_contains_pattern(term)
+        tags_match = _tags_search_condition(Deal.tags, term, dialect_name)
+        custom_fields_match = _json_object_values_search_condition(
+            Deal.custom_fields, term, dialect_name
+        )
+        source_match = sa.exists(
+            sa.select(1).where(
+                Source.id == Deal.source_id,
+                Source.workspace_id == context.workspace_id,
+                sa.or_(
+                    Source.key.ilike(literal_pattern, escape="\\"),
+                    Source.name.ilike(literal_pattern, escape="\\"),
+                ),
+            )
+        )
+        if dialect_name == "postgresql":
             query = query.where(
-                sa.func.to_tsvector(sa.text("'simple'"), sa.func.coalesce(Deal.title, "")).op("@@")(
-                    sa.func.websearch_to_tsquery(sa.text("'simple'"), search.strip())
+                sa.or_(
+                    sa.func.to_tsvector(
+                        sa.text("'simple'"), sa.func.coalesce(Deal.title, "")
+                    ).op("@@")(
+                        sa.func.websearch_to_tsquery(sa.text("'simple'"), term)
+                    ),
+                    tags_match,
+                    custom_fields_match,
+                    source_match,
                 )
             )
         else:
-            query = query.where(Deal.title.ilike(f"%{search.strip()}%"))
+            query = query.where(
+                sa.or_(
+                    Deal.title.ilike(literal_pattern, escape="\\"),
+                    tags_match,
+                    custom_fields_match,
+                    source_match,
+                )
+            )
     if (condition := _cursor_condition(Deal, cursor)) is not None:
         query = query.where(condition)
     items = list(
@@ -1719,6 +1833,13 @@ async def list_tasks(
     cursor: str | None = None,
     limit: int = Query(default=50, ge=1, le=100),
 ) -> TaskPage:
+    await enforce_cursor_page_budget(
+        db,
+        workspace_id=context.workspace_id,
+        user_id=context.user_id,
+        resource="tasks",
+        cursor=cursor,
+    )
     query = sa.select(Task).where(Task.workspace_id == context.workspace_id)
     if task_status:
         query = query.where(Task.status == task_status)
@@ -1816,6 +1937,13 @@ async def list_activity(
     cursor: str | None = None,
     limit: int = Query(default=50, ge=1, le=100),
 ) -> ActivityPage:
+    await enforce_cursor_page_budget(
+        db,
+        workspace_id=context.workspace_id,
+        user_id=context.user_id,
+        resource="activity",
+        cursor=cursor,
+    )
     query = sa.select(ActivityEvent).where(ActivityEvent.workspace_id == context.workspace_id)
     if entity_type:
         query = query.where(ActivityEvent.entity_type == entity_type)

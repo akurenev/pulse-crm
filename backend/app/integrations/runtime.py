@@ -252,11 +252,33 @@ def _payload_datetime(job: ClaimedJob, key: str) -> datetime:
     return _as_utc(value)
 
 
+def _require_job_workspace(job: ClaimedJob, entity_workspace_id: uuid.UUID) -> uuid.UUID:
+    """Fail closed when a domain job is absent from or crosses its workspace."""
+
+    if job.workspace_id is None:
+        raise RuntimeWiringError("workspace-scoped job is missing workspace_id")
+    if job.workspace_id != entity_workspace_id:
+        raise RuntimeWiringError("background job workspace does not match domain entity")
+    return job.workspace_id
+
+
+def _require_payload_workspace(job: ClaimedJob, payload_workspace_id: uuid.UUID) -> uuid.UUID:
+    return _require_job_workspace(job, payload_workspace_id)
+
+
+def _require_global_job(job: ClaimedJob) -> None:
+    """Fail closed when a global maintenance handler receives a scoped job."""
+
+    if job.workspace_id is not None:
+        raise RuntimeWiringError("global maintenance job must not have workspace_id")
+
+
 async def _enqueue_runtime_job(
     session: AsyncSession,
     job_type: str,
     payload: Mapping[str, Any],
     *,
+    workspace_id: uuid.UUID | None = None,
     dedupe_key: str,
     run_at: datetime | None = None,
     max_attempts: int = 5,
@@ -274,6 +296,7 @@ async def _enqueue_runtime_job(
             session,
             job_type,
             payload,
+            workspace_id=workspace_id,
             run_at=run_at,
             max_attempts=max_attempts,
             dedupe_key=dedupe_key,
@@ -288,6 +311,7 @@ async def _enqueue_runtime_job(
         session,
         job_type,
         payload,
+        workspace_id=workspace_id,
         run_at=run_at,
         max_attempts=max_attempts,
     )
@@ -361,6 +385,7 @@ class RuntimeHandlers:
                 )
                 if event is None:
                     raise LookupError("outbox event not found")
+                _require_job_workspace(job, event.workspace_id)
                 if event.processed_at is not None:
                     return
                 child_type, child_payload, child_key = self._route_outbox(event)
@@ -368,6 +393,7 @@ class RuntimeHandlers:
                     session,
                     child_type,
                     child_payload,
+                    workspace_id=event.workspace_id,
                     dedupe_key=child_key,
                     # The scheduler only dispatches events whose available_at
                     # is due. Using its clock also avoids driver-specific
@@ -410,7 +436,7 @@ class RuntimeHandlers:
     async def send_message(self, job: ClaimedJob) -> None:
         message_id = _payload_uuid(job, "message_id")
         try:
-            context = await self._message_context(message_id)
+            context = await self._message_context(message_id, job=job)
             if context is None:
                 return
             message, conversation, connection, attachment_records, reply_to_provider_id = context
@@ -430,13 +456,13 @@ class RuntimeHandlers:
                     attachments=attachments,
                 )
             )
-            await self._mark_message_sent(message.id, result)
+            await self._mark_message_sent(message.id, result, workspace_id=message.workspace_id)
         except Exception as exc:
             await self._mark_message_failed_if_terminal(message_id, job, exc)
             raise
 
     async def _message_context(
-        self, message_id: uuid.UUID
+        self, message_id: uuid.UUID, *, job: ClaimedJob
     ) -> (
         tuple[
             Message,
@@ -462,6 +488,9 @@ class RuntimeHandlers:
             if row is None:
                 raise LookupError("outbound message not found")
             message, conversation, connection = row
+            _require_job_workspace(job, message.workspace_id)
+            _require_job_workspace(job, conversation.workspace_id)
+            _require_job_workspace(job, connection.workspace_id)
             if message.status in {MessageStatus.sent, MessageStatus.failed}:
                 return None
             if (
@@ -522,11 +551,22 @@ class RuntimeHandlers:
             )
         return tuple(result)
 
-    async def _mark_message_sent(self, message_id: uuid.UUID, result: SendResult) -> None:
+    async def _mark_message_sent(
+        self,
+        message_id: uuid.UUID,
+        result: SendResult,
+        *,
+        workspace_id: uuid.UUID,
+    ) -> None:
         async with self.session_factory() as session:
             async with session.begin():
                 message = await session.scalar(
-                    sa.select(Message).where(Message.id == message_id).with_for_update()
+                    sa.select(Message)
+                    .where(
+                        Message.id == message_id,
+                        Message.workspace_id == workspace_id,
+                    )
+                    .with_for_update()
                 )
                 if message is None or message.status is MessageStatus.sent:
                     return
@@ -555,7 +595,12 @@ class RuntimeHandlers:
         async with self.session_factory() as session:
             async with session.begin():
                 message = await session.scalar(
-                    sa.select(Message).where(Message.id == message_id).with_for_update()
+                    sa.select(Message)
+                    .where(
+                        Message.id == message_id,
+                        Message.workspace_id == job.workspace_id,
+                    )
+                    .with_for_update()
                 )
                 if message is None or message.status is not MessageStatus.queued:
                     return
@@ -573,6 +618,7 @@ class RuntimeHandlers:
                     )
                     if event is None:
                         raise LookupError("inbound event not found")
+                    _require_job_workspace(job, event.workspace_id)
                     if event.status is InboundStatus.processed:
                         return
                     if event.status is InboundStatus.failed:
@@ -594,7 +640,12 @@ class RuntimeHandlers:
         async with self.session_factory() as session:
             async with session.begin():
                 event = await session.scalar(
-                    sa.select(InboundEvent).where(InboundEvent.id == event_id).with_for_update()
+                    sa.select(InboundEvent)
+                    .where(
+                        InboundEvent.id == event_id,
+                        InboundEvent.workspace_id == job.workspace_id,
+                    )
+                    .with_for_update()
                 )
                 if event is None or event.status is InboundStatus.processed:
                     return
@@ -613,6 +664,7 @@ class RuntimeHandlers:
                     )
                     if submission is None:
                         raise LookupError("form submission not found")
+                    _require_job_workspace(job, submission.workspace_id)
                     if submission.status is FormSubmissionStatus.processed:
                         return
                     if submission.status is FormSubmissionStatus.failed:
@@ -635,7 +687,10 @@ class RuntimeHandlers:
             async with session.begin():
                 submission = await session.scalar(
                     sa.select(FormSubmission)
-                    .where(FormSubmission.id == submission_id)
+                    .where(
+                        FormSubmission.id == submission_id,
+                        FormSubmission.workspace_id == job.workspace_id,
+                    )
                     .with_for_update()
                 )
                 if submission is None or submission.status is FormSubmissionStatus.processed:
@@ -650,6 +705,7 @@ class RuntimeHandlers:
                 event = await session.get(OutboxEvent, event_id)
                 if event is None:
                     raise LookupError("notification source outbox event not found")
+                _require_job_workspace(job, event.workspace_id)
                 if self.notification_expander is not None:
                     await self.notification_expander(session, event)
                 else:
@@ -735,7 +791,7 @@ class RuntimeHandlers:
     async def deliver_notification(self, job: ClaimedJob) -> None:
         delivery_id = _payload_uuid(job, "notification_delivery_id")
         try:
-            delivery = await self._pending_delivery(delivery_id)
+            delivery = await self._pending_delivery(delivery_id, job=job)
             if delivery is None:
                 return
             if _as_utc(delivery.scheduled_at) > _as_utc(self.now()):
@@ -758,16 +814,24 @@ class RuntimeHandlers:
                         text=text,
                     )
                 )
-            await self._mark_delivery_sent(delivery.id, result, in_app=delivery.channel == "in_app")
+            await self._mark_delivery_sent(
+                delivery.id,
+                result,
+                workspace_id=delivery.workspace_id,
+                in_app=delivery.channel == "in_app",
+            )
         except Exception as exc:
             await self._mark_delivery_failed_if_terminal(delivery_id, job, exc)
             raise
 
-    async def _pending_delivery(self, delivery_id: uuid.UUID) -> NotificationDelivery | None:
+    async def _pending_delivery(
+        self, delivery_id: uuid.UUID, *, job: ClaimedJob
+    ) -> NotificationDelivery | None:
         async with self.session_factory() as session:
             delivery = await session.get(NotificationDelivery, delivery_id)
             if delivery is None:
                 raise LookupError("notification delivery not found")
+            _require_job_workspace(job, delivery.workspace_id)
             if delivery.status in {DeliveryStatus.delivered, DeliveryStatus.failed}:
                 return None
             if delivery.status not in {DeliveryStatus.pending, DeliveryStatus.processing}:
@@ -775,13 +839,21 @@ class RuntimeHandlers:
             return delivery
 
     async def _mark_delivery_sent(
-        self, delivery_id: uuid.UUID, result: SendResult, *, in_app: bool
+        self,
+        delivery_id: uuid.UUID,
+        result: SendResult,
+        *,
+        workspace_id: uuid.UUID,
+        in_app: bool,
     ) -> None:
         async with self.session_factory() as session:
             async with session.begin():
                 delivery = await session.scalar(
                     sa.select(NotificationDelivery)
-                    .where(NotificationDelivery.id == delivery_id)
+                    .where(
+                        NotificationDelivery.id == delivery_id,
+                        NotificationDelivery.workspace_id == workspace_id,
+                    )
                     .with_for_update()
                 )
                 if delivery is None or delivery.status is DeliveryStatus.delivered:
@@ -801,8 +873,6 @@ class RuntimeHandlers:
                                 "recipient_id": (
                                     str(delivery.recipient_id) if delivery.recipient_id else None
                                 ),
-                                "subject": delivery.subject,
-                                "body": delivery.body,
                             },
                         )
                     )
@@ -816,7 +886,10 @@ class RuntimeHandlers:
             async with session.begin():
                 delivery = await session.scalar(
                     sa.select(NotificationDelivery)
-                    .where(NotificationDelivery.id == delivery_id)
+                    .where(
+                        NotificationDelivery.id == delivery_id,
+                        NotificationDelivery.workspace_id == job.workspace_id,
+                    )
                     .with_for_update()
                 )
                 if delivery is None or delivery.status is DeliveryStatus.delivered:
@@ -828,6 +901,7 @@ class RuntimeHandlers:
     async def schedule_purchase(self, job: ClaimedJob) -> None:
         schedule_id = _payload_uuid(job, "purchase_schedule_id")
         workspace_id = _payload_uuid(job, "workspace_id")
+        _require_payload_workspace(job, workspace_id)
         async with self.session_factory() as session:
             async with session.begin():
                 schedule = await session.get(PurchaseSchedule, schedule_id)
@@ -842,6 +916,7 @@ class RuntimeHandlers:
                 )
 
     async def cleanup(self, job: ClaimedJob) -> None:
+        _require_global_job(job)
         del job
         now = self.now()
         async with self.session_factory() as session:
@@ -906,6 +981,7 @@ class RuntimeHandlers:
         return int(getattr(result, "rowcount", 0) or 0)
 
     async def recover(self, job: ClaimedJob) -> None:
+        _require_global_job(job)
         del job
         async with self.session_factory() as session:
             async with session.begin():
@@ -926,6 +1002,7 @@ class RuntimeHandlers:
     ) -> None:
         task_id = _payload_uuid(job, "task_id")
         workspace_id = _payload_uuid(job, "workspace_id")
+        _require_payload_workspace(job, workspace_id)
         occurrence = _payload_datetime(job, "occurrence_at")
         async with self.session_factory() as session:
             async with session.begin():
@@ -979,6 +1056,7 @@ class RuntimeHandlers:
     async def emit_deal_inactive(self, job: ClaimedJob) -> None:
         deal_id = _payload_uuid(job, "deal_id")
         workspace_id = _payload_uuid(job, "workspace_id")
+        _require_payload_workspace(job, workspace_id)
         occurrence = _payload_datetime(job, "occurrence_at")
         async with self.session_factory() as session:
             async with session.begin():
@@ -1087,11 +1165,15 @@ class RuntimeHandlers:
                 connection = await session.scalar(
                     sa.select(ChannelConnection).where(
                         ChannelConnection.id == connection_id,
-                        ChannelConnection.kind == ChannelKind.email,
-                        ChannelConnection.status == ConnectionStatus.active,
                     )
                 )
             if connection is None:
+                return
+            _require_job_workspace(job, connection.workspace_id)
+            if (
+                connection.kind is not ChannelKind.email
+                or connection.status is not ConnectionStatus.active
+            ):
                 return
             if self.adapter_factory is None or self.imap_poller_factory is None:
                 raise RuntimeWiringError("email adapter and IMAP poller factories are required")
@@ -1129,11 +1211,16 @@ class RuntimeHandlers:
                 last_uid = previous_uid
             await self._update_imap_state(
                 connection_id,
+                workspace_id=connection.workspace_id,
                 uidvalidity=batch.uidvalidity,
                 last_uid=last_uid or 0,
             )
         except Exception as exc:
-            await self._record_imap_error(connection_id, exc)
+            await self._record_imap_error(
+                connection_id,
+                exc,
+                workspace_id=job.workspace_id,
+            )
             raise
 
     async def _persist_email_envelope(
@@ -1249,6 +1336,7 @@ class RuntimeHandlers:
         self,
         connection_id: uuid.UUID,
         *,
+        workspace_id: uuid.UUID,
         uidvalidity: int,
         last_uid: int,
     ) -> None:
@@ -1256,7 +1344,10 @@ class RuntimeHandlers:
             async with session.begin():
                 connection = await session.scalar(
                     sa.select(ChannelConnection)
-                    .where(ChannelConnection.id == connection_id)
+                    .where(
+                        ChannelConnection.id == connection_id,
+                        ChannelConnection.workspace_id == workspace_id,
+                    )
                     .with_for_update()
                 )
                 if connection is None:
@@ -1272,12 +1363,21 @@ class RuntimeHandlers:
                 connection.last_error = None
                 connection.version += 1
 
-    async def _record_imap_error(self, connection_id: uuid.UUID, error: BaseException) -> None:
+    async def _record_imap_error(
+        self,
+        connection_id: uuid.UUID,
+        error: BaseException,
+        *,
+        workspace_id: uuid.UUID | None,
+    ) -> None:
         async with self.session_factory() as session:
             async with session.begin():
                 await session.execute(
                     sa.update(ChannelConnection)
-                    .where(ChannelConnection.id == connection_id)
+                    .where(
+                        ChannelConnection.id == connection_id,
+                        ChannelConnection.workspace_id == workspace_id,
+                    )
                     .values(
                         last_healthcheck_at=self.now(),
                         last_error=str(error)[:MAX_ERROR_LENGTH],
@@ -1430,6 +1530,7 @@ class RuntimeScheduler:
                 session,
                 JOB_OUTBOX_DISPATCH,
                 {"outbox_event_id": str(event.id)},
+                workspace_id=event.workspace_id,
                 dedupe_key=f"outbox:{event.id}:dispatch",
             )
             self._count(scheduled, JOB_OUTBOX_DISPATCH)
@@ -1438,10 +1539,10 @@ class RuntimeScheduler:
         self, session: AsyncSession, now: datetime, scheduled: dict[str, int]
     ) -> None:
         del now
-        ids = list(
+        messages = list(
             (
                 await session.scalars(
-                    sa.select(Message.id)
+                    sa.select(Message)
                     .where(
                         Message.direction == MessageDirection.outbound,
                         Message.status == MessageStatus.queued,
@@ -1452,12 +1553,13 @@ class RuntimeScheduler:
                 )
             ).all()
         )
-        for message_id in ids:
+        for message in messages:
             await _enqueue_runtime_job(
                 session,
                 JOB_MESSAGE_SEND,
-                {"message_id": str(message_id)},
-                dedupe_key=f"message:{message_id}:send",
+                {"message_id": str(message.id)},
+                workspace_id=message.workspace_id,
+                dedupe_key=f"message:{message.id}:send",
             )
             self._count(scheduled, JOB_MESSAGE_SEND)
 
@@ -1465,10 +1567,10 @@ class RuntimeScheduler:
         self, session: AsyncSession, now: datetime, scheduled: dict[str, int]
     ) -> None:
         del now
-        ids = list(
+        events = list(
             (
                 await session.scalars(
-                    sa.select(InboundEvent.id)
+                    sa.select(InboundEvent)
                     .where(InboundEvent.status == InboundStatus.accepted)
                     .order_by(InboundEvent.received_at, InboundEvent.id)
                     .limit(self.batch_size)
@@ -1476,12 +1578,13 @@ class RuntimeScheduler:
                 )
             ).all()
         )
-        for event_id in ids:
+        for event in events:
             await _enqueue_runtime_job(
                 session,
                 JOB_INBOUND_PROCESS,
-                {"inbound_event_id": str(event_id)},
-                dedupe_key=f"inbound:{event_id}:process",
+                {"inbound_event_id": str(event.id)},
+                workspace_id=event.workspace_id,
+                dedupe_key=f"inbound:{event.id}:process",
             )
             self._count(scheduled, JOB_INBOUND_PROCESS)
 
@@ -1489,10 +1592,10 @@ class RuntimeScheduler:
         self, session: AsyncSession, now: datetime, scheduled: dict[str, int]
     ) -> None:
         del now
-        ids = list(
+        submissions = list(
             (
                 await session.scalars(
-                    sa.select(FormSubmission.id)
+                    sa.select(FormSubmission)
                     .where(FormSubmission.status == FormSubmissionStatus.accepted)
                     .order_by(FormSubmission.created_at, FormSubmission.id)
                     .limit(self.batch_size)
@@ -1500,22 +1603,23 @@ class RuntimeScheduler:
                 )
             ).all()
         )
-        for submission_id in ids:
+        for submission in submissions:
             await _enqueue_runtime_job(
                 session,
                 JOB_FORM_PROCESS,
-                {"form_submission_id": str(submission_id)},
-                dedupe_key=f"form-submission:{submission_id}:process",
+                {"form_submission_id": str(submission.id)},
+                workspace_id=submission.workspace_id,
+                dedupe_key=f"form-submission:{submission.id}:process",
             )
             self._count(scheduled, JOB_FORM_PROCESS)
 
     async def _schedule_notifications(
         self, session: AsyncSession, now: datetime, scheduled: dict[str, int]
     ) -> None:
-        ids = list(
+        deliveries = list(
             (
                 await session.scalars(
-                    sa.select(NotificationDelivery.id)
+                    sa.select(NotificationDelivery)
                     .where(
                         NotificationDelivery.status == DeliveryStatus.pending,
                         NotificationDelivery.scheduled_at <= now,
@@ -1526,12 +1630,13 @@ class RuntimeScheduler:
                 )
             ).all()
         )
-        for delivery_id in ids:
+        for delivery in deliveries:
             await _enqueue_runtime_job(
                 session,
                 JOB_NOTIFICATION_DELIVER,
-                {"notification_delivery_id": str(delivery_id)},
-                dedupe_key=f"notification-delivery:{delivery_id}:send",
+                {"notification_delivery_id": str(delivery.id)},
+                workspace_id=delivery.workspace_id,
+                dedupe_key=f"notification-delivery:{delivery.id}:send",
             )
             self._count(scheduled, JOB_NOTIFICATION_DELIVER)
 
@@ -1561,6 +1666,7 @@ class RuntimeScheduler:
                     "purchase_schedule_id": str(schedule.id),
                     "workspace_id": str(schedule.workspace_id),
                 },
+                workspace_id=schedule.workspace_id,
                 dedupe_key=f"purchase-schedule:{schedule.id}:task",
             )
             self._count(scheduled, JOB_PURCHASE_SCHEDULE)
@@ -1568,10 +1674,10 @@ class RuntimeScheduler:
     async def _schedule_imap(
         self, session: AsyncSession, now: datetime, scheduled: dict[str, int]
     ) -> None:
-        connection_ids = list(
+        connections = list(
             (
                 await session.scalars(
-                    sa.select(ChannelConnection.id)
+                    sa.select(ChannelConnection)
                     .where(
                         ChannelConnection.kind == ChannelKind.email,
                         ChannelConnection.status == ConnectionStatus.active,
@@ -1582,12 +1688,13 @@ class RuntimeScheduler:
             ).all()
         )
         bucket = now.astimezone(UTC).strftime("%Y%m%d%H%M")
-        for connection_id in connection_ids:
+        for connection in connections:
             await _enqueue_runtime_job(
                 session,
                 JOB_IMAP_POLL,
-                {"channel_connection_id": str(connection_id)},
-                dedupe_key=f"imap:{connection_id}:{bucket}",
+                {"channel_connection_id": str(connection.id)},
+                workspace_id=connection.workspace_id,
+                dedupe_key=f"imap:{connection.id}:{bucket}",
                 max_attempts=5,
             )
             self._count(scheduled, JOB_IMAP_POLL)
@@ -1655,6 +1762,7 @@ class RuntimeScheduler:
                     "workspace_id": str(task.workspace_id),
                     "occurrence_at": occurrence.isoformat(),
                 },
+                workspace_id=task.workspace_id,
                 dedupe_key=f"{job_type}:{task.id}:{occurrence.isoformat()}",
             )
             self._count(scheduled, job_type)
@@ -1697,6 +1805,7 @@ class RuntimeScheduler:
                     "workspace_id": str(deal.workspace_id),
                     "occurrence_at": occurrence.isoformat(),
                 },
+                workspace_id=deal.workspace_id,
                 dedupe_key=f"{JOB_DEAL_INACTIVE_EVENT}:{deal.id}:{occurrence.isoformat()}",
             )
             self._count(scheduled, JOB_DEAL_INACTIVE_EVENT)

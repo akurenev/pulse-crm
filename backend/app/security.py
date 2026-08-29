@@ -172,6 +172,27 @@ def require_roles(*roles: Role) -> Callable[..., Coroutine[Any, Any, AuthContext
 CurrentUser = Annotated[AuthContext, Depends(get_auth_context)]
 CurrentMutationUser = Annotated[AuthContext, Depends(require_csrf)]
 CurrentAdmin = Annotated[AuthContext, Depends(require_roles(Role.owner, Role.admin))]
+CurrentOwner = Annotated[AuthContext, Depends(require_roles(Role.owner))]
+
+
+async def require_crm_export_enabled(
+    context: CurrentOwner,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> AuthContext:
+    """Authorize a future CRM export only for an owner and an explicit opt-in."""
+
+    if not settings.crm_export_enabled:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": "crm_export_disabled",
+                "message": "CRM data export is disabled",
+            },
+        )
+    return context
+
+
+CurrentCRMExporter = Annotated[AuthContext, Depends(require_crm_export_enabled)]
 
 
 SettingsDependency = Annotated[Settings, Depends(get_settings)]

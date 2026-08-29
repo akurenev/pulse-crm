@@ -253,6 +253,7 @@ class AttachmentStorage:
                 "Bucket": self._bucket,
                 "Key": object_key,
                 "ResponseContentDisposition": disposition,
+                "ResponseCacheControl": "no-store",
             },
             ExpiresIn=expires_seconds,
         )
@@ -300,6 +301,7 @@ class AttachmentStorage:
                 "Key": object_key,
                 "ResponseContentDisposition": "attachment; filename=report.json",
                 "ResponseContentType": "application/json",
+                "ResponseCacheControl": "no-store",
             },
             ExpiresIn=expires_seconds,
         )

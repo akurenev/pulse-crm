@@ -28,6 +28,7 @@ frontend/.vite/
 frontend/coverage/
 playwright-report/
 test-results/
+.playwright-cli/
 
 # Editors and operating systems
 .DS_Store

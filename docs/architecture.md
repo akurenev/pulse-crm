@@ -13,7 +13,8 @@ Production состоит из трёх ресурсов:
 1. Timeweb App Platform webapp: FastAPI, статический React build и supervisor.
 2. PostgreSQL 17 или 18 DBaaS: доменные данные, сессии, job queue, outbox и
    realtime.
-3. Приватный S3: `attachments/`, `imports/`, `exports/`, `backups/`.
+3. Приватный S3: `attachments/`, `imports/`, резервный префикс `exports/` и
+   `backups/`. Массовый экспорт CRM в MVP не реализован.
 
 ## Модули
 
@@ -66,9 +67,11 @@ HTTP response          supervisor claims outbox/job
 
 ## Очередь и расписание
 
-`background_jobs` содержит тип, JSON payload, `run_at`, статус, попытки,
-`dedupe_key`, owner/until lease и последнюю ошибку. Для claim используется
-частичный составной индекс только по queued-заданиям. Supervisor:
+`background_jobs` содержит `workspace_id` (nullable только для общесистемного
+обслуживания), тип, JSON payload, `run_at`, статус, попытки, `dedupe_key`,
+owner/until lease и последнюю ошибку. Административное чтение и повтор заданий
+обязательно фильтруются по текущему workspace. Для claim используется частичный
+составной индекс только по queued-заданиям. Supervisor:
 
 - возвращает просроченные leases;
 - захватывает небольшую пачку `SKIP LOCKED`;
@@ -109,7 +112,19 @@ PostgreSQL DDL в Alembic-миграции. Они перечислены как
 - AES-GCM для токенов интеграций, master key только в environment;
 - MIME/расширение/размер до 20 МБ, запрет архивов и executable;
 - authenticated upload в приватный S3 и signed GET с коротким TTL;
+- аудит выдачи signed URL без записи самого URL или S3-ключа;
+- массовый экспорт отсутствует; будущий endpoint требует `owner`, явный
+  `PULSE_CRM_EXPORT_ENABLED=true` и отдельный security review;
+- `Cache-Control: no-store` для API и минимальный SSE payload без содержимого
+  заметок, сообщений и согласий;
+- `cursor_access_buckets` атомарно ограничивает продолжение пагинации по паре
+  workspace/user/resource; первая страница не учитывается, превышение окна
+  возвращает HTTP 429 и создаёт безопасное audit-событие;
 - request ID и структурированные логи без тел сообщений и секретов.
+
+Эти меры блокируют штатную bulk-выгрузку и уменьшают риск автоматического
+извлечения, но не являются полной DLP: пользователь с законным доступом к
+карточке может скопировать видимые данные вне приложения.
 
 ## Пределы MVP
 

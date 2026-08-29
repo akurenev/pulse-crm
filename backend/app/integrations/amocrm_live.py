@@ -88,6 +88,13 @@ class AmoImportDependencyError(AmoImportError):
     pass
 
 
+def _require_claimed_workspace(claimed: ClaimedJob, workspace_id: uuid.UUID) -> None:
+    if claimed.workspace_id is None:
+        raise AmoImportError("amoCRM background job is missing workspace_id")
+    if claimed.workspace_id != workspace_id:
+        raise AmoImportError("amoCRM background job workspace does not match import")
+
+
 @dataclass(frozen=True, slots=True)
 class AmoTokenSet:
     access_token: str
@@ -932,6 +939,7 @@ class PulseAmoWriter(ImportEntityWriter):
         model.title = _required_text(entity.data.get("name"), "Сделка amoCRM")[:240]
         model.amount = _decimal_value(entity.data.get("price"))
         model.currency = "RUB"
+        model.tags = _tags(entity.data)
         model.custom_fields = await _custom_field_values(
             session, workspace_id, "deal", entity.data.get("custom_fields_values")
         )
@@ -1259,9 +1267,20 @@ def _tags(data: Mapping[str, Any]) -> list[str]:
     rows = embedded.get("tags", []) if isinstance(embedded, Mapping) else []
     if not isinstance(rows, list):
         return []
-    return [
-        str(row.get("name"))[:100] for row in rows if isinstance(row, Mapping) and row.get("name")
-    ]
+    result: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        if not isinstance(row, Mapping) or row.get("name") is None:
+            continue
+        name = str(row["name"]).strip()[:100].rstrip()
+        key = name.casefold()
+        if not name or key in seen:
+            continue
+        seen.add(key)
+        result.append(name)
+        if len(result) == 100:
+            break
+    return result
 
 
 def _amo_custom_rows(data: Mapping[str, Any]) -> list[Mapping[str, Any]]:
@@ -1511,6 +1530,7 @@ def make_amo_import_handler(
             import_job = await session.get(ImportJob, import_job_id)
             if import_job is None:
                 raise AmoImportError("amoCRM import job does not exist")
+            _require_claimed_workspace(claimed, import_job.workspace_id)
             if import_job.status in {ImportStatus.paused, ImportStatus.succeeded}:
                 return
             if import_job.status == ImportStatus.failed:
@@ -1575,6 +1595,7 @@ def make_amo_import_handler(
                     if not result.done:
                         session.add(
                             BackgroundJob(
+                                workspace_id=locked_job.workspace_id,
                                 job_type=AMO_IMPORT_JOB_TYPE,
                                 payload={"import_job_id": str(locked_job.id)},
                                 dedupe_key=f"amo-import:{locked_job.id}:page:{locked_job.version}",
@@ -1583,6 +1604,7 @@ def make_amo_import_handler(
                     else:
                         session.add(
                             BackgroundJob(
+                                workspace_id=locked_job.workspace_id,
                                 job_type=AMO_IMPORT_REPORT_JOB_TYPE,
                                 payload={"import_job_id": str(locked_job.id)},
                                 dedupe_key=f"amo-import:{locked_job.id}:report",
@@ -1595,7 +1617,12 @@ def make_amo_import_handler(
             async with session_factory() as session:
                 async with session.begin():
                     failed_job = await session.scalar(
-                        sa.select(ImportJob).where(ImportJob.id == import_job_id).with_for_update()
+                        sa.select(ImportJob)
+                        .where(
+                            ImportJob.id == import_job_id,
+                            ImportJob.workspace_id == claimed.workspace_id,
+                        )
+                        .with_for_update()
                     )
                     if failed_job is not None and failed_job.status in {
                         ImportStatus.pending,
@@ -1632,6 +1659,7 @@ def make_amo_import_report_handler(
             )
             if import_job is None:
                 raise AmoImportError("amoCRM import job does not exist")
+            _require_claimed_workspace(claimed, import_job.workspace_id)
             if import_job.status is not ImportStatus.succeeded:
                 raise AmoImportError("amoCRM import is not completed")
             expected_key = storage.import_report_key(import_job.workspace_id, import_job.id)

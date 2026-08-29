@@ -10,6 +10,7 @@ import {
   Paperclip,
   Phone,
   Send,
+  Tag,
   UserRound,
   X,
 } from "lucide-react";
@@ -17,6 +18,7 @@ import { useDeferredValue, useState, type FormEvent } from "react";
 
 import { Avatar } from "../../components/Avatar";
 import { api, remoteEnabled } from "../../lib/api";
+import { parseDealTags } from "../../lib/deal-tags";
 import { formatLongDate, formatMoney, formatTime } from "../../lib/format";
 import type { ApiActivity, ApiCompany, ApiContact, ApiCustomField, CursorPage } from "../../types/api";
 import type { Deal, Pipeline } from "../../types/crm";
@@ -29,13 +31,14 @@ interface DealDrawerProps {
   onSetNextPurchase: (dealId: string, date: string | null) => Promise<void>;
   onSetContact: (dealId: string, contact: { id: string; name: string; phone?: string; email?: string } | null) => Promise<void>;
   onSetCompany: (dealId: string, company: { id: string; name: string } | null) => Promise<void>;
+  onSetTags: (dealId: string, tags: string[]) => Promise<void>;
   onSetCustomFields: (dealId: string, fields: Record<string, unknown>) => Promise<void>;
   onSendMessage: (dealId: string, body: string, attachment?: File) => Promise<void>;
   onRetryMessage: (dealId: string, messageId: string) => Promise<void>;
   onToggleTask: (dealId: string, taskId: string) => Promise<void>;
 }
 
-export function DealDrawer({ deal, pipeline, onClose, onMove, onSetNextPurchase, onSetContact, onSetCompany, onSetCustomFields, onSendMessage, onRetryMessage, onToggleTask }: DealDrawerProps) {
+export function DealDrawer({ deal, pipeline, onClose, onMove, onSetNextPurchase, onSetContact, onSetCompany, onSetTags, onSetCustomFields, onSendMessage, onRetryMessage, onToggleTask }: DealDrawerProps) {
   const queryClient = useQueryClient();
   const [tab, setTab] = useState("details");
   const [messageError, setMessageError] = useState("");
@@ -136,6 +139,10 @@ export function DealDrawer({ deal, pipeline, onClose, onMove, onSetNextPurchase,
                   <div>
                     <dt>Ответственный</dt>
                     <dd className="owner-line"><Avatar user={deal.assignee} size="sm" /> {deal.assignee.name}</dd>
+                  </div>
+                  <div>
+                    <dt><Tag size={17} /> Теги</dt>
+                    <dd><DealTagsEditor key={deal.id} deal={deal} onSave={onSetTags} /></dd>
                   </div>
                   <div>
                     <dt><CalendarDays size={17} /> Следующая покупка</dt>
@@ -287,6 +294,44 @@ function CompanyPicker({ deal, onSave }: { deal: Deal; onSave: DealDrawerProps["
     <span className="relation-picker__actions">{deal.companyId ? <button type="button" disabled={saving} onClick={() => void choose(null)}>Очистить</button> : null}<button type="button" onClick={() => setEditing(false)}>Отмена</button></span>
     {error ? <small className="message-error" role="alert">{error}</small> : null}
   </span>;
+}
+
+function DealTagsEditor({ deal, onSave }: { deal: Deal; onSave: DealDrawerProps["onSetTags"] }) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(deal.tags.join(", "));
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+
+  function startEditing() {
+    setDraft(deal.tags.join(", "));
+    setError("");
+    setEditing(true);
+  }
+
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setSaving(true);
+    setError("");
+    try {
+      await onSave(deal.id, parseDealTags(draft));
+      setEditing(false);
+    } catch {
+      setError("Не удалось сохранить теги сделки");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  if (!editing) {
+    return <span className="deal-tags-editor__display"><span className="deal-tags-list">{deal.tags.length ? deal.tags.map((tag) => <span className="deal-tag" key={tag}>{tag}</span>) : <small>Нет тегов</small>}</span><button type="button" aria-label="Изменить теги сделки" onClick={startEditing}>Изменить</button></span>;
+  }
+
+  return <form className="deal-tags-editor" onSubmit={(event) => void submit(event)}>
+    <input autoFocus aria-label="Теги сделки" value={draft} onChange={(event) => setDraft(event.target.value)} maxLength={10_000} placeholder="VIP, Повторная покупка" />
+    <small>Разделяйте теги запятыми</small>
+    <span><button type="button" disabled={saving} onClick={() => setEditing(false)}>Отмена</button><button type="submit" aria-label="Сохранить теги сделки" disabled={saving}>{saving ? "Сохраняем…" : "Сохранить"}</button></span>
+    {error ? <small className="message-error" role="alert">{error}</small> : null}
+  </form>;
 }
 
 function CustomFieldsEditor({ deal, onSave }: { deal: Deal; onSave: DealDrawerProps["onSetCustomFields"] }) {

@@ -41,7 +41,7 @@ from app.integrations.s3 import AttachmentStorage
 from app.integrations.secrets import SecretCipher
 from app.models import BackgroundJob, Membership, Pipeline, Source, Stage
 from app.security import CurrentAdmin
-from app.services.events import record_domain_event
+from app.services.events import record_audit_event, record_domain_event
 
 router = APIRouter(prefix="/admin/integrations", tags=["integration-settings"])
 ALLOWED_NOTIFICATION_CHANNELS = frozenset({"in_app", "email", "telegram", "max"})
@@ -1440,6 +1440,16 @@ async def get_import_report(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="import report is not available",
         ) from exc
+    record_audit_event(
+        db,
+        workspace_id=context.workspace_id,
+        event_type="amo_import.report_download_link_issued",
+        entity_type="import_job",
+        entity_id=import_job.id,
+        actor_id=context.user_id,
+        payload={"expires_in": expires_in},
+    )
+    await db.commit()
     return ImportReportDownload(url=url, expires_in=expires_in)
 
 
@@ -1473,6 +1483,7 @@ async def start_import(
     db.add(entity)
     db.add(
         BackgroundJob(
+            workspace_id=context.workspace_id,
             job_type="amo_import.page",
             payload={"import_job_id": str(entity.id)},
             dedupe_key=f"amo-import:{entity.id}:initial",
@@ -1564,6 +1575,7 @@ async def resume_import_job(
         raise _version_conflict()
     db.add(
         BackgroundJob(
+            workspace_id=context.workspace_id,
             job_type="amo_import.page",
             payload={"import_job_id": str(entity.id)},
             dedupe_key=f"amo-import:{entity.id}:resume:{next_version}",

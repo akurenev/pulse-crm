@@ -338,6 +338,7 @@ class Deal(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     title: Mapped[str] = mapped_column(sa.String(240), nullable=False)
     amount: Mapped[Decimal | None] = mapped_column(sa.Numeric(14, 2))
     currency: Mapped[str] = mapped_column(sa.String(3), default="RUB", nullable=False)
+    tags: Mapped[list[str]] = mapped_column(JSON_TYPE, default=list, nullable=False)
     custom_fields: Mapped[dict[str, Any]] = mapped_column(JSON_TYPE, default=dict, nullable=False)
     next_purchase_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
     last_activity_at: Mapped[datetime] = mapped_column(
@@ -492,8 +493,14 @@ class BackgroundJob(UUIDPrimaryKeyMixin, TimestampMixin, Base):
             postgresql_where=sa.text("status = 'queued'"),
         ),
         sa.Index("ix_background_jobs_lease", "lease_until"),
+        sa.Index("ix_background_jobs_workspace_updated", "workspace_id", "updated_at"),
     )
 
+    # Null is reserved for application-wide maintenance jobs.  Every job that
+    # acts on CRM or integration data must carry its workspace explicitly.
+    workspace_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID_TYPE, sa.ForeignKey("workspaces.id", ondelete="CASCADE")
+    )
     job_type: Mapped[str] = mapped_column(sa.String(100), nullable=False)
     payload: Mapped[dict[str, Any]] = mapped_column(JSON_TYPE, default=dict, nullable=False)
     status: Mapped[JobStatus] = mapped_column(
@@ -508,6 +515,33 @@ class BackgroundJob(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     lease_owner: Mapped[str | None] = mapped_column(sa.String(160))
     lease_until: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
     last_error: Mapped[str | None] = mapped_column(sa.Text)
+
+
+class CursorAccessBucket(UUIDPrimaryKeyMixin, Base):
+    """One fixed-window pagination counter per user and CRM resource."""
+
+    __tablename__ = "cursor_access_buckets"
+    __table_args__ = (
+        sa.UniqueConstraint(
+            "workspace_id",
+            "user_id",
+            "resource",
+            name="uq_cursor_access_bucket_scope",
+        ),
+        sa.Index("ix_cursor_access_buckets_workspace", "workspace_id"),
+    )
+
+    workspace_id: Mapped[uuid.UUID] = mapped_column(
+        UUID_TYPE, sa.ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID_TYPE, sa.ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    resource: Mapped[str] = mapped_column(sa.String(64), nullable=False)
+    window_started_at: Mapped[datetime] = mapped_column(
+        sa.DateTime(timezone=True), nullable=False
+    )
+    request_count: Mapped[int] = mapped_column(sa.Integer, nullable=False)
 
 
 class RealtimeEvent(Base):

@@ -52,6 +52,7 @@ export interface Deal {
   email?: string;
   companyId?: string;
   companyName?: string;
+  tags: string[];
   customFields?: Record<string, unknown>;
   nextPurchaseAt?: string;
   version: number;
@@ -78,6 +79,7 @@ export interface Contact {
   company: string;
   email: string;
   phone: string;
+  tags: string[];
   deals: number;
   revenue: number;
   nextPurchaseAt?: string;

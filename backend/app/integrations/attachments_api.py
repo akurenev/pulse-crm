@@ -24,6 +24,7 @@ from app.integrations.s3 import (
     AttachmentValidationError,
 )
 from app.security import CurrentMutationUser, CurrentUser
+from app.services.events import record_audit_event
 
 router = APIRouter(tags=["attachments"])
 
@@ -242,4 +243,18 @@ async def download_attachment(
         filename=attachment.original_filename,
         expires_seconds=expires_in,
     )
+    record_audit_event(
+        db,
+        workspace_id=context.workspace_id,
+        event_type="attachment.download_link_issued",
+        entity_type="attachment",
+        entity_id=attachment.id,
+        actor_id=context.user_id,
+        payload={
+            "message_id": str(attachment.message_id),
+            "size_bytes": attachment.size_bytes,
+            "expires_in": expires_in,
+        },
+    )
+    await db.commit()
     return AttachmentDownload(url=url, expires_in=expires_in)

@@ -259,6 +259,7 @@ class DealCreate(BaseModel):
     source_id: uuid.UUID | None = None
     amount: Decimal | None = Field(default=None, ge=0, max_digits=14, decimal_places=2)
     currency: str = Field(default="RUB", pattern=r"^[A-Z]{3}$")
+    tags: list[str] = Field(default_factory=list, max_length=100)
     custom_fields: dict[str, Any] = Field(default_factory=dict)
     next_purchase_at: datetime | None = None
 
@@ -271,6 +272,7 @@ class DealUpdate(VersionedUpdate):
     source_id: uuid.UUID | None = None
     amount: Decimal | None = Field(default=None, ge=0, max_digits=14, decimal_places=2)
     currency: str | None = Field(default=None, pattern=r"^[A-Z]{3}$")
+    tags: list[str] | None = Field(default=None, max_length=100)
     custom_fields: dict[str, Any] | None = None
     next_purchase_at: datetime | None = None
 
@@ -293,6 +295,7 @@ class DealRead(ORMModel):
     source_id: uuid.UUID | None
     amount: Decimal | None
     currency: str
+    tags: list[str]
     custom_fields: dict[str, Any]
     next_purchase_at: datetime | None
     last_activity_at: datetime

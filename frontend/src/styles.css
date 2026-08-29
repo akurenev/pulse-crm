@@ -438,7 +438,11 @@ a {
 .deal-card__content { display: flex; width: 100%; min-height: 150px; flex-direction: column; align-items: flex-start; padding: 13px 12px 11px; background: transparent; text-align: left; }
 .deal-card__title { max-width: calc(100% - 18px); overflow: hidden; color: #111827; font-size: 14px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
 .deal-card__subtitle { display: block; width: 100%; margin-top: 6px; overflow: hidden; color: var(--muted); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.deal-card__tags { display: flex; width: 100%; min-width: 0; align-items: center; gap: 5px; margin-top: 8px; overflow: hidden; }
+.deal-card__tags > span, .deal-card__tags > em { overflow: hidden; max-width: 44%; border-radius: 999px; background: #f1f0ff; padding: 3px 7px; color: #5548c8; font-size: 9px; font-style: normal; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
+.deal-card__tags > em { flex: 0 0 auto; }
 .deal-card__amount { margin-top: 15px; color: #111827; font-size: 19px; font-weight: 710; letter-spacing: -0.025em; }
+.deal-card__tags + .deal-card__amount { margin-top: 10px; }
 .deal-card__meta { display: flex; width: 100%; align-items: center; justify-content: space-between; gap: 8px; margin-top: auto; padding-top: 12px; }
 .deal-card__owner { display: inline-flex; align-items: center; gap: 6px; }
 .deal-card__owner time { color: var(--danger); font-size: 11px; white-space: nowrap; }
@@ -492,7 +496,19 @@ a {
 .relation-value { display: flex; min-width: 0; align-items: center; justify-content: space-between; gap: 8px; }
 .relation-value > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .relation-value button,
+.deal-tags-editor__display > button,
 .relation-picker__actions button { background: transparent; color: var(--accent); font-size: 10px; font-weight: 680; }
+.deal-tags-editor__display { display: flex; min-width: 0; align-items: center; justify-content: space-between; gap: 8px; }
+.deal-tags-list { display: flex; min-width: 0; flex-wrap: wrap; gap: 5px; }
+.deal-tags-list > small { color: var(--muted); font-size: 11px; font-weight: 500; }
+.deal-tag { display: inline-flex; min-height: 23px; align-items: center; border-radius: 999px; background: #f1f0ff; padding: 3px 8px; color: #5548c8; font-size: 10px; font-weight: 650; }
+.deal-tags-editor { display: grid; min-width: 0; gap: 6px; }
+.deal-tags-editor > input { width: 100%; min-height: 36px; }
+.deal-tags-editor > small { color: var(--muted); font-size: 9px; font-weight: 500; }
+.deal-tags-editor > span { display: flex; justify-content: flex-end; gap: 8px; }
+.deal-tags-editor button { border-radius: 7px; background: #f2f3f6; padding: 6px 8px; color: #536076; font-size: 9px; font-weight: 650; }
+.deal-tags-editor button[type="submit"] { background: var(--accent-soft); color: var(--accent); }
+.deal-tags-editor button:disabled { cursor: wait; opacity: .6; }
 .relation-picker { display: grid; gap: 6px; }
 .relation-picker > input { min-width: 0; width: 100%; height: 34px; border: 1px solid var(--border-strong); border-radius: 7px; padding: 0 8px; font: inherit; font-size: 11px; }
 .relation-picker > button { display: grid; gap: 2px; border: 1px solid var(--border); border-radius: 7px; background: white; padding: 7px 8px; text-align: left; }
@@ -636,6 +652,7 @@ a {
 .data-row strong { overflow: hidden; font-size: 12px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
 .data-row small { overflow: hidden; color: var(--muted); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 .data-row__primary { display: grid !important; grid-template-columns: auto 1fr; align-items: center; gap: 10px !important; }
+.contacts-page .data-row__primary > span:last-child { display: flex; min-width: 0; flex-direction: column; gap: 3px; }
 .company-avatar { display: grid; width: 35px; height: 35px; place-items: center; border-radius: 9px; background: var(--accent-soft); color: var(--accent); font-weight: 720; }
 .data-row .owner-line { flex-direction: row; align-items: center; }
 .data-row .owner-line > span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

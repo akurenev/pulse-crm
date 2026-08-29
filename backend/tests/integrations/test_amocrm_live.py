@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -10,10 +11,11 @@ import pytest
 import sqlalchemy as sa
 
 from app.db import SessionLocal
-from app.integrations.amo import AmoEntity, AmoPage, apply_import_page
+from app.integrations.amo import AmoEntity, AmoImportError, AmoPage, apply_import_page
 from app.integrations.amocrm_live import (
     AmoV4Client,
     PulseAmoWriter,
+    _tags,
     make_amo_import_handler,
     make_amo_import_report_handler,
 )
@@ -109,6 +111,53 @@ async def test_v4_client_pages_official_resources_and_filters_common_notes() -> 
                     }
                 },
             )
+        if path == "/api/v4/companies":
+            return httpx.Response(
+                200,
+                json={
+                    "_embedded": {
+                        "companies": [
+                            {
+                                "id": 20,
+                                "name": "ООО Слой",
+                                "_embedded": {"tags": [{"id": 1, "name": "Партнёр"}]},
+                            }
+                        ]
+                    }
+                },
+            )
+        if path == "/api/v4/contacts":
+            return httpx.Response(
+                200,
+                json={
+                    "_embedded": {
+                        "contacts": [
+                            {
+                                "id": 30,
+                                "name": "Анна",
+                                "_embedded": {"tags": [{"id": 2, "name": "VIP"}]},
+                            }
+                        ]
+                    }
+                },
+            )
+        if path == "/api/v4/leads":
+            return httpx.Response(
+                200,
+                json={
+                    "_embedded": {
+                        "leads": [
+                            {
+                                "id": 40,
+                                "name": "Поставка",
+                                "_embedded": {
+                                    "tags": [{"id": 3, "name": "Оптовая", "color": "#fff"}]
+                                },
+                            }
+                        ]
+                    }
+                },
+            )
         if path.endswith("/custom_fields"):
             parent = path.split("/")[3]
             return httpx.Response(
@@ -137,6 +186,9 @@ async def test_v4_client_pages_official_resources_and_filters_common_notes() -> 
         )
         pipelines = await client.fetch_page(entity_type="pipelines", cursor={}, limit=250)
         stages = await client.fetch_page(entity_type="stages", cursor={}, limit=250)
+        companies = await client.fetch_page(entity_type="companies", cursor={}, limit=250)
+        contacts = await client.fetch_page(entity_type="contacts", cursor={}, limit=250)
+        deals = await client.fetch_page(entity_type="deals", cursor={}, limit=250)
         custom_fields = await client.fetch_page(entity_type="custom_fields", cursor={}, limit=250)
         notes = await client.fetch_page(entity_type="notes", cursor={}, limit=250)
 
@@ -151,6 +203,11 @@ async def test_v4_client_pages_official_resources_and_filters_common_notes() -> 
     ]
     assert len({entity.external_id for entity in stages.entities}) == len(stages.entities)
     assert stages.entities[0].data["pipeline_id"] == 10
+    assert companies.entities[0].data["_embedded"]["tags"][0]["name"] == "Партнёр"
+    assert contacts.entities[0].data["_embedded"]["tags"][0]["name"] == "VIP"
+    assert deals.entities[0].data["_embedded"]["tags"][0]["name"] == "Оптовая"
+    deal_request = next(request for request in requests if request.url.path == "/api/v4/leads")
+    assert deal_request.url.params["with"] == "contacts"
     assert custom_fields.entities[0].external_id == "deal:500"
     assert custom_fields.next_cursor == {"partition": 1, "page": 1}
     assert [entity.external_id for entity in notes.entities] == ["leads:1"]
@@ -187,7 +244,7 @@ async def test_workspace_writer_imports_full_domain_and_reruns_without_duplicate
         await db.flush()
         writer = PulseAmoWriter()
 
-        async def apply(entity_type: str, entities: list[AmoEntity]) -> None:
+        async def apply(entity_type: str, entities: list[AmoEntity]) -> Any:
             job = ImportJob(
                 workspace_id=workspace.id,
                 provider="amocrm",
@@ -198,7 +255,7 @@ async def test_workspace_writer_imports_full_domain_and_reruns_without_duplicate
             )
             db.add(job)
             await db.flush()
-            await apply_import_page(
+            return await apply_import_page(
                 db,
                 job=job,
                 page=AmoPage(entity_type=entity_type, entities=entities, next_cursor=None),
@@ -246,7 +303,17 @@ async def test_workspace_writer_imports_full_domain_and_reruns_without_duplicate
         )
         await apply(
             "companies",
-            [AmoEntity("companies", "20", {"id": 20, "name": "ООО Слой"})],
+            [
+                AmoEntity(
+                    "companies",
+                    "20",
+                    {
+                        "id": 20,
+                        "name": "ООО Слой",
+                        "_embedded": {"tags": [{"id": 1, "name": "Партнёр"}]},
+                    },
+                )
+            ],
         )
         await apply(
             "contacts",
@@ -264,7 +331,13 @@ async def test_workspace_writer_imports_full_domain_and_reruns_without_duplicate
                                 "values": [{"value": "anna@example.com"}],
                             }
                         ],
-                        "_embedded": {"companies": [{"id": 20}]},
+                        "_embedded": {
+                            "companies": [{"id": 20}],
+                            "tags": [
+                                {"id": 2, "name": " VIP "},
+                                {"id": 3, "name": "VIP"},
+                            ],
+                        },
                     },
                 )
             ],
@@ -280,6 +353,7 @@ async def test_workspace_writer_imports_full_domain_and_reruns_without_duplicate
             "_embedded": {
                 "companies": [{"id": 20}],
                 "contacts": [{"id": 30, "is_main": True}],
+                "tags": [{"id": 4, "name": "Оптовая"}],
             },
         }
         await apply("deals", [AmoEntity("deals", "40", deal_data)])
@@ -331,23 +405,77 @@ async def test_workspace_writer_imports_full_domain_and_reruns_without_duplicate
         )
         assert company is not None and contact is not None and deal is not None
         assert task is not None and note is not None
+        assert company.tags == ["Партнёр"]
         assert contact.company_id == company.id
         assert contact.primary_email == "anna@example.com"
+        assert contact.tags == ["VIP"]
         assert await db.scalar(sa.select(sa.func.count()).select_from(ContactPoint)) == 1
         assert deal.company_id == company.id
         assert deal.assignee_id == owner.id
+        assert deal.tags == ["Оптовая"]
         assert deal.custom_fields == {"amo_501": "A-001"}
         assert task.deal_id == deal.id
         assert note.entity_id == deal.id
         assert await db.scalar(sa.select(sa.func.count()).select_from(DealContact)) == 1
 
-        updated_data = {**deal_data, "name": "Поставка кофе — обновлено"}
+        updated_data = {
+            **deal_data,
+            "name": "Поставка кофе — обновлено",
+            "_embedded": {
+                **deal_data["_embedded"],
+                "tags": [{"id": 5, "name": "Повторная"}],
+            },
+        }
         await apply("deals", [AmoEntity("deals", "40", updated_data)])
         await db.commit()
         assert await db.scalar(sa.select(sa.func.count()).select_from(Deal)) == 1
         refreshed = await db.get(Deal, deal.id)
         assert refreshed is not None
         assert refreshed.title == "Поставка кофе — обновлено"
+        assert refreshed.tags == ["Повторная"]
+
+        mapping = await db.scalar(
+            sa.select(ExternalEntityMap).where(
+                ExternalEntityMap.workspace_id == workspace.id,
+                ExternalEntityMap.entity_type == "deals",
+                ExternalEntityMap.external_id == "40",
+            )
+        )
+        assert mapping is not None
+        legacy_payload = json.dumps(
+            updated_data,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+        mapping.fingerprint = hashlib.sha256(legacy_payload).hexdigest()
+        refreshed.tags = []
+        await db.commit()
+
+        backfill = await apply("deals", [AmoEntity("deals", "40", updated_data)])
+        await db.commit()
+        assert backfill.updated == 1
+        backfilled = await db.get(Deal, deal.id)
+        assert backfilled is not None
+        assert backfilled.tags == ["Повторная"]
+
+
+def test_amo_tags_are_normalized_deduplicated_and_bounded() -> None:
+    rows = [
+        {"name": " VIP "},
+        {"name": "vip"},
+        {"name": "   "},
+        {"name": None},
+        {"name": "x" * 101},
+        *({"name": f"tag-{index}"} for index in range(150)),
+    ]
+
+    tags = _tags({"_embedded": {"tags": rows}})
+
+    assert tags[:2] == ["VIP", "x" * 100]
+    assert len(tags) == 100
+    assert tags[-1] == "tag-97"
 
 
 @pytest.mark.asyncio
@@ -600,6 +728,7 @@ async def test_all_import_handler_advances_entity_and_enqueues_next_page() -> No
                 attempts=1,
                 max_attempts=5,
                 lease_owner="test-worker",
+                workspace_id=workspace.id,
             )
         )
 
@@ -651,7 +780,22 @@ async def test_import_report_handler_is_deterministic_and_retry_safe() -> None:
         attempts=1,
         max_attempts=5,
         lease_owner="report-worker",
+        workspace_id=workspace_id,
     )
+
+    with pytest.raises(AmoImportError, match="does not match"):
+        await handler(
+            ClaimedJob(
+                id=uuid.uuid4(),
+                job_type="amo_import.report",
+                payload={"import_job_id": str(import_job_id)},
+                attempts=1,
+                max_attempts=5,
+                lease_owner="cross-workspace-worker",
+                workspace_id=uuid.uuid4(),
+            )
+        )
+    assert fake_s3.puts == []
 
     with pytest.raises(RuntimeError, match="acknowledgement loss"):
         await handler(claimed)
@@ -744,6 +888,7 @@ async def test_final_import_page_enqueues_one_report_job() -> None:
             attempts=1,
             max_attempts=5,
             lease_owner="page-worker",
+            workspace_id=workspace.id,
         )
         await handler(claimed)
         await handler(claimed)

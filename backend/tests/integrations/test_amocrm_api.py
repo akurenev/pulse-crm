@@ -87,7 +87,7 @@ async def oauth_client() -> AsyncIterator[
     exchanges: list[dict[str, str]] = []
 
     def provider(request: httpx.Request) -> httpx.Response:
-        assert request.url == "https://sales-team.amocrm.ru/oauth2/access_token"
+        assert request.url == "https://example.amocrm.ru/oauth2/access_token"
         payload = json.loads(request.content)
         assert isinstance(payload, dict)
         exchanges.append(payload)
@@ -130,7 +130,7 @@ async def start_oauth(
             "client_id": "integration-client-id",
             "client_secret": "integration-client-secret",
             "redirect_uri": "https://pulse.example.com/api/v1/admin/integrations/amocrm/oauth/callback",
-            "allowed_referers": referers or ["sales-team.amocrm.ru"],
+            "allowed_referers": referers or ["example.amocrm.ru"],
         },
     )
     assert response.status_code == 201, response.text
@@ -156,7 +156,7 @@ async def test_oauth_state_is_digest_only_one_time_and_connection_is_secret_safe
             "client_id": "id",
             "client_secret": "secret",
             "redirect_uri": "https://pulse.example.com/callback",
-            "allowed_referers": ["sales-team.amocrm.ru"],
+            "allowed_referers": ["example.amocrm.ru"],
         },
     )
     assert forbidden.status_code == 403
@@ -174,7 +174,7 @@ async def test_oauth_state_is_digest_only_one_time_and_connection_is_secret_safe
         params={
             "code": "one-time-code",
             "state": raw_state,
-            "referer": "https://sales-team.amocrm.ru/",
+            "referer": "https://example.amocrm.ru/",
         },
     )
     assert callback.status_code == 200, callback.text
@@ -201,7 +201,7 @@ async def test_oauth_state_is_digest_only_one_time_and_connection_is_secret_safe
         params={
             "code": "replayed-code",
             "state": raw_state,
-            "referer": "sales-team.amocrm.ru",
+            "referer": "example.amocrm.ru",
         },
     )
     assert replay.status_code == 400
@@ -261,20 +261,20 @@ async def test_referer_allowlist_rejection_consumes_state(
         params={
             "code": "code",
             "state": raw_state,
-            "referer": "sales-team.amocrm.ru",
+            "referer": "example.amocrm.ru",
         },
     )
     assert reused.status_code == 400
 
 
 def test_referer_validation_blocks_ssrf_hosts() -> None:
-    assert normalize_amocrm_referer("https://demo.amocrm.ru/") == "demo.amocrm.ru"
+    assert normalize_amocrm_referer("https://example.amocrm.ru/") == "example.amocrm.ru"
     for invalid in (
         "amocrm.ru",
         "amocrm.ru.attacker.example",
-        "https://user@demo.amocrm.ru",
-        "https://demo.amocrm.ru:444",
-        "http://demo.amocrm.ru",
+        "https://user@example.amocrm.ru",
+        "https://example.amocrm.ru:444",
+        "http://example.amocrm.ru",
         "http://127.0.0.1",
     ):
         with pytest.raises(ValueError):
@@ -292,7 +292,7 @@ async def test_token_manager_rotates_refresh_token(
             id=connection_id,
             workspace_id=oauth_seed.workspace_id,
             status=AmoConnectionStatus.connected,
-            account_domain="sales-team.amocrm.ru",
+            account_domain="example.amocrm.ru",
             client_id="client-id",
             redirect_uri="https://pulse.example.com/callback",
             encrypted_client_secret=cipher.encrypt(

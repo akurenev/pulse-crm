@@ -43,7 +43,35 @@ def record_domain_event(
         RealtimeEvent(
             workspace_id=workspace_id,
             event_type=event_type,
-            payload={"entity_type": entity_type, "entity_id": str(entity_id), **event_payload},
+            # Realtime consumers only need an invalidation signal.  Business
+            # payloads can contain notes, contact addresses or consent
+            # evidence and belong in the access-controlled activity/outbox
+            # records, not in the replayable SSE stream.
+            payload={"entity_type": entity_type, "entity_id": str(entity_id)},
         )
     )
+    return activity
+
+
+def record_audit_event(
+    db: AsyncSession,
+    *,
+    workspace_id: uuid.UUID,
+    event_type: str,
+    entity_type: str,
+    entity_id: uuid.UUID,
+    actor_id: uuid.UUID | None,
+    payload: dict[str, Any] | None = None,
+) -> ActivityEvent:
+    """Append a read/security audit record without dispatching a business event."""
+
+    activity = ActivityEvent(
+        workspace_id=workspace_id,
+        event_type=event_type,
+        entity_type=entity_type,
+        entity_id=entity_id,
+        actor_id=actor_id,
+        payload=payload or {},
+    )
+    db.add(activity)
     return activity

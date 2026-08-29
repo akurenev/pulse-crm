@@ -180,6 +180,11 @@ def create_app() -> FastAPI:
             raise
         duration_ms = round((time.perf_counter() - started) * 1000, 2)
         response.headers["X-Request-ID"] = request_id
+        if request.url.path.startswith("/api/"):
+            # Authenticated CRM responses can contain personal data.  They
+            # must not be retained by browsers or intermediary caches.
+            response.headers["Cache-Control"] = "no-store"
+            response.headers["Pragma"] = "no-cache"
         logging.getLogger("pulse.requests").info(
             "request",
             extra={

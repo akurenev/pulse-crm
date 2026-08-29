@@ -273,7 +273,7 @@ async def test_max_transport_uses_upload_tokens_without_forwarding_authorization
 @pytest.mark.asyncio
 async def test_max_attachment_failure_redacts_provider_body_and_credentials() -> None:
     token = "max-super-secret-token"
-    recipient = "+79991234567"
+    recipient = "+70000000002"
 
     async def reject(request: httpx.Request) -> httpx.Response:
         del request

@@ -9,7 +9,7 @@ import {
 } from "@dnd-kit/core";
 import { sortableKeyboardCoordinates } from "@dnd-kit/sortable";
 import { Columns3, Filter, List, Plus, Search } from "lucide-react";
-import { useDeferredValue, useMemo, useState } from "react";
+import { useDeferredValue, useEffect, useMemo, useState } from "react";
 
 import { Avatar } from "../../components/Avatar";
 import { Button } from "../../components/Button";
@@ -35,6 +35,8 @@ export function DealsPage() {
     setNextPurchase,
     setDealContact,
     setDealCompany,
+    setDealTags,
+    setDealSearch,
     setDealCustomFields,
     nextCursorByStage,
     loadingStageId,
@@ -57,11 +59,15 @@ export function DealsPage() {
     useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
   );
 
+  useEffect(() => {
+    setDealSearch(deferredSearch);
+  }, [deferredSearch, setDealSearch]);
+
   const visibleDeals = useMemo(() => {
     return deals.filter((deal) => {
       const matchesSource = sourceFilter === "all" || deal.source === sourceFilter;
       const matchesSearch = !deferredSearch
-        || `${deal.title} ${deal.subtitle} ${deal.sourceLabel}`.toLocaleLowerCase("ru").includes(deferredSearch);
+        || `${deal.title} ${deal.subtitle} ${deal.sourceLabel} ${deal.tags.join(" ")}`.toLocaleLowerCase("ru").includes(deferredSearch);
       return matchesSource && matchesSearch;
     });
   }, [deals, deferredSearch, sourceFilter]);
@@ -161,7 +167,7 @@ export function DealsPage() {
         <div className="data-table__header"><span>Сделка</span><span>Этап</span><span>Сумма</span><span>Источник и срок</span><span>Ответственный</span></div>
         {visibleDeals.map((deal) => (
           <button className="data-row" type="button" key={deal.id} onClick={() => selectDeal(deal.id)}>
-            <span className="data-row__primary"><span className="company-avatar">{deal.title.slice(0, 1)}</span><span><strong>{deal.title}</strong><small>{deal.subtitle}</small></span></span>
+            <span className="data-row__primary"><span className="company-avatar">{deal.title.slice(0, 1)}</span><span><strong>{deal.title}</strong><small>{deal.tags.length ? `${deal.subtitle} · ${deal.tags.join(" · ")}` : deal.subtitle}</small></span></span>
             <span><strong>{pipeline.stages.find((stage) => stage.id === deal.stageId)?.name ?? "Без этапа"}</strong><small>{pipeline.name}</small></span>
             <span><strong>{formatMoney(deal.amount)}</strong><small>{deal.currency}</small></span>
             <span><SourceBadge source={deal.source} label={deal.sourceLabel} /><small>до {formatShortDate(deal.dueDate)}</small></span>
@@ -183,6 +189,7 @@ export function DealsPage() {
         onSetNextPurchase={setNextPurchase}
         onSetContact={setDealContact}
         onSetCompany={setDealCompany}
+        onSetTags={setDealTags}
         onSetCustomFields={setDealCustomFields}
         onSendMessage={sendMessage}
         onRetryMessage={retryMessage}

@@ -31,6 +31,7 @@ def _claimed(job_type: str, payload: dict[str, Any]) -> ClaimedJob:
         attempts=1,
         max_attempts=5,
         lease_owner="monitoring-test",
+        workspace_id=uuid.UUID(str(payload["workspace_id"])),
     )
 
 

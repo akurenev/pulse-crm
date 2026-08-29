@@ -14,6 +14,7 @@ import {
 
 import { initialDeals, pipeline as demoPipeline } from "../data/demo";
 import { api, remoteEnabled } from "../lib/api";
+import { normalizeDealTags } from "../lib/deal-tags";
 import type { ApiDeal, ApiMessage, ApiMessageWithAttachment, ApiPipeline, ApiSource, ApiTask, ApiUser, CursorPage } from "../types/api";
 import type { Deal, Message, Pipeline, SourceCode, Stage, UserSummary } from "../types/crm";
 
@@ -38,6 +39,8 @@ interface CrmStore {
   setNextPurchase: (dealId: string, date: string | null) => Promise<void>;
   setDealContact: (dealId: string, contact: { id: string; name: string; phone?: string; email?: string } | null) => Promise<void>;
   setDealCompany: (dealId: string, company: { id: string; name: string } | null) => Promise<void>;
+  setDealTags: (dealId: string, tags: string[]) => Promise<void>;
+  setDealSearch: (query: string) => void;
   setDealCustomFields: (dealId: string, fields: Record<string, unknown>) => Promise<void>;
   nextCursorByStage: Record<string, string | null>;
   loadingStageId: string | null;
@@ -129,6 +132,7 @@ function mapRemoteDeal(
     email: primaryContact?.primary_email ?? primaryContact?.emails[0] ?? stringField(customFields, "email"),
     companyId: deal.company_id ?? undefined,
     companyName: deal.company?.name,
+    tags: deal.tags,
     customFields,
     nextPurchaseAt: deal.next_purchase_at ?? undefined,
     version: deal.version,
@@ -155,6 +159,7 @@ export function CrmProvider({ children }: PropsWithChildren) {
   const [nextCursorByStage, setNextCursorByStage] = useState<Record<string, string | null>>({});
   const [loadingStageId, setLoadingStageId] = useState<string | null>(null);
   const [selectedDealId, setSelectedDealId] = useState<string | null>(null);
+  const [dealSearch, setDealSearchQuery] = useState("");
   const [refreshTick, setRefreshTick] = useState(0);
   const hasLoaded = useRef(!remoteEnabled);
   const activePipelineId = useRef(remoteEnabled ? "" : demoPipeline.id);
@@ -179,9 +184,10 @@ export function CrmProvider({ children }: PropsWithChildren) {
       const selectedPipeline = pipelines.find((item) => item.id === activePipelineId.current) ?? pipelines[0];
       if (!selectedPipeline) throw new Error("В рабочем пространстве нет активной воронки");
       activePipelineId.current = selectedPipeline.id;
+      const searchQuery = dealSearch ? `&search=${encodeURIComponent(dealSearch)}` : "";
       const [dealPages, taskPage] = await Promise.all([
         Promise.all(selectedPipeline.stages.map((stage) =>
-          api.get<CursorPage<ApiDeal>>(`/deals?limit=100&pipeline_id=${selectedPipeline.id}&stage_id=${stage.id}`),
+          api.get<CursorPage<ApiDeal>>(`/deals?limit=100&pipeline_id=${selectedPipeline.id}&stage_id=${stage.id}${searchQuery}`),
         )),
         api.get<CursorPage<ApiTask>>("/tasks?limit=100"),
       ]);
@@ -222,7 +228,7 @@ export function CrmProvider({ children }: PropsWithChildren) {
       }
     });
     return () => { active = false; };
-  }, [refreshTick]);
+  }, [dealSearch, refreshTick]);
 
   const selectedDeal = useMemo(
     () => deals.find((deal) => deal.id === selectedDealId) ?? null,
@@ -257,6 +263,10 @@ export function CrmProvider({ children }: PropsWithChildren) {
     setSelectedDealId(dealId);
   }, []);
 
+  const setDealSearch = useCallback((query: string) => {
+    setDealSearchQuery(query.trim());
+  }, []);
+
   const selectPipeline = useCallback(async (pipelineId: string) => {
     if (pipelineId === activePipelineId.current) return;
     const next = pipelines.find((item) => item.id === pipelineId);
@@ -277,7 +287,7 @@ export function CrmProvider({ children }: PropsWithChildren) {
     setLoadingStageId(stageId);
     try {
       const page = await api.get<CursorPage<ApiDeal>>(
-        `/deals?limit=100&pipeline_id=${pipeline.id}&stage_id=${stageId}&cursor=${encodeURIComponent(cursor)}`,
+        `/deals?limit=100&pipeline_id=${pipeline.id}&stage_id=${stageId}&cursor=${encodeURIComponent(cursor)}${dealSearch ? `&search=${encodeURIComponent(dealSearch)}` : ""}`,
       );
       const mapped = page.items
         .filter((deal) => deal.pipeline_id === pipeline.id && deal.stage_id === stageId)
@@ -290,7 +300,7 @@ export function CrmProvider({ children }: PropsWithChildren) {
     } finally {
       setLoadingStageId(null);
     }
-  }, [loadingStageId, nextCursorByStage, pipeline, sources, users]);
+  }, [dealSearch, loadingStageId, nextCursorByStage, pipeline, sources, users]);
 
   const moveDeal = useCallback(async (dealId: string, stageId: string) => {
     const current = deals.find((deal) => deal.id === dealId);
@@ -400,6 +410,27 @@ export function CrmProvider({ children }: PropsWithChildren) {
     }
   }, [deals]);
 
+  const setDealTags = useCallback(async (dealId: string, tags: string[]) => {
+    const current = deals.find((deal) => deal.id === dealId);
+    if (!current) return;
+    const normalizedTags = normalizeDealTags(tags);
+    const optimistic = { ...current, tags: normalizedTags, version: current.version + 1 };
+    setDeals((items) => items.map((deal) => deal.id === dealId ? optimistic : deal));
+    if (!remoteEnabled) return;
+    try {
+      const updated = await api.patch<ApiDeal>(`/deals/${dealId}`, {
+        expected_version: current.version,
+        tags: normalizedTags,
+      });
+      setDeals((items) => items.map((deal) => deal.id === dealId
+        ? { ...optimistic, tags: updated.tags, version: updated.version }
+        : deal));
+    } catch (reason) {
+      setDeals((items) => items.map((deal) => deal.id === dealId ? current : deal));
+      throw reason;
+    }
+  }, [deals]);
+
   const setDealCustomFields = useCallback(async (
     dealId: string,
     fields: Record<string, unknown>,
@@ -447,6 +478,7 @@ export function CrmProvider({ children }: PropsWithChildren) {
       stageId: pipeline.stages[0]?.id ?? demoPipeline.stages[0].id,
       status: "open",
       contactName: input.title,
+      tags: [],
       customFields: { subtitle: input.subtitle },
       version: 1,
       messages: [],
@@ -469,9 +501,10 @@ export function CrmProvider({ children }: PropsWithChildren) {
         amount: input.amount,
         currency: "RUB",
         source_id: sourceId,
+        tags: [],
         custom_fields: { subtitle: input.subtitle },
       });
-      const persisted = { ...optimistic, id: created.id, version: created.version };
+      const persisted = { ...optimistic, id: created.id, tags: created.tags, version: created.version };
       setDeals((items) => items.map((deal) => (deal.id === optimistic.id ? persisted : deal)));
       setSelectedDealId(persisted.id);
       return persisted;
@@ -609,6 +642,8 @@ export function CrmProvider({ children }: PropsWithChildren) {
       setNextPurchase,
       setDealContact,
       setDealCompany,
+      setDealTags,
+      setDealSearch,
       setDealCustomFields,
       nextCursorByStage,
       loadingStageId,
@@ -618,7 +653,7 @@ export function CrmProvider({ children }: PropsWithChildren) {
       retryMessage,
       toggleTask,
     }),
-    [addDeal, deals, error, loadMoreDeals, loading, loadingStageId, moveDeal, nextCursorByStage, pipeline, pipelines, retryMessage, selectDeal, selectPipeline, selectedDeal, selectedDealId, sendMessage, setDealCompany, setDealContact, setDealCustomFields, setNextPurchase, toggleTask],
+    [addDeal, deals, error, loadMoreDeals, loading, loadingStageId, moveDeal, nextCursorByStage, pipeline, pipelines, retryMessage, selectDeal, selectPipeline, selectedDeal, selectedDealId, sendMessage, setDealCompany, setDealContact, setDealCustomFields, setDealSearch, setDealTags, setNextPurchase, toggleTask],
   );
 
   return <CrmContext.Provider value={value}>{children}</CrmContext.Provider>;

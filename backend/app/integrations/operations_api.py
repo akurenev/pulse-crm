@@ -187,8 +187,7 @@ async def list_background_jobs(
     job_status: JobStatus | None = Query(default=None, alias="status"),
     limit: int = Query(default=100, ge=1, le=500),
 ) -> list[BackgroundJob]:
-    del context
-    query = sa.select(BackgroundJob)
+    query = sa.select(BackgroundJob).where(BackgroundJob.workspace_id == context.workspace_id)
     if job_status is not None:
         query = query.where(BackgroundJob.status == job_status)
     return list(
@@ -241,9 +240,13 @@ async def retry_background_job(
     context: CurrentAdmin,
     db: AsyncSession = Depends(get_session),
 ) -> BackgroundJob:
-    del context
     job = await db.scalar(
-        sa.select(BackgroundJob).where(BackgroundJob.id == job_id).with_for_update()
+        sa.select(BackgroundJob)
+        .where(
+            BackgroundJob.id == job_id,
+            BackgroundJob.workspace_id == context.workspace_id,
+        )
+        .with_for_update()
     )
     if job is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="job not found")
@@ -307,7 +310,8 @@ async def retry_notification_delivery(
     delivery.last_error = None
     job = await db.scalar(
         sa.select(BackgroundJob).where(
-            BackgroundJob.dedupe_key == f"notification-delivery:{delivery.id}:send"
+            BackgroundJob.workspace_id == context.workspace_id,
+            BackgroundJob.dedupe_key == f"notification-delivery:{delivery.id}:send",
         )
     )
     if job is not None:

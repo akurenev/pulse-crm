@@ -10,7 +10,7 @@ OAuth-реквизиты, access/refresh token, выгрузки клиенто�
    URI:
 
    ```text
-   https://crm.example.ru/api/v1/admin/integrations/amocrm/oauth/callback
+   https://crm.example.com/api/v1/admin/integrations/amocrm/oauth/callback
    ```
 
    URI должен использовать HTTPS и дословно совпадать с URI, который Pulse
@@ -18,7 +18,7 @@ OAuth-реквизиты, access/refresh token, выгрузки клиенто�
 2. От имени `owner` или `admin` вызвать
    `POST /api/v1/admin/integrations/amocrm/oauth/start` с `client_id`,
    `client_secret`, `redirect_uri` и allowlist аккаунтов
-   `allowed_referers`, например `["company.amocrm.ru"]`.
+   `allowed_referers`, например `["example.amocrm.ru"]`.
 3. Открыть возвращённый `authorization_url` в браузере до `expires_at`. OAuth
    state одноразовый и истекает через 10 минут; URL содержит
    `mode=post_message`.
@@ -41,7 +41,7 @@ OAuth-реквизиты, access/refresh token, выгрузки клиенто�
    `{"entity_type":"all","dry_run":true,"user_mapping":{...}}`. Режим
    `all` последовательно проходит воронки, этапы, пользователей,
    пользовательские поля, компании, контакты, сделки, открытые задачи и обычные
-   заметки.
+   заметки. Теги компаний, контактов и сделок входят в соответствующие записи.
 3. Дождаться `succeeded` и получить агрегированные `counts` без создания
    бизнес-сущностей. Dry-run проверяет доступность страниц, уникальность внешних
    идентификаторов и объём данных, но не заменяет ручную проверку назначения
@@ -51,8 +51,9 @@ OAuth-реквизиты, access/refresh token, выгрузки клиенто�
    UUID; не назначенные записи
    направить владельцу workspace.
 5. Выполнить полный импорт с `dry_run:false` в отдельную тестовую PostgreSQL.
-6. Сверить количества по типам, воронкам и этапам, суммы сделок и открытые
-   задачи; вручную проверить 100 случайных записей.
+6. Сверить количества по типам, воронкам и этапам, суммы сделок, открытые
+   задачи и теги; вручную проверить 100 случайных записей каждого критичного
+   типа.
 7. Повторить импорт и убедиться, что `ExternalEntityMap` не допускает дублей.
 
 Этап amoCRM идентифицируется парой `pipeline_id:status_id`: системные status ID
@@ -101,6 +102,7 @@ token. Одинаковый status ID в разных воронках дубл�
 устранения причины.
 
 При критической проблеме задать `PULSE_JOB_RUNNER_ENABLED=false`, перезапустить
-webapp, вернуть webhooks прежней системе и экспортировать записи, созданные в
-Pulse после cutover. В `v0.1.0` отдельного встроенного read-only flag нет:
-ограничение записи выполняется операционно на входном proxy/maintenance-контуре.
+webapp, вернуть webhooks прежней системе и сохранить отдельный логический
+backup Pulse для последующего owner-controlled разбора. Встроенного массового
+экспорта и отдельного read-only flag в MVP нет: ограничение записи выполняется
+операционно на входном proxy/maintenance-контуре.

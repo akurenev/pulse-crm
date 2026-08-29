@@ -37,6 +37,7 @@ export function DealCard({ deal, selected, onSelect }: DealCardProps) {
       <button type="button" className="deal-card__content" onClick={() => onSelect(deal.id)}>
         <span className="deal-card__title">{deal.title}</span>
         <span className="deal-card__subtitle">{deal.subtitle}</span>
+        {deal.tags.length ? <span className="deal-card__tags" aria-label={`Теги: ${deal.tags.join(", ")}`}>{deal.tags.slice(0, 2).map((tag) => <span key={tag}>{tag}</span>)}{deal.tags.length > 2 ? <em>+{deal.tags.length - 2}</em> : null}</span> : null}
         <strong className="deal-card__amount">{formatMoney(deal.amount)}</strong>
         <span className="deal-card__meta">
           <SourceBadge source={deal.source} label={deal.sourceLabel} />

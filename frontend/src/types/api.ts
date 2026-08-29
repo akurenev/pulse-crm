@@ -85,6 +85,7 @@ export interface ApiDeal {
   source_id: string | null;
   amount: string | number | null;
   currency: string;
+  tags: string[];
   custom_fields: Record<string, unknown>;
   next_purchase_at: string | null;
   last_activity_at: string;

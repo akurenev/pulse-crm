@@ -54,13 +54,14 @@ export default function ContactsPage() {
       company: contact.company_id ? "Компания" : "—",
       email: contact.primary_email ?? contact.emails[0] ?? "—",
       phone: contact.primary_phone ?? contact.phones[0] ?? "—",
+      tags: contact.tags,
       deals: 0,
       revenue: 0,
       assignee: users.ak,
     }));
   }, [demoContacts, remoteContacts.data]);
   const visibleContacts = useMemo(
-    () => sourceContacts.filter((contact) => `${contact.name} ${contact.company} ${contact.email} ${contact.phone}`.toLocaleLowerCase("ru").includes(deferred)),
+    () => sourceContacts.filter((contact) => `${contact.name} ${contact.company} ${contact.email} ${contact.phone} ${contact.tags.join(" ")}`.toLocaleLowerCase("ru").includes(deferred)),
     [deferred, sourceContacts],
   );
   const sourceCompanies = useMemo<ApiCompany[]>(() => {
@@ -68,7 +69,7 @@ export default function ContactsPage() {
     return demoCompanies;
   }, [demoCompanies, remoteCompanies.data]);
   const visibleCompanies = useMemo(
-    () => sourceCompanies.filter((company) => `${company.name} ${company.email ?? ""} ${company.phone ?? ""}`.toLocaleLowerCase("ru").includes(deferred)),
+    () => sourceCompanies.filter((company) => `${company.name} ${company.email ?? ""} ${company.phone ?? ""} ${company.tags.join(" ")}`.toLocaleLowerCase("ru").includes(deferred)),
     [deferred, sourceCompanies],
   );
   const loading = view === "contacts" ? remoteContacts.isLoading : remoteCompanies.isLoading;
@@ -133,6 +134,7 @@ export default function ContactsPage() {
           company: "—",
           email: String(data.get("email") ?? "").trim() || "—",
           phone: String(data.get("phone") ?? "").trim() || "—",
+          tags: [],
           deals: 0,
           revenue: 0,
           assignee: users.ak,
@@ -191,7 +193,7 @@ export default function ContactsPage() {
         <Button variant="primary" onClick={() => setDialogOpen(true)}><Plus size={17} /> {view === "contacts" ? "Новый контакт" : "Новая компания"}</Button>
       </header>
       <div className="content-toolbar">
-        <label className="search-control"><Search size={18} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Имя, компания, телефон или email" /></label>
+        <label className="search-control"><Search size={18} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Имя, компания, тег, телефон или email" /></label>
         <div className="view-switch" aria-label="Тип клиентов"><button className={view === "contacts" ? "is-active" : ""} type="button" aria-label="Контакты" onClick={() => setView("contacts")}><Users size={18} /></button><button className={view === "companies" ? "is-active" : ""} type="button" aria-label="Компании" onClick={() => setView("companies")}><Building2 size={18} /></button></div>
       </div>
 
@@ -201,7 +203,7 @@ export default function ContactsPage() {
         <div className="data-table__header"><span>Клиент</span><span>Контакты</span><span>Сделки</span><span>Следующая покупка</span><span>Ответственный</span></div>
         {visibleContacts.map((contact) => (
           <button className="data-row" type="button" key={contact.id} onClick={() => setSelectedContact(contact)}>
-            <span className="data-row__primary"><span className="company-avatar">{contact.name.slice(0, 1)}</span><span><strong>{contact.name}</strong><small>{contact.company}</small></span></span>
+            <span className="data-row__primary"><span className="company-avatar">{contact.name.slice(0, 1)}</span><span><strong>{contact.name}</strong><small>{[...(contact.company === "—" ? [] : [contact.company]), ...contact.tags].join(" · ") || "—"}</small></span></span>
             <span className="data-row__contact"><strong>{contact.phone}</strong><small>{contact.email}</small></span>
             <span>{remoteEnabled ? <><strong>—</strong><small>см. карточку</small></> : <><strong>{contact.deals}</strong><small>{formatMoney(contact.revenue)}</small></>}</span>
             <span>{contact.nextPurchaseAt ? formatLongDate(contact.nextPurchaseAt) : "Не запланирована"}</span>
@@ -263,6 +265,7 @@ export default function ContactsPage() {
               <div><small>Email</small><strong>{selectedContact.email}</strong></div>
               <div><small>Компания</small><strong>{selectedContact.company}</strong></div>
               <div><small>Ответственный</small><strong>{selectedContact.assignee.name}</strong></div>
+              <div className="record-detail-grid__wide"><small>Теги</small><strong>{selectedContact.tags.length ? selectedContact.tags.join(", ") : "Нет тегов"}</strong></div>
               <div><small>Покупок</small><strong>{remoteEnabled ? selectedPurchases.length : selectedContact.deals}</strong></div>
               <div><small>Покупок на сумму</small><strong>{formatMoney(remoteEnabled ? selectedRevenue : selectedContact.revenue)}</strong></div>
               <div className="record-detail-grid__wide"><small>Следующая покупка</small><strong>{selectedContact.nextPurchaseAt ? formatLongDate(selectedContact.nextPurchaseAt) : "Не запланирована"}</strong></div>

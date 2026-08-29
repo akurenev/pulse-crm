@@ -24,6 +24,28 @@ def _psycopg_dsn(database_url: str) -> str:
     return database_url.replace("postgresql+psycopg://", "postgresql://", 1)
 
 
+def _public_event_payload(
+    event: RealtimeEvent,
+    *,
+    user_id: object,
+) -> dict[str, object] | None:
+    """Return a minimal invalidation payload, or hide a private user event."""
+
+    payload = event.payload if isinstance(event.payload, dict) else {}
+    if event.event_type == "notification.delivered":
+        recipient_id = payload.get("recipient_id")
+        if recipient_id is None or str(recipient_id) != str(user_id):
+            return None
+        delivery_id = payload.get("delivery_id")
+        return {"delivery_id": str(delivery_id)} if delivery_id is not None else {}
+    public: dict[str, object] = {}
+    for key in ("entity_type", "entity_id"):
+        value = payload.get(key)
+        if value is not None:
+            public[key] = str(value)
+    return public
+
+
 @router.get("/events", response_class=StreamingResponse)
 async def realtime_events(
     request: Request,
@@ -71,8 +93,14 @@ async def realtime_events(
                 if events:
                     for event in events:
                         cursor = event.id
+                        public_payload = _public_event_payload(
+                            event,
+                            user_id=context.user_id,
+                        )
+                        if public_payload is None:
+                            continue
                         data = json.dumps(
-                            event.payload,
+                            public_payload,
                             ensure_ascii=False,
                             default=str,
                             separators=(",", ":"),

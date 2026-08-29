@@ -290,6 +290,7 @@ async def test_admin_can_retry_failed_job_and_scoped_notification_delivery(
     workspace_id = _workspace_id(owner_auth)
     own_delivery_id = uuid.uuid4()
     failed_job = BackgroundJob(
+        workspace_id=workspace_id,
         job_type="test.failed",
         payload={},
         status=JobStatus.failed,
@@ -315,6 +316,7 @@ async def test_admin_can_retry_failed_job_and_scoped_notification_delivery(
     )
     other_workspace = Workspace(name="Hidden Workspace", slug="hidden-workspace")
     delivery_job = BackgroundJob(
+        workspace_id=workspace_id,
         job_type="notification.deliver",
         payload={"notification_delivery_id": str(own_delivery_id)},
         status=JobStatus.failed,
@@ -328,6 +330,14 @@ async def test_admin_can_retry_failed_job_and_scoped_notification_delivery(
     async with SessionLocal() as db:
         db.add(other_workspace)
         await db.flush()
+        other_job = BackgroundJob(
+            workspace_id=other_workspace.id,
+            job_type="test.hidden",
+            payload={},
+            status=JobStatus.failed,
+            run_at=now,
+            last_error="hidden workspace error",
+        )
         other_delivery = NotificationDelivery(
             workspace_id=other_workspace.id,
             audience=NotificationAudience.employee,
@@ -344,12 +354,25 @@ async def test_admin_can_retry_failed_job_and_scoped_notification_delivery(
                 failed_job,
                 own_delivery,
                 other_delivery,
+                other_job,
                 delivery_job,
             ]
         )
         await db.commit()
 
     csrf = {"X-CSRF-Token": str(owner_auth["csrf_token"])}
+    jobs = await client.get("/api/v1/admin/jobs?status=failed")
+    assert jobs.status_code == 200, jobs.text
+    visible_job_ids = {item["id"] for item in jobs.json()}
+    assert str(failed_job.id) in visible_job_ids
+    assert str(other_job.id) not in visible_job_ids
+
+    hidden_job_retry = await client.post(
+        f"/api/v1/admin/jobs/{other_job.id}/retry",
+        headers=csrf,
+    )
+    assert hidden_job_retry.status_code == 404
+
     retried_job = await client.post(
         f"/api/v1/admin/jobs/{failed_job.id}/retry",
         headers=csrf,

@@ -27,6 +27,7 @@ from app.integrations.models import (
 from app.models import BackgroundJob, JobStatus
 from app.pagination import decode_cursor, encode_cursor
 from app.security import CurrentMutationUser, CurrentUser
+from app.services.data_access import enforce_cursor_page_budget
 
 router = APIRouter(tags=["messages"])
 
@@ -80,6 +81,13 @@ async def get_deal_messages(
     cursor: str | None = None,
     limit: int = Query(default=50, ge=1, le=100),
 ) -> MessagePage:
+    await enforce_cursor_page_budget(
+        db,
+        workspace_id=context.workspace_id,
+        user_id=context.user_id,
+        resource="deal_messages",
+        cursor=cursor,
+    )
     decoded = decode_cursor(cursor)
     try:
         rows = await list_deal_messages(
@@ -192,7 +200,10 @@ async def retry_message(
     message.failed_at = None
     message.last_error = None
     job = await db.scalar(
-        sa.select(BackgroundJob).where(BackgroundJob.dedupe_key == f"message:{message.id}:send")
+        sa.select(BackgroundJob).where(
+            BackgroundJob.dedupe_key == f"message:{message.id}:send",
+            BackgroundJob.workspace_id == context.workspace_id,
+        )
     )
     if job is not None:
         job.status = JobStatus.queued

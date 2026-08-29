@@ -76,6 +76,95 @@ async def test_contact_company_and_task_crud(
 
 
 @pytest.mark.asyncio
+async def test_deal_tags_round_trip_through_create_list_get_and_update(
+    client: httpx.AsyncClient, owner_auth: dict[str, object]
+) -> None:
+    headers = csrf(owner_auth)
+    pipeline = (await client.get("/api/v1/pipelines")).json()[0]
+    deal = await client.post(
+        "/api/v1/deals",
+        headers=headers,
+        json={
+            "title": "Tagged deal",
+            "pipeline_id": pipeline["id"],
+            "stage_id": pipeline["stages"][0]["id"],
+            "tags": ["vip", "repeat"],
+        },
+    )
+    assert deal.status_code == 201, deal.text
+    assert deal.json()["tags"] == ["vip", "repeat"]
+
+    deal_id = deal.json()["id"]
+    loaded = await client.get(f"/api/v1/deals/{deal_id}")
+    listed = await client.get("/api/v1/deals", params={"pipeline_id": pipeline["id"]})
+    assert loaded.status_code == 200, loaded.text
+    assert loaded.json()["tags"] == ["vip", "repeat"]
+    assert listed.status_code == 200, listed.text
+    assert listed.json()["items"][0]["tags"] == ["vip", "repeat"]
+
+    updated = await client.patch(
+        f"/api/v1/deals/{deal_id}",
+        headers=headers,
+        json={"expected_version": 1, "tags": ["priority"]},
+    )
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["tags"] == ["priority"]
+
+
+@pytest.mark.asyncio
+async def test_company_contact_and_deal_search_include_tags(
+    client: httpx.AsyncClient, owner_auth: dict[str, object]
+) -> None:
+    headers = csrf(owner_auth)
+    company = await client.post(
+        "/api/v1/companies",
+        headers=headers,
+        json={"name": "Northwind", "tags": ["Company-only-segment"]},
+    )
+    assert company.status_code == 201, company.text
+
+    contact = await client.post(
+        "/api/v1/contacts",
+        headers=headers,
+        json={"first_name": "Test", "last_name": "Person", "tags": ["Contact-only-segment"]},
+    )
+    assert contact.status_code == 201, contact.text
+
+    pipeline = (await client.get("/api/v1/pipelines")).json()[0]
+    sources = (await client.get("/api/v1/sources")).json()
+    html_form_source = next(source for source in sources if source["key"] == "html_form")
+    deal = await client.post(
+        "/api/v1/deals",
+        headers=headers,
+        json={
+            "title": "Synthetic order",
+            "pipeline_id": pipeline["id"],
+            "stage_id": pipeline["stages"][0]["id"],
+            "source_id": html_form_source["id"],
+            "tags": ["Deal-only-segment"],
+            "custom_fields": {"subtitle": "Rare catalog request"},
+        },
+    )
+    assert deal.status_code == 201, deal.text
+
+    companies = await client.get("/api/v1/companies", params={"search": "company-ONLY"})
+    contacts = await client.get("/api/v1/contacts", params={"search": "contact-ONLY"})
+    deals = await client.get("/api/v1/deals", params={"search": "deal-ONLY"})
+    deals_by_description = await client.get(
+        "/api/v1/deals", params={"search": "catalog request"}
+    )
+    deals_by_source_key = await client.get("/api/v1/deals", params={"search": "html_form"})
+    deals_by_source_name = await client.get("/api/v1/deals", params={"search": "HTML-форма"})
+
+    assert [item["id"] for item in companies.json()["items"]] == [company.json()["id"]]
+    assert [item["id"] for item in contacts.json()["items"]] == [contact.json()["id"]]
+    assert [item["id"] for item in deals.json()["items"]] == [deal.json()["id"]]
+    assert [item["id"] for item in deals_by_description.json()["items"]] == [deal.json()["id"]]
+    assert [item["id"] for item in deals_by_source_key.json()["items"]] == [deal.json()["id"]]
+    assert [item["id"] for item in deals_by_source_name.json()["items"]] == [deal.json()["id"]]
+
+
+@pytest.mark.asyncio
 async def test_required_fields_block_stage_transition_and_versions_conflict(
     client: httpx.AsyncClient, owner_auth: dict[str, object]
 ) -> None:

@@ -31,6 +31,15 @@ class Settings(BaseSettings):
     )
     cookie_secure: bool = False
     session_ttl_hours: int = Field(default=24 * 7, ge=1, le=24 * 90)
+    # CRM data export is a privileged, opt-in capability.  Keeping the server
+    # switch off by default prevents a future route or UI control from
+    # accidentally enabling bulk extraction.
+    crm_export_enabled: bool = False
+    # Continued cursor traversal is intentionally bounded.  The first page of
+    # every list remains free so normal dashboards and polling are unaffected;
+    # only follow-up pages consume this per-user, per-resource budget.
+    cursor_page_budget: int = Field(default=20, ge=1, le=1_000)
+    cursor_page_window_seconds: int = Field(default=15 * 60, ge=60, le=24 * 60 * 60)
     job_runner_enabled: bool = True
     job_runner_poll_seconds: float = Field(default=1.0, ge=0.1, le=30)
     job_runner_heartbeat_timeout_seconds: float = Field(default=30.0, ge=5, le=300)

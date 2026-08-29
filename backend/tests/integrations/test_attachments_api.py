@@ -19,7 +19,7 @@ from app.integrations.models import (
 )
 from app.integrations.s3 import AttachmentStorage
 from app.main import app
-from app.models import Deal, Membership, Pipeline, Stage
+from app.models import ActivityEvent, Deal, Membership, Pipeline, Stage
 
 
 class _RecordingS3:
@@ -117,6 +117,22 @@ async def test_attachment_upload_metadata_and_private_download_link(
     assert download.json()["expires_in"] == 300
     assert download.json()["url"].startswith("https://s3.test/get_object/attachments/")
     assert download.json()["url"].endswith("?expires=300")
+
+    async with SessionLocal() as db:
+        audit = await db.scalar(
+            sa.select(ActivityEvent).where(
+                ActivityEvent.workspace_id == workspace_id,
+                ActivityEvent.entity_id == uuid.UUID(str(attachment["id"])),
+                ActivityEvent.event_type == "attachment.download_link_issued",
+            )
+        )
+        assert audit is not None
+        assert audit.actor_id == owner_id
+        assert audit.payload == {
+            "message_id": str(message.id),
+            "size_bytes": len(b"%PDF-1.7\nproposal"),
+            "expires_in": 300,
+        }
 
 
 @pytest.mark.asyncio

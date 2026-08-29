@@ -25,6 +25,7 @@ from app.integrations.models import (
 from app.integrations.s3 import AttachmentStorage
 from app.integrations.secrets import SecretCipher
 from app.models import (
+    ActivityEvent,
     BackgroundJob,
     Membership,
     Pipeline,
@@ -491,7 +492,10 @@ async def test_import_start_pause_resume_is_versioned_and_enqueues_pages(
         queued = await db.scalar(
             sa.select(sa.func.count())
             .select_from(BackgroundJob)
-            .where(BackgroundJob.job_type == "amo_import.page")
+            .where(
+                BackgroundJob.workspace_id == uuid.UUID(admin_seed.workspace_id),
+                BackgroundJob.job_type == "amo_import.page",
+            )
         )
         assert queued == 2
 
@@ -576,3 +580,14 @@ async def test_import_report_download_is_admin_and_workspace_scoped(
         "url": f"https://s3.test/get_object/{ready.report_object_key}?expires=300",
         "expires_in": 300,
     }
+    async with SessionLocal() as db:
+        audit = await db.scalar(
+            sa.select(ActivityEvent).where(
+                ActivityEvent.workspace_id == workspace_id,
+                ActivityEvent.entity_id == ready.id,
+                ActivityEvent.event_type == "amo_import.report_download_link_issued",
+            )
+        )
+        assert audit is not None
+        assert audit.actor_id == uuid.UUID(admin_seed.owner_id)
+        assert audit.payload == {"expires_in": 300}

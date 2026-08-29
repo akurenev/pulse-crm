@@ -1,6 +1,6 @@
 from fastapi import APIRouter
 
-from app.api import auth, crm, events
+from app.api import auth, crm, events, security_controls
 from app.integrations import (
     admin_api,
     amocrm_api,
@@ -15,6 +15,7 @@ api_router.include_router(auth.router)
 api_router.include_router(auth.users_router)
 api_router.include_router(crm.router)
 api_router.include_router(events.router)
+api_router.include_router(security_controls.router)
 api_router.include_router(integrations_api.router)
 api_router.include_router(attachments_api.router)
 api_router.include_router(consents_api.router)

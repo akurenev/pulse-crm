@@ -16,6 +16,7 @@ class FakeS3:
     def __init__(self) -> None:
         self.puts: list[dict[str, Any]] = []
         self.deletes: list[dict[str, Any]] = []
+        self.presigns: list[dict[str, Any]] = []
         self.objects: dict[str, bytes] = {}
 
     def put_object(self, **kwargs: Any) -> None:
@@ -32,6 +33,9 @@ class FakeS3:
     def generate_presigned_url(
         self, client_method: str, *, Params: dict[str, Any], ExpiresIn: int
     ) -> str:
+        self.presigns.append(
+            {"client_method": client_method, "Params": Params, "ExpiresIn": ExpiresIn}
+        )
         return f"https://s3.test/{client_method}/{Params['Key']}?expires={ExpiresIn}"
 
 
@@ -72,6 +76,7 @@ async def test_private_storage_scopes_signed_url_to_workspace() -> None:
         filename="report.pdf",
     )
     assert "expires=300" in url
+    assert fake.presigns[-1]["Params"]["ResponseCacheControl"] == "no-store"
     with pytest.raises(PermissionError):
         await storage.signed_download_url(
             workspace_id=uuid.uuid4(),
@@ -130,6 +135,7 @@ async def test_import_report_uses_deterministic_private_key_and_scoped_url() -> 
     )
     assert expected in url
     assert "expires=300" in url
+    assert fake.presigns[-1]["Params"]["ResponseCacheControl"] == "no-store"
     with pytest.raises(PermissionError):
         await storage.signed_import_report_url(
             workspace_id=uuid.uuid4(),

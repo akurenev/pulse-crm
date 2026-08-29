@@ -2,12 +2,19 @@ import { expect, test } from "@playwright/test";
 
 test("creates a contact and switches to companies", async ({ page }) => {
   await page.goto("/contacts");
+  const importedContact = page.getByRole("button", { name: /Анна Смирнова/ });
+  await expect(importedContact).toContainText("VIP");
+  await importedContact.click();
+  const importedDialog = page.getByRole("dialog", { name: "Анна Смирнова" });
+  await expect(importedDialog.getByText("Повторная покупка, VIP", { exact: true })).toBeVisible();
+  await importedDialog.getByRole("button", { name: "Закрыть" }).click();
+
   await page.getByRole("button", { name: "Новый контакт" }).click();
   const dialog = page.getByRole("dialog", { name: "Новый контакт" });
   await dialog.getByLabel("Имя").fill("Мария");
   await dialog.getByLabel("Фамилия").fill("Орлова");
-  await dialog.getByLabel("Email").fill("maria@example.ru");
-  await dialog.getByLabel("Телефон").fill("+7 999 555-44-33");
+  await dialog.getByLabel("Email").fill("maria@example.com");
+  await dialog.getByLabel("Телефон").fill("+7 000 000-00-06");
   await dialog.getByRole("button", { name: "Сохранить" }).click();
   await expect(page.getByText("Мария Орлова", { exact: true })).toBeVisible();
 

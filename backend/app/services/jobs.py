@@ -7,7 +7,7 @@ own domain changes.  :class:`JobSupervisor` owns its transaction boundaries
 when it claims or acknowledges jobs.
 
 The implementation assumes ``BackgroundJob`` exposes the fields documented
-in the project architecture: ``id``, ``job_type``, ``status``, ``payload``,
+in the project architecture: ``id``, ``workspace_id``, ``job_type``, ``status``, ``payload``,
 ``run_at``, ``attempts``, ``max_attempts``, ``dedupe_key``, ``lease_owner``,
 ``lease_until`` and ``last_error``.
 """
@@ -111,6 +111,7 @@ class ClaimedJob:
     attempts: int
     max_attempts: int
     lease_owner: str
+    workspace_id: uuid.UUID | None = None
 
     @classmethod
     def from_model(cls, job: BackgroundJob) -> ClaimedJob:
@@ -123,6 +124,7 @@ class ClaimedJob:
             attempts=job.attempts,
             max_attempts=job.max_attempts,
             lease_owner=job.lease_owner,
+            workspace_id=job.workspace_id,
         )
 
 
@@ -144,6 +146,7 @@ async def enqueue_job(
     job_type: str,
     payload: Mapping[str, Any] | None = None,
     *,
+    workspace_id: uuid.UUID | None = None,
     run_at: datetime | None = None,
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
     dedupe_key: str | None = None,
@@ -162,6 +165,7 @@ async def enqueue_job(
         raise ValueError("max_attempts must be at least 1")
 
     values: dict[str, Any] = {
+        "workspace_id": workspace_id,
         "job_type": job_type,
         "payload": dict(payload or {}),
         "status": _job_status(QUEUED),

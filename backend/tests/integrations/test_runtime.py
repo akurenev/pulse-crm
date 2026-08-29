@@ -48,6 +48,7 @@ from app.integrations.runtime import (
     RUNTIME_JOB_TYPES,
     RuntimeHandlers,
     RuntimeScheduler,
+    RuntimeWiringError,
 )
 from app.integrations.s3 import AttachmentStorage
 from app.models import (
@@ -72,6 +73,7 @@ def claimed_job(
     *,
     attempts: int = 1,
     max_attempts: int = 5,
+    workspace_id: uuid.UUID | None = None,
 ) -> ClaimedJob:
     return ClaimedJob(
         id=uuid.uuid4(),
@@ -80,6 +82,7 @@ def claimed_job(
         attempts=attempts,
         max_attempts=max_attempts,
         lease_owner="runtime-test",
+        workspace_id=workspace_id,
     )
 
 
@@ -226,6 +229,13 @@ async def test_scheduler_tick_is_idempotent_for_same_durable_work(
         JOB_RUNTIME_CLEANUP,
         JOB_RUNTIME_RECOVER,
     }
+    scoped = next(job for job in jobs if job.job_type == JOB_INBOUND_PROCESS)
+    assert scoped.workspace_id == integration_domain["workspace"].id
+    assert all(
+        job.workspace_id is None
+        for job in jobs
+        if job.job_type in {JOB_RUNTIME_CLEANUP, JOB_RUNTIME_RECOVER}
+    )
 
 
 @pytest.mark.asyncio
@@ -245,7 +255,11 @@ async def test_outbox_dispatch_enqueues_one_deduplicated_child_job(
     db.add(event)
     await db.commit()
     handlers = RuntimeHandlers(session_factory=SessionLocal, now=lambda: FIXED_NOW)
-    job = claimed_job("outbox.dispatch", {"outbox_event_id": str(event.id)})
+    job = claimed_job(
+        "outbox.dispatch",
+        {"outbox_event_id": str(event.id)},
+        workspace_id=event.workspace_id,
+    )
 
     await handlers.dispatch_outbox(job)
     await handlers.dispatch_outbox(job)
@@ -265,6 +279,58 @@ async def test_outbox_dispatch_enqueues_one_deduplicated_child_job(
     assert len(child_jobs) == 1
     assert child_jobs[0].job_type == JOB_MESSAGE_SEND
     assert child_jobs[0].payload == {"message_id": str(message_id)}
+    assert child_jobs[0].workspace_id == integration_domain["workspace"].id
+
+
+@pytest.mark.asyncio
+async def test_runtime_rejects_cross_workspace_claim_before_domain_mutation(
+    db: AsyncSession,
+    integration_domain: dict[str, Any],
+) -> None:
+    event = OutboxEvent(
+        workspace_id=integration_domain["workspace"].id,
+        event_type="message.outbound.queued",
+        aggregate_type="message",
+        aggregate_id=uuid.uuid4(),
+        payload={},
+        available_at=FIXED_NOW,
+    )
+    db.add(event)
+    await db.commit()
+    handlers = RuntimeHandlers(session_factory=SessionLocal, now=lambda: FIXED_NOW)
+
+    with pytest.raises(RuntimeWiringError, match="does not match"):
+        await handlers.dispatch_outbox(
+            claimed_job(
+                "outbox.dispatch",
+                {"outbox_event_id": str(event.id)},
+                workspace_id=uuid.uuid4(),
+            )
+        )
+
+    await db.refresh(event)
+    assert event.processed_at is None
+    assert event.attempts == 0
+    assert (
+        await db.scalar(
+            sa.select(sa.func.count()).select_from(BackgroundJob).where(
+                BackgroundJob.dedupe_key == f"message:{event.aggregate_id}:send"
+            )
+        )
+        == 0
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("job_type", [JOB_RUNTIME_CLEANUP, JOB_RUNTIME_RECOVER])
+async def test_global_maintenance_handlers_reject_workspace_scoped_jobs(
+    job_type: str,
+) -> None:
+    handlers = RuntimeHandlers(session_factory=SessionLocal, now=lambda: FIXED_NOW)
+    handler = handlers.registry()[job_type]
+
+    with pytest.raises(RuntimeWiringError, match="must not have workspace_id"):
+        await handler(claimed_job(job_type, {}, workspace_id=uuid.uuid4()))
 
 
 @pytest.mark.asyncio
@@ -619,7 +685,13 @@ async def test_runtime_sends_outbound_message_and_marks_it_sent(
         adapter_factory=lambda _: adapter,
         now=lambda: FIXED_NOW,
     )
-    await handlers.send_message(claimed_job("message.send", {"message_id": str(outbound.id)}))
+    await handlers.send_message(
+        claimed_job(
+            "message.send",
+            {"message_id": str(outbound.id)},
+            workspace_id=outbound.workspace_id,
+        )
+    )
 
     await db.refresh(outbound)
     sent_event = await db.scalar(
@@ -699,20 +771,42 @@ async def test_runtime_materializes_private_attachment_and_retry_is_status_idemp
 
     with pytest.raises(RuntimeError, match="temporarily unavailable"):
         await handlers.send_message(
-            claimed_job(JOB_MESSAGE_SEND, payload, attempts=1, max_attempts=3)
+            claimed_job(
+                JOB_MESSAGE_SEND,
+                payload,
+                attempts=1,
+                max_attempts=3,
+                workspace_id=outbound.workspace_id,
+            )
         )
     await db.refresh(outbound)
     assert outbound.status is MessageStatus.queued
     assert outbound.last_error is None
 
-    await handlers.send_message(claimed_job(JOB_MESSAGE_SEND, payload, attempts=2, max_attempts=3))
+    await handlers.send_message(
+        claimed_job(
+            JOB_MESSAGE_SEND,
+            payload,
+            attempts=2,
+            max_attempts=3,
+            workspace_id=outbound.workspace_id,
+        )
+    )
     await db.refresh(outbound)
     assert outbound.status is MessageStatus.sent
     assert outbound.provider_message_id == "provider-out-attachment"
 
     # A duplicate/replayed job observes the persisted sent status and performs
     # neither another S3 read nor another provider send.
-    await handlers.send_message(claimed_job(JOB_MESSAGE_SEND, payload, attempts=3, max_attempts=3))
+    await handlers.send_message(
+        claimed_job(
+            JOB_MESSAGE_SEND,
+            payload,
+            attempts=3,
+            max_attempts=3,
+            workspace_id=outbound.workspace_id,
+        )
+    )
     expected_attachment = OutboundAttachment(
         filename="proposal.pdf",
         content_type="application/pdf",
@@ -761,6 +855,7 @@ async def test_runtime_delivers_in_app_notification_and_publishes_realtime_event
         claimed_job(
             "notification.deliver",
             {"notification_delivery_id": str(delivery.id)},
+            workspace_id=delivery.workspace_id,
         )
     )
 
@@ -777,6 +872,4 @@ async def test_runtime_delivers_in_app_notification_and_publishes_realtime_event
     assert realtime.payload == {
         "delivery_id": str(delivery.id),
         "recipient_id": str(integration_domain["user"].id),
-        "subject": "Новая задача",
-        "body": "Проверьте сделку",
     }

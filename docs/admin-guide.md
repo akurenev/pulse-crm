@@ -22,13 +22,13 @@ Timeweb описано в [production runbook](runbooks/timeweb-production.md).
   `primary`;
 - `PULSE_DATABASE_URL` и параметры приватного S3;
 - `PULSE_COOKIE_SECURE=true`, `PULSE_JOB_RUNNER_ENABLED=true` и
-  `PULSE_ALLOWED_HOSTS='["crm.example.ru"]'`.
+  `PULSE_ALLOWED_HOSTS='["crm.example.com"]'`.
 
 После deploy сначала проверьте:
 
 ```bash
-curl -fsS https://crm.example.ru/health/live
-curl -fsS https://crm.example.ru/health/ready
+curl -fsS https://crm.example.com/health/live
+curl -fsS https://crm.example.com/health/ready
 ```
 
 Создайте единственный workspace и владельца. Пароль должен содержать не менее
@@ -42,11 +42,11 @@ curl -i -c pulse.cookies \
   -d '{
     "workspace_name":"Моя компания",
     "workspace_slug":"my-company",
-    "email":"owner@example.ru",
+    "email":"owner@example.com",
     "full_name":"Владелец CRM",
     "password":"CHANGE-THIS-LONG-PASSWORD"
   }' \
-  https://crm.example.ru/api/v1/auth/bootstrap
+  https://crm.example.com/api/v1/auth/bootstrap
 ```
 
 Ответ содержит `csrf_token`, а cookie `pulse_session` устанавливается как
@@ -67,10 +67,14 @@ HttpOnly. Для изменяющих API-запросов с cookie перед�
 | `admin` | CRM-данные, воронки, поля, каналы, уведомления, импорт, приглашение `manager` |
 | `manager` | Контакты, компании, сделки, задачи, сообщения и активность; без административных настроек |
 
+Штатный массовый экспорт CRM не входит в MVP. Даже при включённом в будущем
+серверном feature flag право на такой процесс зарезервировано только за
+`owner`; роли `admin` и `manager` его не получают.
+
 В разделе **Настройки → Пользователи** укажите email и роль. API-эквивалент —
 `POST /api/v1/invitations`; сырой token возвращается только в ответе на создание
 и действует 72 часа по умолчанию. Ссылка имеет вид:
-`https://crm.example.ru/accept-invitation?token=TOKEN`.
+`https://crm.example.com/accept-invitation?token=TOKEN`.
 
 Администратор не может приглашать другого администратора — это может сделать
 только `owner`. Роль `owner` через приглашение не назначается.
@@ -206,19 +210,19 @@ read API.
 ```json
 {
   "smtp": {
-    "host": "smtp.example.ru",
+    "host": "smtp.example.com",
     "port": 587,
     "security": "starttls",
-    "username": "sales@example.ru",
+    "username": "sales@example.com",
     "password": "SMTP_PASSWORD",
-    "from_address": "sales@example.ru",
+    "from_address": "sales@example.com",
     "subject": "Pulse CRM"
   },
   "imap": {
-    "host": "imap.example.ru",
+    "host": "imap.example.com",
     "port": 993,
     "security": "ssl",
-    "username": "sales@example.ru",
+    "username": "sales@example.com",
     "password": "IMAP_PASSWORD",
     "mailbox": "INBOX"
   }
@@ -240,7 +244,7 @@ read API.
 HTTPS webhook:
 
 ```text
-https://crm.example.ru/hooks/v1/telegram/{connection_id}
+https://crm.example.com/hooks/v1/telegram/{connection_id}
 ```
 
 Передайте то же значение как Telegram `secret_token`. Pulse проверяет входящий
@@ -255,7 +259,7 @@ https://crm.example.ru/hooks/v1/telegram/{connection_id}
 Webhook URL:
 
 ```text
-https://crm.example.ru/hooks/v1/max/{connection_id}
+https://crm.example.com/hooks/v1/max/{connection_id}
 ```
 
 При создании подписки MAX задайте тот же секрет. Pulse проверяет заголовок
@@ -274,7 +278,7 @@ https://crm.example.ru/hooks/v1/max/{connection_id}
 раз; сохраните его в secret-хранилище источника. URL:
 
 ```text
-POST https://crm.example.ru/hooks/v1/generic/{slug}
+POST https://crm.example.com/hooks/v1/generic/{slug}
 ```
 
 Тело — JSON-объект до 2 МБ с хотя бы одним из ключей `contact`, `deal`,
@@ -282,7 +286,7 @@ POST https://crm.example.ru/hooks/v1/generic/{slug}
 
 ```json
 {
-  "contact": {"name":"Анна", "email":"anna@example.ru"},
+  "contact": {"name":"Анна", "email":"anna@example.com"},
   "deal": {"title":"Заказ кофе", "amount":45000},
   "message": {"text":"Нужна консультация"},
   "custom_fields": {"utm_source":"site"}
@@ -301,7 +305,7 @@ POST https://crm.example.ru/hooks/v1/generic/{slug}
 вычисления подписи. Пример проверки отправки:
 
 ```bash
-body='{"contact":{"name":"Анна","email":"anna@example.ru"},"deal":{"title":"Заказ кофе"}}'
+body='{"contact":{"name":"Анна","email":"anna@example.com"},"deal":{"title":"Заказ кофе"}}'
 timestamp="$(date +%s)"
 signature="$(printf '%s.%s' "$timestamp" "$body" | openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" -hex | awk '{print "sha256=" $2}')"
 curl -i \
@@ -310,7 +314,7 @@ curl -i \
   -H "X-Pulse-Signature: $signature" \
   -H "Idempotency-Key: test-$(date +%s)" \
   --data-binary "$body" \
-  https://crm.example.ru/hooks/v1/generic/orders-from-site
+  https://crm.example.com/hooks/v1/generic/orders-from-site
 ```
 
 Успешный приём отвечает `202`. Повтор тех же байтов с тем же ключом снова
@@ -325,14 +329,14 @@ curl -i \
 - уникальный `slug`, маршрут в воронку и ответственного;
 - `fields_schema` с ключами `key`, `label`, `type`, `required`; типы формы:
   `text`, `email`, `phone`, `textarea`, `number`, `boolean`, `select`;
-- точный allowlist `allowed_origins`, например `https://www.example.ru`;
+- точный allowlist `allowed_origins`, например `https://www.example.com`;
 - отдельное honeypot-поле и сообщение об успехе.
 
 Готовая страница доступна по `GET /forms/{slug}`. Для встраивания добавьте на
 разрешённый сайт:
 
 ```html
-<script src="https://crm.example.ru/forms/request-offer/embed.js" async></script>
+<script src="https://crm.example.com/forms/request-offer/embed.js" async></script>
 ```
 
 Submit идёт на `POST /forms/{slug}/submit`. Встроенная разметка добавляет
@@ -373,7 +377,7 @@ honeypot и `_idempotency_key`; при собственной форме пер�
 ```json
 {
   "channel": "email",
-  "address": "client@example.ru",
+  "address": "client@example.com",
   "purpose": "notifications",
   "source": "html_form",
   "evidence": {
@@ -398,7 +402,7 @@ JSON-доказательство `evidence` обязательны. Не фик
 В amoCRM создайте интеграцию и зарегистрируйте точный Redirect URI:
 
 ```text
-https://crm.example.ru/api/v1/admin/integrations/amocrm/oauth/callback
+https://crm.example.com/api/v1/admin/integrations/amocrm/oauth/callback
 ```
 
 URI должен использовать HTTPS и дословно совпадать с `redirect_uri` в запросе.
@@ -409,8 +413,8 @@ URI должен использовать HTTPS и дословно совпад
 {
   "client_id": "AMO_INTEGRATION_ID",
   "client_secret": "AMO_CLIENT_SECRET",
-  "redirect_uri": "https://crm.example.ru/api/v1/admin/integrations/amocrm/oauth/callback",
-  "allowed_referers": ["company.amocrm.ru"]
+  "redirect_uri": "https://crm.example.com/api/v1/admin/integrations/amocrm/oauth/callback",
+  "allowed_referers": ["example.amocrm.ru"]
 }
 ```
 
@@ -436,12 +440,28 @@ secret, access token и одноразово ротируемый refresh token 
 
 `all` последовательно обрабатывает: воронки, этапы, пользователей,
 пользовательские поля, компании, контакты, сделки, открытые задачи и обычные
-заметки. Страница содержит не более 250 объектов. API-запрос к amoCRM выполняется
-вне транзакции, а cursor и counts сохраняются после каждой страницы.
+заметки. Для компаний, контактов и сделок сохраняются названия тегов из
+`_embedded.tags`; пустые и повторяющиеся значения отбрасываются, порядок
+сохраняется, максимум — 100 тегов по 100 символов. Страница содержит не более
+250 объектов. API-запрос к amoCRM выполняется вне транзакции, а cursor и counts
+сохраняются после каждой страницы.
+
+Серверный поиск компаний, контактов и сделок учитывает сохранённые теги. Для
+сделок он также ищет по названию, значениям пользовательских полей и источнику,
+поэтому результат не ограничивается уже загруженной страницей Kanban.
+
+Формат и разделение справочников тегов по типам сущностей описаны в
+[официальной документации amoCRM](https://www.amocrm.ru/developers/content/crm_platform/tags-api).
 
 Проверьте `counts` и сопоставление пользователей. Затем повторите запрос с
 `dry_run: false`. `ExternalEntityMap` обеспечивает повторный запуск без дублей.
 Чаты, звонки, файлы и полный журнал изменений не импортируются.
+
+Fingerprint сделок имеет версию схемы. Первый повторный импорт после добавления
+поддержки тегов пересматривает уже сопоставленные сделки и заполняет их теги;
+следующие неизменившиеся страницы снова пропускаются как `unchanged`. Если набор
+тегов в amoCRM изменён или очищен, Pulse заменяет сохранённый набор, а не
+объединяет его со старым.
 
 Внешний ID этапа хранится как `pipeline_id:status_id`. Это важно, потому что
 одинаковые системные status ID закономерно встречаются в нескольких воронках
@@ -465,7 +485,48 @@ status ID. Для старых сопоставлений по одному ID �
 Полный production cutover описан в
 [runbook amoCRM](runbooks/amocrm-cutover.md).
 
-## 10. Ошибки, health и backup
+## 10. Защита данных и политика экспорта
+
+В MVP не реализованы UI, endpoint или background job для массового экспорта
+CRM-данных. Дополнительная серверная защита включена по принципу deny by
+default:
+
+- `PULSE_CRM_EXPORT_ENABLED=false` — безопасное значение по умолчанию;
+- будущий процесс экспорта обязан использовать owner-only dependency и
+  дополнительно проверять этот feature flag на сервере;
+- только владелец видит эффективное состояние через
+  `GET /api/v1/admin/security/export-policy`; одному включению переменной
+  недостаточно, чтобы создать выгрузку в текущей версии;
+- ответы `/api/*` отправляются с `Cache-Control: no-store`;
+- SSE отдаёт только идентификаторы для обновления UI и не повторяет тела
+  заметок, сообщений, адреса или доказательства согласий;
+- фоновые задания имеют `workspace_id`, а административный список и повтор
+  задания, а также само исполнение доменного задания ограничены текущим
+  workspace;
+- первая страница CRM-списка остаётся доступной для обычного обновления UI, а
+  продолжение cursor-pagination учитывается отдельно для пользователя и вида
+  списка; по умолчанию разрешено 20 продолжений за 15 минут, затем API отвечает
+  HTTP 429 с `Retry-After` и один раз журналирует превышение;
+- выдача временной ссылки на вложение или итоговый отчёт импорта записывается
+  в журнал активности без URL, имени бакета и секретов.
+
+Временные S3-ссылки действуют пять минут, однако уже открытый файл находится за
+пределами контроля приложения. Абсолютно запретить копирование данных
+авторизованным пользователем невозможно: он может переписать видимую карточку,
+автоматизировать разрешённые запросы или сделать снимок экрана. Поэтому эта
+политика предотвращает штатный bulk export, уменьшает кэширование и оставляет
+аудит чувствительных скачиваний, но не заменяет организационные меры и DLP.
+
+Не включайте `PULSE_CRM_EXPORT_ENABLED` до появления отдельного проверенного
+процесса с явным подтверждением владельца, лимитами, аудитом создания и
+скачивания, коротким TTL файла и автоматическим удалением объекта.
+
+Лимит последовательного чтения настраивается переменными
+`PULSE_CURSOR_PAGE_BUDGET` и `PULSE_CURSOR_PAGE_WINDOW_SECONDS`. Не завышайте их
+без анализа журнала и реального размера страниц. Лимит сдерживает быстрый обход,
+но не является полной защитой от медленного или ручного копирования.
+
+## 11. Ошибки, health и backup
 
 Администратор видит terminal failed jobs в **Настройки → Импорт amoCRM → Ошибки
 фоновых заданий**. API:
