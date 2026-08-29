@@ -55,6 +55,9 @@ const realtimeEventTypes = [
   "company.updated",
 ] as const;
 
+const REALTIME_REFRESH_DEBOUNCE_MS = 250;
+const REALTIME_FALLBACK_INTERVAL_MS = 15_000;
+
 export function AppShell() {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const { session, logout } = useAuth();
@@ -167,15 +170,64 @@ function useRealtimeRefresh() {
 
   useEffect(() => {
     if (!remoteEnabled) return;
+    let refreshTimeout: number | null = null;
+    let fallbackInterval: number | null = null;
+    let disposed = false;
+
     const refresh = () => {
+      refreshTimeout = null;
+      if (disposed) return;
       void queryClient.invalidateQueries();
       window.dispatchEvent(new Event("pulse:refresh"));
     };
+
+    const scheduleRefresh = () => {
+      if (refreshTimeout !== null) return;
+      refreshTimeout = window.setTimeout(refresh, REALTIME_REFRESH_DEBOUNCE_MS);
+    };
+
+    const stopFallback = () => {
+      if (fallbackInterval === null) return;
+      window.clearInterval(fallbackInterval);
+      fallbackInterval = null;
+    };
+
+    const startFallback = () => {
+      if (disposed || fallbackInterval !== null) return;
+      fallbackInterval = window.setInterval(scheduleRefresh, REALTIME_FALLBACK_INTERVAL_MS);
+    };
+
+    if (typeof EventSource === "undefined") {
+      startFallback();
+      return () => {
+        disposed = true;
+        stopFallback();
+        if (refreshTimeout !== null) window.clearTimeout(refreshTimeout);
+      };
+    }
+
     const source = new EventSource("/api/v1/events");
-    for (const eventType of realtimeEventTypes) source.addEventListener(eventType, refresh);
-    const fallback = window.setInterval(refresh, 15_000);
+    const handleOpen = () => {
+      stopFallback();
+      // Reconcile the REST snapshot with events that may have arrived before
+      // the server established the stream cursor, and after reconnect gaps.
+      scheduleRefresh();
+    };
+    const handleError = () => startFallback();
+    source.addEventListener("open", handleOpen);
+    source.addEventListener("error", handleError);
+    for (const eventType of realtimeEventTypes) source.addEventListener(eventType, scheduleRefresh);
+    // Cover slow or failed initial connections. A successful `open` clears the
+    // interval before it can poll while the live stream is healthy.
+    startFallback();
+
     return () => {
-      window.clearInterval(fallback);
+      disposed = true;
+      stopFallback();
+      if (refreshTimeout !== null) window.clearTimeout(refreshTimeout);
+      source.removeEventListener("open", handleOpen);
+      source.removeEventListener("error", handleError);
+      for (const eventType of realtimeEventTypes) source.removeEventListener(eventType, scheduleRefresh);
       source.close();
     };
   }, [queryClient]);

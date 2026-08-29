@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import uuid
 from collections.abc import AsyncIterator
 from typing import Annotated
 
@@ -46,17 +47,41 @@ def _public_event_payload(
     return public
 
 
+async def _initial_event_cursor(
+    workspace_id: uuid.UUID,
+    *,
+    after_id: int | None,
+    last_event_id: int | None,
+) -> int:
+    """Resolve a workspace-scoped SSE cursor without replaying history to new clients."""
+
+    if after_id is not None or last_event_id is not None:
+        return max(0, after_id or 0, last_event_id or 0)
+
+    async with SessionLocal() as db:
+        tail = await db.scalar(
+            sa.select(sa.func.max(RealtimeEvent.id)).where(
+                RealtimeEvent.workspace_id == workspace_id
+            )
+        )
+    return int(tail or 0)
+
+
 @router.get("/events", response_class=StreamingResponse)
 async def realtime_events(
     request: Request,
     context: CurrentUser,
-    after_id: int = Query(default=0, ge=0),
+    after_id: int | None = Query(default=None, ge=0),
     last_event_id: Annotated[int | None, Header(alias="Last-Event-ID")] = None,
 ) -> StreamingResponse:
-    """Durable SSE feed. Clients reconnect with Last-Event-ID to replay missed events."""
+    """Stream new events; explicit cursors let reconnecting clients replay missed events."""
 
     workspace_id = context.workspace_id
-    initial_cursor = max(after_id, last_event_id or 0)
+    initial_cursor = await _initial_event_cursor(
+        workspace_id,
+        after_id=after_id,
+        last_event_id=last_event_id,
+    )
 
     async def stream() -> AsyncIterator[str]:
         cursor = initial_cursor
