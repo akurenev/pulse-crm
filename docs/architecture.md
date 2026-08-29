@@ -11,7 +11,8 @@ payload: он извлекается из сессии и включается �
 Production состоит из трёх ресурсов:
 
 1. Timeweb App Platform webapp: FastAPI, статический React build и supervisor.
-2. PostgreSQL 17 DBaaS: доменные данные, сессии, job queue, outbox и realtime.
+2. PostgreSQL 17 или 18 DBaaS: доменные данные, сессии, job queue, outbox и
+   realtime.
 3. Приватный S3: `attachments/`, `imports/`, `exports/`, `backups/`.
 
 ## Модули
@@ -25,6 +26,20 @@ Production состоит из трёх ресурсов:
 | `app.services.jobs` | очередь, leases, retry/backoff и supervisor |
 | `app.api.events` | replayable SSE по монотонному `event_id` |
 | `frontend` | responsive SPA и optimistic UI |
+
+## Воронки и внешние идентификаторы
+
+Администратор может создавать и переименовывать воронки, добавлять открытые
+этапы, менять название и цвет этапа и удалять только неиспользуемые объекты.
+Удаление блокируется, если на этап или воронку ссылаются сделки, история
+переходов, каналы, формы, webhook-и или правила оповещений. Финальные этапы
+`won`/`lost` и последний открытый этап защищены.
+
+ID этапа amoCRM уникален только внутри своей воронки: системные status ID могут
+повторяться. Поэтому `ExternalEntityMap` использует составной внешний ключ
+`pipeline_id:status_id`, а импорт сделки разрешает этап по той же паре. Для
+ранее созданных записей поддерживается чтение legacy-сопоставления по одному
+status ID; новое сопоставление всегда записывается в составном формате.
 
 ## Транзакционный путь изменения
 
@@ -77,6 +92,12 @@ HTTP response          supervisor claims outbox/job
 по нормализованным контактам. JSONB custom fields индексируются только для
 реально используемых фильтров: универсальный GIN на каждую JSONB-колонку в MVP
 не создаётся.
+
+Индексы `ix_contacts_fulltext` и `ix_deals_fulltext` создаются явным
+PostgreSQL DDL в Alembic-миграции. Они перечислены как управляемые миграцией в
+`backend/alembic/env.py`, поэтому autogenerate/check не предлагает удалить их
+как отсутствующие в ORM metadata. Обычные metadata-индексы продолжают
+сравниваться без исключений.
 
 ## Защита
 

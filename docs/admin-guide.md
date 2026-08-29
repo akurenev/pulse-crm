@@ -5,6 +5,11 @@
 не означает, что конкретный production-контур уже создан. Развёртывание в
 Timeweb описано в [production runbook](runbooks/timeweb-production.md).
 
+> [!IMPORTANT]
+> Репозиторий публичный. Все домены, UUID и реквизиты ниже — плейсхолдеры.
+> Фактические connection strings, IP, имена бакетов/сетей, OAuth secrets и
+> token должны храниться только в закрытых variables соответствующего контура.
+
 ## 1. Первый запуск и bootstrap
 
 До первого старта задайте production-переменные из `.env.example`. Особенно
@@ -405,7 +410,7 @@ URI должен использовать HTTPS и дословно совпад
   "client_id": "AMO_INTEGRATION_ID",
   "client_secret": "AMO_CLIENT_SECRET",
   "redirect_uri": "https://crm.example.ru/api/v1/admin/integrations/amocrm/oauth/callback",
-  "allowed_referers": ["mycompany.amocrm.ru"]
+  "allowed_referers": ["company.amocrm.ru"]
 }
 ```
 
@@ -438,6 +443,12 @@ secret, access token и одноразово ротируемый refresh token 
 `dry_run: false`. `ExternalEntityMap` обеспечивает повторный запуск без дублей.
 Чаты, звонки, файлы и полный журнал изменений не импортируются.
 
+Внешний ID этапа хранится как `pipeline_id:status_id`. Это важно, потому что
+одинаковые системные status ID закономерно встречаются в нескольких воронках
+amoCRM. При импорте сделки этап ищется по той же паре, а не глобально по одному
+status ID. Для старых сопоставлений по одному ID сохранена совместимость;
+повторный запуск создаёт составное сопоставление и не дублирует этап.
+
 - список: `GET /api/v1/admin/integrations/imports`;
 - пауза: `POST .../imports/{id}/pause` с `{"expected_version":N}`;
 - продолжение после `paused` или `failed`: `POST .../imports/{id}/resume` с
@@ -445,6 +456,9 @@ secret, access token и одноразово ротируемый refresh token 
 - итоговый JSON-отчёт: `GET .../imports/{id}/report` после статуса `succeeded`.
 
 Пауза применяется между страницами; уже подтверждённая страница не откатывается.
+После исправления причины failed-запуск следует продолжить, а не создавать
+заново: сохранённый cursor и идемпотентные внешние сопоставления защищают от
+повторного создания уже обработанных сущностей.
 Отчёт записывается в приватный S3 по ключу
 `imports/{workspace_id}/{import_id}/report.json`; endpoint возвращает временную
 подписанную ссылку на пять минут. В UI она доступна по кнопке **Скачать отчёт**.

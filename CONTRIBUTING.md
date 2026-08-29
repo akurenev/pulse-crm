@@ -42,6 +42,11 @@ python -m pip install -e "backend[dev]"
 ruff check backend/app backend/tests
 mypy backend/app
 python -m pytest backend/tests
+
+# TEST_DATABASE_URL указывает только на одноразовую тестовую PostgreSQL.
+test -n "$TEST_DATABASE_URL"
+PULSE_DATABASE_URL="$TEST_DATABASE_URL" alembic -c backend/alembic.ini upgrade head
+PULSE_DATABASE_URL="$TEST_DATABASE_URL" alembic -c backend/alembic.ini check
 ```
 
 Frontend:
@@ -72,6 +77,14 @@ docker build -t pulse-crm:local .
   обсуждения.
 - Интерфейс проверяется на ширинах 360, 768 и 1440 px, с клавиатуры и без мыши.
 - В production остаются один webapp, одна PostgreSQL и один приватный S3.
+- PostgreSQL-specific индекс, созданный raw DDL, нужно добавить в список
+  управляемых миграцией объектов в `backend/alembic/env.py`; обычные индексы
+  должны оставаться видимыми для `alembic check`.
+
+Публичный репозиторий не должен содержать параметры реального контура. В issue,
+PR, документации, fixtures и скриншотах используйте только вымышленные домены,
+IP и идентификаторы. Не публикуйте connection strings, bucket/network names,
+OAuth-реквизиты, bot tokens, дампы, сообщения клиентов и production-логи.
 
 Не запускайте formatter по несвязанным файлам и не включайте в PR generated
 артефакты (`dist`, coverage, Playwright reports).

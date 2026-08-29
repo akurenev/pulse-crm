@@ -10,16 +10,24 @@ Pulse CRM — открытая CRM-система для небольшой ко
 создан. Целевая конфигурация — до 20 пользователей, 100&nbsp;000 контактов,
 50&nbsp;000 сделок и около 1 млн событий и сообщений.
 
+> [!IMPORTANT]
+> Репозиторий публичный. Домены, IP-адреса, имена облачных ресурсов, строки
+> подключения и значения секретов конкретного production-контура здесь не
+> публикуются. Все адреса и реквизиты в документации — безопасные плейсхолдеры.
+
 ## Возможности MVP
 
 - контакты, компании, теги, заметки и история покупок;
 - несколько воронок, адаптивные Kanban и list views, карточка сделки;
+- создание и переименование воронок, добавление и редактирование этапов,
+  защищённое удаление неиспользуемых этапов и воронок;
 - встроенные и пользовательские поля, обязательность полей на этапе;
 - задачи, напоминания, следующая покупка и журнал активности;
 - ручные лиды, email, Telegram-бот, MAX-бот, HMAC-webhook и HTML-форма;
 - правила уведомлений для команды и клиентов;
 - учёт и отзыв подтверждённых согласий клиентов по каждому каналу;
-- возобновляемый идемпотентный импорт данных из amoCRM;
+- возобновляемый идемпотентный импорт из amoCRM: воронки и этапы,
+  пользователи и поля, компании, контакты, сделки, открытые задачи и заметки;
 - роли `owner`, `admin` и `manager`;
 - интерфейс для mobile, tablet и desktop.
 
@@ -41,7 +49,7 @@ Browser / webhooks / bots / email
 └──────────────┬───────────────┬───────┘
                │               │
                ▼               ▼
-         PostgreSQL 17     Private S3
+        PostgreSQL 17/18    Private S3
 ```
 
 React собирается внутри multi-stage Dockerfile и обслуживается FastAPI с того
@@ -70,6 +78,7 @@ scripts/                 контейнерный запуск и безопас
 .github/workflows/       CI
 Dockerfile               production-образ всего webapp
 docker-compose.yml       локальный PostgreSQL, MinIO, Mailpit и webapp
+CHANGELOG.md              журнал заметных изменений
 ```
 
 ## Быстрый локальный запуск
@@ -140,12 +149,17 @@ Vite dev server использует свой адрес, а production build в
 
 ## Проверки
 
-Команды совпадают с обязательными GitHub Actions jobs:
+Основные команды совпадают с обязательными GitHub Actions jobs:
 
 ```bash
 ruff check backend/app backend/tests
 mypy backend/app
 python -m pytest backend/tests
+
+# Проверка схемы выполняется на отдельной временной PostgreSQL.
+export TEST_DATABASE_URL='postgresql+psycopg://USER:PASSWORD@HOST:5432/DATABASE'
+PULSE_DATABASE_URL="$TEST_DATABASE_URL" alembic -c backend/alembic.ini upgrade head
+PULSE_DATABASE_URL="$TEST_DATABASE_URL" alembic -c backend/alembic.ini check
 
 cd frontend
 npm run lint
@@ -154,21 +168,34 @@ npm run test
 npm run build
 npm run test:e2e
 
+cd ..
 docker build -t pulse-crm:local .
 ```
+
+GitHub Actions поднимает временные PostgreSQL и S3-compatible MinIO. PostgreSQL
+используется для `upgrade head` и `alembic check`, а тесты приложения создают
+собственную изолированную тестовую БД. Никакие production-реквизиты CI не нужны.
 
 ## Развёртывание в Timeweb
 
 ### 1. Создайте инфраструктуру
 
-1. Создайте PostgreSQL 17 DBaaS в регионе Москва, без публичного IP.
-2. Создайте приватный S3-бакет в том же регионе.
-3. Создайте одно приложение App Platform из этого GitHub-репозитория с
-   `Dockerfile`, портом контейнера `8000` и одной репликой.
-4. Подключите webapp и PostgreSQL к одной приватной BGP-сети.
+1. Выберите один доступный регион и разместите в нём webapp, PostgreSQL и
+   приватную BGP-сеть.
+2. Создайте PostgreSQL 17 или 18 DBaaS без публичного IP.
+3. Создайте приватный S3-бакет стандартного класса; для пилота допустим
+   минимальный тариф с автомасштабированием.
+4. Создайте одно приложение App Platform из этого GitHub-репозитория с
+   окружением `Dockerfile`, портом контейнера `8000` и одной репликой.
+5. Подключите webapp и PostgreSQL к одной приватной BGP-сети.
 
 Не создавайте Redis, отдельный worker или scheduler: фоновые задачи выполняет
 supervisor внутри единственного webapp.
+
+Минимальные тарифы подходят для установки, smoke-тестов и небольшой пилотной
+группы, но не являются гарантией целевой нагрузки. Перед большим импортом и
+полноценным запуском ориентируйтесь на RAM/CPU, p95 API и возраст очереди;
+увеличьте webapp или DBaaS при устойчивом дефиците ресурсов.
 
 ### 2. Настройте переменные webapp
 
@@ -181,7 +208,7 @@ supervisor внутри единственного webapp.
 | `PULSE_SECRET_KEY` | случайный секрет не короче 32 байт |
 | `PULSE_INTEGRATION_ENCRYPTION_KEY` | Base64 от отдельного случайного 32-байтного ключа AES-GCM |
 | `PULSE_INTEGRATION_ENCRYPTION_KEY_ID` | идентификатор активного ключа, например `primary` |
-| `PULSE_BOOTSTRAP_TOKEN` | отдельный одноразовый случайный token |
+| `PULSE_BOOTSTRAP_TOKEN` | временный одноразовый token; удалить после создания владельца |
 | `PULSE_COOKIE_SECURE` | `true` |
 | `PULSE_ALLOWED_HOSTS` | JSON-массив, например `["crm.example.ru"]` |
 | `PULSE_JOB_RUNNER_ENABLED` | `true` |
@@ -194,8 +221,9 @@ supervisor внутри единственного webapp.
 | `PULSE_S3_SECRET_ACCESS_KEY` | secret key сервисного аккаунта |
 
 Секреты задаются только через variables/secrets App Platform. Их нельзя
-добавлять в репозиторий, Docker image, build arguments или логи. Для генерации
-секретов можно использовать `openssl rand -hex 32` на доверенной машине.
+добавлять в репозиторий, Docker image, build arguments, документацию,
+скриншоты или логи. Для генерации секретов можно использовать
+`openssl rand -hex 32` на доверенной машине.
 
 ### 3. Выпустите версию
 
@@ -203,7 +231,8 @@ supervisor внутри единственного webapp.
 2. Отключите production autodeploy и вручную разверните этот commit.
 3. Entrypoint выполнит Alembic-миграции под advisory lock, затем запустит один
    Uvicorn worker.
-4. Настройте HTTPS-домен и проверки `/health/live` и `/health/ready`.
+4. Настройте HTTPS-домен. Dockerfile уже содержит внутренний healthcheck
+   `/health/live`; внешний мониторинг должен проверять `/health/ready`.
 5. Создайте владельца через bootstrap API, затем удалите bootstrap token.
 6. Выполните smoke-тест источников и исходящих каналов.
 
@@ -221,6 +250,7 @@ supervisor внутри единственного webapp.
 - ADR единого webapp — [docs/adr/0001-single-webapp.md](docs/adr/0001-single-webapp.md);
 - production runbook — [docs/runbooks/timeweb-production.md](docs/runbooks/timeweb-production.md);
 - перенос из amoCRM — [docs/runbooks/amocrm-cutover.md](docs/runbooks/amocrm-cutover.md);
+- журнал изменений — [CHANGELOG.md](CHANGELOG.md);
 - дизайн-система — [docs/design/design-system.md](docs/design/design-system.md);
 - правила участия — [CONTRIBUTING.md](CONTRIBUTING.md);
 - политика безопасности — [SECURITY.md](SECURITY.md);
