@@ -19,10 +19,12 @@ from app.integrations.amocrm_live import (
     make_amo_import_handler,
     make_amo_import_report_handler,
 )
+from app.integrations.identity import MatchKind, match_contact_point
 from app.integrations.models import (
     AmoConnectionStatus,
     AmoCRMConnection,
     ContactPoint,
+    ContactPointKind,
     ExternalEntityMap,
     ImportJob,
     ImportStatus,
@@ -525,6 +527,86 @@ async def test_writer_does_not_reactivate_locally_deleted_custom_field() -> None
         assert result.updated == 1
         assert field.name == "Номер заказа из amoCRM"
         assert field.is_active is False
+
+
+@pytest.mark.asyncio
+async def test_writer_does_not_reactivate_locally_deleted_contact() -> None:
+    async with SessionLocal() as db:
+        workspace = Workspace(name="Contact tombstone", slug="amocrm-contact-tombstone")
+        db.add(workspace)
+        await db.flush()
+        deleted_at = datetime.now(UTC)
+        contact = Contact(
+            workspace_id=workspace.id,
+            first_name="Удалённый",
+            primary_email="old@example.com",
+            deleted_at=deleted_at,
+        )
+        job = ImportJob(
+            workspace_id=workspace.id,
+            provider="amocrm",
+            status=ImportStatus.running,
+            dry_run=False,
+            entity_type="contacts",
+        )
+        db.add_all([contact, job])
+        await db.flush()
+        db.add(
+            ExternalEntityMap(
+                workspace_id=workspace.id,
+                import_job_id=job.id,
+                provider="amocrm",
+                entity_type="contacts",
+                external_id="30",
+                internal_id=contact.id,
+                fingerprint="previous-import",
+            )
+        )
+        await db.flush()
+
+        result = await apply_import_page(
+            db,
+            job=job,
+            page=AmoPage(
+                entity_type="contacts",
+                entities=[
+                    AmoEntity(
+                        "contacts",
+                        "30",
+                        {
+                            "id": 30,
+                            "first_name": "Обновлённый",
+                            "custom_fields_values": [
+                                {
+                                    "field_code": "EMAIL",
+                                    "values": [{"value": "new@example.com"}],
+                                }
+                            ],
+                        },
+                    )
+                ],
+                next_cursor=None,
+            ),
+            writer=PulseAmoWriter(),
+        )
+
+        await db.refresh(contact)
+        assert result.updated == 1
+        assert contact.first_name == "Обновлённый"
+        assert contact.deleted_at is not None
+        match = await match_contact_point(
+            db,
+            workspace_id=workspace.id,
+            kind=ContactPointKind.email,
+            value="new@example.com",
+        )
+        contact_point_count = await db.scalar(
+            sa.select(sa.func.count())
+            .select_from(ContactPoint)
+            .where(ContactPoint.contact_id == contact.id)
+        )
+        assert match.kind is MatchKind.none
+        assert contact_point_count == 0
 
 
 def test_amo_tags_are_normalized_deduplicated_and_bounded() -> None:

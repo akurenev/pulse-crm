@@ -135,8 +135,12 @@ async def match_contact_point(
         dict.fromkeys(
             (
                 await session.scalars(
-                    sa.select(ContactPoint.contact_id).where(
+                    sa.select(ContactPoint.contact_id)
+                    .join(Contact, Contact.id == ContactPoint.contact_id)
+                    .where(
                         ContactPoint.workspace_id == workspace_id,
+                        Contact.workspace_id == workspace_id,
+                        Contact.deleted_at.is_(None),
                         ContactPoint.kind == kind,
                         ContactPoint.normalized_value == normalized,
                     )
@@ -159,8 +163,12 @@ async def match_external_identity(
         dict.fromkeys(
             (
                 await session.scalars(
-                    sa.select(ExternalIdentity.contact_id).where(
+                    sa.select(ExternalIdentity.contact_id)
+                    .join(Contact, Contact.id == ExternalIdentity.contact_id)
+                    .where(
                         ExternalIdentity.workspace_id == workspace_id,
+                        Contact.workspace_id == workspace_id,
+                        Contact.deleted_at.is_(None),
                         ExternalIdentity.provider == provider,
                         ExternalIdentity.connection_scope
                         == connection_scope(channel_connection_id),

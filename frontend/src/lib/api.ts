@@ -52,7 +52,11 @@ export const api = {
     request<T>(path, { method: "PATCH", body: JSON.stringify(body) }),
   upload: <T>(path: string, body: FormData) =>
     request<T>(path, { method: "POST", body }),
-  delete: (path: string) => request<void>(path, { method: "DELETE" }),
+  delete: <T = void>(path: string, body?: unknown) =>
+    request<T>(path, {
+      method: "DELETE",
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+    }),
   setCsrf(token: string) {
     csrfToken = token;
     if (token) sessionStorage.setItem(CSRF_STORAGE_KEY, token);

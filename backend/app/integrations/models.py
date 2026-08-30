@@ -576,6 +576,39 @@ class NotificationDelivery(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     last_error: Mapped[str | None] = mapped_column(sa.Text)
 
 
+class WebPushSubscription(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """Encrypted browser PushSubscription scoped to one employee and workspace."""
+
+    __tablename__ = "web_push_subscriptions"
+    __table_args__ = (
+        sa.UniqueConstraint(
+            "endpoint_hash",
+            name="uq_web_push_subscription_endpoint_hash",
+        ),
+        sa.Index(
+            "ix_web_push_subscriptions_workspace_user_active",
+            "workspace_id",
+            "user_id",
+            "is_active",
+        ),
+    )
+
+    workspace_id: Mapped[uuid.UUID] = mapped_column(
+        UUID_TYPE, sa.ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID_TYPE, sa.ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    endpoint_hash: Mapped[str] = mapped_column(sa.String(64), nullable=False)
+    encrypted_subscription: Mapped[bytes] = mapped_column(sa.LargeBinary, nullable=False)
+    encryption_key_id: Mapped[str] = mapped_column(sa.String(100), nullable=False)
+    expiration_time: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    is_active: Mapped[bool] = mapped_column(sa.Boolean, default=True, nullable=False)
+    disabled_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    last_success_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    last_error: Mapped[str | None] = mapped_column(sa.String(500))
+
+
 class PurchaseSchedule(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "purchase_schedules"
     __table_args__ = (

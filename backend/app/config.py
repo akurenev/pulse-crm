@@ -1,9 +1,16 @@
 from __future__ import annotations
 
+import base64
+import binascii
+import re
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlsplit
 
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from email_validator import EmailNotValidError, validate_email
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -16,6 +23,7 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",
+        hide_input_in_errors=True,
     )
 
     app_name: str = "Pulse CRM"
@@ -46,6 +54,9 @@ class Settings(BaseSettings):
     static_dir: Path = Path("/app/backend/static")
     integration_encryption_key: str | None = None
     integration_encryption_key_id: str = "primary"
+    web_push_vapid_public_key: str | None = None
+    web_push_vapid_private_key: str | None = None
+    web_push_vapid_subject: str | None = None
     s3_endpoint_url: str | None = None
     s3_region: str = "ru-1"
     s3_bucket: str | None = None
@@ -54,6 +65,53 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_production_secrets(self) -> Settings:
+        vapid_values = (
+            self.web_push_vapid_public_key,
+            self.web_push_vapid_private_key,
+            self.web_push_vapid_subject,
+        )
+        if any(value is not None for value in vapid_values) and not all(
+            value is not None and value.strip() for value in vapid_values
+        ):
+            raise ValueError(
+                "PULSE_WEB_PUSH_VAPID_PUBLIC_KEY, "
+                "PULSE_WEB_PUSH_VAPID_PRIVATE_KEY and "
+                "PULSE_WEB_PUSH_VAPID_SUBJECT must be configured together"
+            )
+        if self.web_push_vapid_subject:
+            self._validate_vapid_subject(self.web_push_vapid_subject)
+        if self.web_push_enabled:
+            public_key = self._decode_vapid_key(
+                self.web_push_vapid_public_key or "",
+                setting="PULSE_WEB_PUSH_VAPID_PUBLIC_KEY",
+            )
+            private_key = self._decode_vapid_key(
+                self.web_push_vapid_private_key or "",
+                setting="PULSE_WEB_PUSH_VAPID_PRIVATE_KEY",
+            )
+            if len(public_key) != 65 or public_key[0] != 0x04:
+                raise ValueError(
+                    "PULSE_WEB_PUSH_VAPID_PUBLIC_KEY must encode a 65-byte "
+                    "uncompressed P-256 public key"
+                )
+            if len(private_key) != 32:
+                raise ValueError(
+                    "PULSE_WEB_PUSH_VAPID_PRIVATE_KEY must encode a 32-byte P-256 private key"
+                )
+            try:
+                derived_public = ec.derive_private_key(
+                    int.from_bytes(private_key, "big"),
+                    ec.SECP256R1(),
+                ).public_key().public_bytes(
+                    serialization.Encoding.X962,
+                    serialization.PublicFormat.UncompressedPoint,
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    "PULSE_WEB_PUSH_VAPID_PRIVATE_KEY is not a valid P-256 private key"
+                ) from exc
+            if derived_public != public_key:
+                raise ValueError("configured Web Push VAPID public/private keys do not match")
         if self.environment == "production":
             if len(self.secret_key) < 32 or self.secret_key.startswith("development-"):
                 raise ValueError("PULSE_SECRET_KEY must be a strong production secret")
@@ -76,6 +134,53 @@ class Settings(BaseSettings):
             if missing_s3:
                 raise ValueError("production S3 settings are incomplete: " + ", ".join(missing_s3))
         return self
+
+    @staticmethod
+    def _decode_vapid_key(value: str, *, setting: str) -> bytes:
+        raw = value.strip()
+        if re.fullmatch(r"[A-Za-z0-9_-]+={0,2}", raw) is None:
+            raise ValueError(f"{setting} must be valid base64url")
+        try:
+            return base64.b64decode(
+                raw + "=" * (-len(raw) % 4),
+                altchars=b"-_",
+                validate=True,
+            )
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError(f"{setting} must be valid base64url") from exc
+
+    @staticmethod
+    def _validate_vapid_subject(value: str) -> None:
+        parsed = urlsplit(value.strip())
+        if parsed.scheme == "mailto":
+            try:
+                validate_email(parsed.path, check_deliverability=False)
+            except EmailNotValidError as exc:
+                raise ValueError(
+                    "PULSE_WEB_PUSH_VAPID_SUBJECT must contain a valid mailto address"
+                ) from exc
+            return
+        if (
+            parsed.scheme == "https"
+            and parsed.hostname
+            and parsed.username is None
+            and parsed.password is None
+        ):
+            return
+        raise ValueError(
+            "PULSE_WEB_PUSH_VAPID_SUBJECT must be a valid mailto: or https:// contact URI"
+        )
+
+    @property
+    def web_push_enabled(self) -> bool:
+        return all(
+            value is not None and bool(value.strip())
+            for value in (
+                self.web_push_vapid_public_key,
+                self.web_push_vapid_private_key,
+                self.web_push_vapid_subject,
+            )
+        )
 
 
 @lru_cache

@@ -24,6 +24,7 @@ import type { ApiInAppNotification } from "../../types/api";
 import type { UserSummary } from "../../types/crm";
 import { Avatar } from "../Avatar";
 import { BrandMark } from "../BrandMark";
+import { PushNotificationSettings } from "../PushNotificationSettings";
 
 const navigation = [
   { to: "/", label: "Главная", icon: Home, end: true },
@@ -45,12 +46,14 @@ const realtimeEventTypes = [
   "message.outbound.sent",
   "task.created",
   "task.updated",
+  "task.deleted",
   "task.due_soon",
   "task.overdue",
   "purchase.due_soon",
   "notification.delivered",
   "contact.created",
   "contact.updated",
+  "contact.deleted",
   "company.created",
   "company.updated",
 ] as const;
@@ -150,6 +153,7 @@ function NotificationCenter({ size }: { size: number }) {
       <DropdownMenu.Portal>
         <DropdownMenu.Content className="notification-menu" align="end" sideOffset={8}>
           <header><strong>Уведомления</strong><small>{notifications.length ? `${notifications.length} последних` : "Новых событий нет"}</small></header>
+          <PushNotificationSettings />
           <div>
             {notifications.map((notification) => (
               <DropdownMenu.Item key={notification.id} className="notification-menu__item">
@@ -177,7 +181,9 @@ function useRealtimeRefresh() {
     const refresh = () => {
       refreshTimeout = null;
       if (disposed) return;
-      void queryClient.invalidateQueries();
+      void queryClient.invalidateQueries({
+        predicate: (query) => query.queryKey[0] !== "push",
+      });
       window.dispatchEvent(new Event("pulse:refresh"));
     };
 

@@ -14,7 +14,9 @@ from app.db import get_session
 from app.integrations.identity import IdentityNormalizationError, sync_contact_points
 from app.integrations.models import (
     ChannelConnection,
+    ContactPoint,
     ExternalEntityMap,
+    ExternalIdentity,
     Form,
     NotificationRule,
     PurchaseSchedule,
@@ -32,6 +34,7 @@ from app.models import (
     DealStageHistory,
     FieldEntity,
     Membership,
+    OutboxEvent,
     Pipeline,
     Source,
     Stage,
@@ -600,6 +603,19 @@ async def update_contact(
     context: CurrentMutationUser,
     db: AsyncSession = Depends(get_session),
 ) -> Contact:
+    for required_field in (
+        "first_name",
+        "last_name",
+        "emails",
+        "phones",
+        "tags",
+        "custom_fields",
+    ):
+        if required_field in payload.model_fields_set and getattr(payload, required_field) is None:
+            raise HTTPException(
+                status_code=422,
+                detail=f"{required_field} cannot be null",
+            )
     if "company_id" in payload.model_fields_set and payload.company_id:
         await _ensure_company(db, context.workspace_id, payload.company_id)
     values = payload.model_dump(exclude_unset=True, exclude={"expected_version"})
@@ -620,7 +636,9 @@ async def update_contact(
     if contact is None:
         if await db.scalar(
             sa.select(Contact.id).where(
-                Contact.id == contact_id, Contact.workspace_id == context.workspace_id
+                Contact.id == contact_id,
+                Contact.workspace_id == context.workspace_id,
+                Contact.deleted_at.is_(None),
             )
         ):
             raise conflict()
@@ -640,6 +658,58 @@ async def update_contact(
     )
     await db.commit()
     return contact
+
+
+@router.delete("/contacts/{contact_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_contact(
+    contact_id: uuid.UUID,
+    context: CurrentMutationUser,
+    db: AsyncSession = Depends(get_session),
+    expected_version: int = Query(ge=1),
+) -> None:
+    contact = await db.scalar(
+        sa.select(Contact)
+        .where(
+            Contact.id == contact_id,
+            Contact.workspace_id == context.workspace_id,
+            Contact.deleted_at.is_(None),
+        )
+        .with_for_update()
+    )
+    if contact is None:
+        raise not_found("contact")
+    if contact.version != expected_version:
+        raise conflict()
+
+    deleted_at = datetime.now(UTC)
+    contact.deleted_at = deleted_at
+    contact.updated_at = deleted_at
+    contact.version += 1
+    # These tables are lookup indexes rather than the canonical contact
+    # record.  Removing them prevents a future inbound message from resolving
+    # to a soft-deleted contact and lets the address/identity be claimed by a
+    # new active contact.
+    await db.execute(
+        sa.delete(ContactPoint).where(
+            ContactPoint.workspace_id == context.workspace_id,
+            ContactPoint.contact_id == contact.id,
+        )
+    )
+    await db.execute(
+        sa.delete(ExternalIdentity).where(
+            ExternalIdentity.workspace_id == context.workspace_id,
+            ExternalIdentity.contact_id == contact.id,
+        )
+    )
+    record_domain_event(
+        db,
+        workspace_id=context.workspace_id,
+        event_type="contact.deleted",
+        entity_type="contact",
+        entity_id=contact.id,
+        actor_id=context.user_id,
+    )
+    await db.commit()
 
 
 @router.get("/pipelines", response_model=list[PipelineRead])
@@ -1977,32 +2047,70 @@ async def update_task(
     context: CurrentMutationUser,
     db: AsyncSession = Depends(get_session),
 ) -> Task:
-    if payload.assignee_id:
+    task = await db.scalar(
+        sa.select(Task)
+        .where(
+            Task.id == task_id,
+            Task.workspace_id == context.workspace_id,
+        )
+        .with_for_update()
+    )
+    if task is None:
+        raise not_found("task")
+    if task.version != payload.expected_version:
+        raise conflict()
+
+    fields = payload.model_fields_set
+    for required_text_field in ("title", "task_type"):
+        if required_text_field in fields and getattr(payload, required_text_field) is None:
+            raise HTTPException(
+                status_code=422,
+                detail=f"{required_text_field} cannot be null",
+            )
+    if "assignee_id" in fields:
+        if payload.assignee_id is None:
+            raise HTTPException(status_code=422, detail="assignee_id cannot be null")
         await _ensure_member(db, context.workspace_id, payload.assignee_id)
+    if "deal_id" in fields and payload.deal_id is not None:
+        await _ensure_deal(db, context.workspace_id, payload.deal_id)
+    if "contact_id" in fields and payload.contact_id is not None:
+        await _ensure_contact(db, context.workspace_id, payload.contact_id)
+    if "company_id" in fields and payload.company_id is not None:
+        await _ensure_company(db, context.workspace_id, payload.company_id)
+
+    effective_due_at = payload.due_at if "due_at" in fields else task.due_at
+    effective_remind_at = payload.remind_at if "remind_at" in fields else task.remind_at
+    if effective_due_at is None:
+        raise HTTPException(status_code=422, detail="due_at cannot be null")
+    comparison_due_at = (
+        effective_due_at.replace(tzinfo=UTC)
+        if effective_due_at.tzinfo is None
+        else effective_due_at.astimezone(UTC)
+    )
+    comparison_remind_at = (
+        None
+        if effective_remind_at is None
+        else (
+            effective_remind_at.replace(tzinfo=UTC)
+            if effective_remind_at.tzinfo is None
+            else effective_remind_at.astimezone(UTC)
+        )
+    )
+    if comparison_remind_at is not None and comparison_remind_at > comparison_due_at:
+        raise HTTPException(status_code=422, detail="remind_at cannot be after due_at")
+
     values = payload.model_dump(exclude_unset=True, exclude={"expected_version"})
     if payload.status is TaskStatus.completed:
         values["completed_at"] = datetime.now(UTC)
     elif "status" in payload.model_fields_set:
+        if payload.status is None:
+            raise HTTPException(status_code=422, detail="status cannot be null")
         values["completed_at"] = None
-    values.update(version=payload.expected_version + 1, updated_at=datetime.now(UTC))
-    task = (
-        await db.execute(
-            sa.update(Task)
-            .where(
-                Task.id == task_id,
-                Task.workspace_id == context.workspace_id,
-                Task.version == payload.expected_version,
-            )
-            .values(**values)
-            .returning(Task)
-        )
-    ).scalar_one_or_none()
-    if task is None:
-        if await db.scalar(
-            sa.select(Task.id).where(Task.id == task_id, Task.workspace_id == context.workspace_id)
-        ):
-            raise conflict()
-        raise not_found("task")
+    changed_fields = sorted(values)
+    for field, value in values.items():
+        setattr(task, field, value)
+    task.version += 1
+    task.updated_at = datetime.now(UTC)
     record_domain_event(
         db,
         workspace_id=context.workspace_id,
@@ -2010,10 +2118,69 @@ async def update_task(
         entity_type="task",
         entity_id=task.id,
         actor_id=context.user_id,
-        payload={"fields": sorted(values.keys() - {"updated_at", "version"})},
+        payload={"fields": changed_fields},
     )
     await db.commit()
     return task
+
+
+@router.delete("/tasks/{task_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_task(
+    task_id: uuid.UUID,
+    context: CurrentMutationUser,
+    db: AsyncSession = Depends(get_session),
+    expected_version: int = Query(ge=1),
+) -> None:
+    task = await db.scalar(
+        sa.select(Task)
+        .where(
+            Task.id == task_id,
+            Task.workspace_id == context.workspace_id,
+        )
+        .with_for_update()
+    )
+    if task is None:
+        raise not_found("task")
+    if task.version != expected_version:
+        raise conflict()
+
+    purchase_schedule = await db.scalar(
+        sa.select(PurchaseSchedule)
+        .where(
+            PurchaseSchedule.workspace_id == context.workspace_id,
+            PurchaseSchedule.task_id == task.id,
+        )
+        .with_for_update()
+    )
+    if purchase_schedule is not None:
+        cancelled_at = datetime.now(UTC)
+        purchase_schedule.status = PurchaseScheduleStatus.cancelled
+        purchase_schedule.task_id = None
+        purchase_schedule.completed_at = cancelled_at
+        purchase_schedule.updated_at = cancelled_at
+        purchase_schedule.version += 1
+        await db.execute(
+            sa.update(OutboxEvent)
+            .where(
+                OutboxEvent.workspace_id == context.workspace_id,
+                OutboxEvent.aggregate_type == "purchase_schedule",
+                OutboxEvent.aggregate_id == purchase_schedule.id,
+                OutboxEvent.event_type == "purchase.due_soon",
+                OutboxEvent.processed_at.is_(None),
+            )
+            .values(processed_at=cancelled_at)
+        )
+
+    await db.delete(task)
+    record_domain_event(
+        db,
+        workspace_id=context.workspace_id,
+        event_type="task.deleted",
+        entity_type="task",
+        entity_id=task.id,
+        actor_id=context.user_id,
+    )
+    await db.commit()
 
 
 @router.get("/activity", response_model=ActivityPage)

@@ -1383,6 +1383,8 @@ async def _sync_imported_contact_points(session: AsyncSession, contact: Contact)
             ContactPoint.contact_id == contact.id,
         )
     )
+    if contact.deleted_at is not None:
+        return
     points: list[ContactPoint] = []
     seen: set[tuple[ContactPointKind, str]] = set()
     for kind, values in (

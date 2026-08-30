@@ -329,6 +329,9 @@ class TaskUpdate(VersionedUpdate):
     due_at: datetime | None = None
     remind_at: datetime | None = None
     assignee_id: uuid.UUID | None = None
+    deal_id: uuid.UUID | None = None
+    contact_id: uuid.UUID | None = None
+    company_id: uuid.UUID | None = None
     status: TaskStatus | None = None
 
 

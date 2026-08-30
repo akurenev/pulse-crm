@@ -3,6 +3,7 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type PropsWithChildren } from "react";
 
 import { api, ApiError, remoteEnabled } from "../lib/api";
+import { cleanupWebPushBeforeLogout } from "../lib/web-push";
 import type { AuthResponse } from "../types/api";
 
 type AuthStatus = "loading" | "authenticated" | "anonymous";
@@ -34,6 +35,16 @@ const demoSession: AuthResponse = {
 
 const AuthContext = createContext<AuthStore | null>(null);
 
+async function cleanupPushBeforeSessionChange(): Promise<void> {
+  try {
+    await cleanupWebPushBeforeLogout();
+  } catch (error) {
+    // Authentication must remain available even if a browser implementation
+    // fails while removing a stale subscription from a previous account.
+    console.warn("Pulse CRM push session cleanup failed", error);
+  }
+}
+
 export function AuthProvider({ children }: PropsWithChildren) {
   const [status, setStatus] = useState<AuthStatus>(remoteEnabled ? "loading" : "authenticated");
   const [session, setSession] = useState<AuthResponse | null>(remoteEnabled ? null : demoSession);
@@ -64,6 +75,7 @@ export function AuthProvider({ children }: PropsWithChildren) {
       setStatus("authenticated");
       return;
     }
+    await cleanupPushBeforeSessionChange();
     const current = await api.post<AuthResponse>("/auth/login", { email, password });
     api.setCsrf(current.csrf_token);
     setSession(current);
@@ -77,6 +89,7 @@ export function AuthProvider({ children }: PropsWithChildren) {
       setStatus("authenticated");
       return;
     }
+    await cleanupPushBeforeSessionChange();
     const current = await api.post<AuthResponse>("/auth/accept-invitation", {
       token,
       full_name: fullName,
@@ -88,7 +101,10 @@ export function AuthProvider({ children }: PropsWithChildren) {
   }, []);
 
   const logout = useCallback(async () => {
-    if (remoteEnabled) await api.post<void>("/auth/logout", {});
+    if (remoteEnabled) {
+      await cleanupPushBeforeSessionChange();
+      await api.post<void>("/auth/logout", {});
+    }
     api.setCsrf("");
     setSession(null);
     setStatus("anonymous");

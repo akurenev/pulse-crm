@@ -38,11 +38,14 @@ from app.integrations.models import (
     MessageStatus,
     NotificationAudience,
     NotificationDelivery,
+    PurchaseSchedule,
+    PurchaseScheduleStatus,
     WebhookEndpoint,
 )
 from app.integrations.runtime import (
     JOB_INBOUND_PROCESS,
     JOB_MESSAGE_SEND,
+    JOB_NOTIFICATION_EXPAND,
     JOB_RUNTIME_CLEANUP,
     JOB_RUNTIME_RECOVER,
     RUNTIME_JOB_TYPES,
@@ -51,6 +54,8 @@ from app.integrations.runtime import (
     RuntimeWiringError,
 )
 from app.integrations.s3 import AttachmentStorage
+from app.integrations.secrets import SecretCipher
+from app.integrations.web_push import register_subscription
 from app.models import (
     ActivityEvent,
     BackgroundJob,
@@ -280,6 +285,70 @@ async def test_outbox_dispatch_enqueues_one_deduplicated_child_job(
     assert child_jobs[0].job_type == JOB_MESSAGE_SEND
     assert child_jobs[0].payload == {"message_id": str(message_id)}
     assert child_jobs[0].workspace_id == integration_domain["workspace"].id
+
+
+@pytest.mark.asyncio
+async def test_purchase_notification_expansion_skips_cancelled_or_missing_schedule(
+    db: AsyncSession,
+    integration_domain: dict[str, Any],
+) -> None:
+    workspace_id = integration_domain["workspace"].id
+    cancelled_schedule = PurchaseSchedule(
+        workspace_id=workspace_id,
+        deal_id=integration_domain["deal"].id,
+        contact_id=integration_domain["contact"].id,
+        assignee_id=integration_domain["user"].id,
+        scheduled_for=FIXED_NOW + timedelta(days=30),
+        remind_at=FIXED_NOW,
+        status=PurchaseScheduleStatus.cancelled,
+        completed_at=FIXED_NOW,
+    )
+    active_schedule = PurchaseSchedule(
+        workspace_id=workspace_id,
+        deal_id=integration_domain["deal"].id,
+        contact_id=integration_domain["contact"].id,
+        assignee_id=integration_domain["user"].id,
+        scheduled_for=FIXED_NOW + timedelta(days=31),
+        remind_at=FIXED_NOW,
+        status=PurchaseScheduleStatus.active,
+    )
+    db.add_all([cancelled_schedule, active_schedule])
+    await db.flush()
+    events = [
+        OutboxEvent(
+            workspace_id=workspace_id,
+            event_type="purchase.due_soon",
+            aggregate_type="purchase_schedule",
+            aggregate_id=schedule_id,
+            payload={"schedule_id": str(schedule_id)},
+            available_at=FIXED_NOW,
+        )
+        for schedule_id in (cancelled_schedule.id, uuid.uuid4(), active_schedule.id)
+    ]
+    db.add_all(events)
+    await db.commit()
+
+    expanded_event_ids: list[uuid.UUID] = []
+
+    async def record_expansion(session: AsyncSession, event: OutboxEvent) -> None:
+        del session
+        expanded_event_ids.append(event.id)
+
+    handlers = RuntimeHandlers(
+        session_factory=SessionLocal,
+        notification_expander=record_expansion,
+        now=lambda: FIXED_NOW,
+    )
+    for event in events:
+        await handlers.expand_notification(
+            claimed_job(
+                JOB_NOTIFICATION_EXPAND,
+                {"outbox_event_id": str(event.id)},
+                workspace_id=workspace_id,
+            )
+        )
+
+    assert expanded_event_ids == [events[-1].id]
 
 
 @pytest.mark.asyncio
@@ -873,3 +942,139 @@ async def test_runtime_delivers_in_app_notification_and_publishes_realtime_event
         "delivery_id": str(delivery.id),
         "recipient_id": str(integration_domain["user"].id),
     }
+    assert (
+        await db.scalar(
+            sa.select(sa.func.count())
+            .select_from(NotificationDelivery)
+            .where(NotificationDelivery.channel == "web_push")
+        )
+        == 0
+    )
+
+
+@pytest.mark.asyncio
+async def test_runtime_atomically_mirrors_employee_in_app_delivery_to_web_push(
+    db: AsyncSession,
+    integration_domain: dict[str, Any],
+) -> None:
+    runtime_now = FIXED_NOW.replace(tzinfo=None)
+    cipher = SecretCipher(key=b"m" * 32, key_id="mirror-test")
+    await register_subscription(
+        db,
+        cipher=cipher,
+        workspace_id=integration_domain["workspace"].id,
+        user_id=integration_domain["user"].id,
+        endpoint="https://fcm.googleapis.com/fcm/send/mirror-device",
+        expiration_time=None,
+        p256dh="test-public-key",
+        auth="test-auth-secret",
+        now=FIXED_NOW,
+    )
+    delivery = NotificationDelivery(
+        workspace_id=integration_domain["workspace"].id,
+        audience=NotificationAudience.employee,
+        channel="in_app",
+        recipient_id=integration_domain["user"].id,
+        recipient_address=str(integration_domain["user"].id),
+        subject="Новая задача",
+        body="Проверьте сделку",
+        status=DeliveryStatus.pending,
+        dedupe_key="runtime-in-app-mirror",
+        scheduled_at=runtime_now - timedelta(minutes=1),
+    )
+    db.add(delivery)
+    await db.commit()
+
+    handlers = RuntimeHandlers(session_factory=SessionLocal, now=lambda: runtime_now)
+    await handlers.deliver_notification(
+        claimed_job(
+            "notification.deliver",
+            {"notification_delivery_id": str(delivery.id)},
+            workspace_id=delivery.workspace_id,
+        )
+    )
+
+    mirrored = await db.scalar(
+        sa.select(NotificationDelivery).where(
+            NotificationDelivery.workspace_id == delivery.workspace_id,
+            NotificationDelivery.dedupe_key == f"web-push:in-app:{delivery.id}",
+        )
+    )
+    assert mirrored is not None
+    assert mirrored.channel == "web_push"
+    assert mirrored.status is DeliveryStatus.pending
+    assert mirrored.recipient_id == delivery.recipient_id
+    queued = await db.scalar(
+        sa.select(OutboxEvent).where(
+            OutboxEvent.aggregate_type == "notification_delivery",
+            OutboxEvent.aggregate_id == mirrored.id,
+            OutboxEvent.event_type == "notification.delivery.queued",
+        )
+    )
+    assert queued is not None
+
+    # Replayed delivery jobs observe the committed in-app state, so neither a
+    # second mirror nor a second outbox record is created.
+    await handlers.deliver_notification(
+        claimed_job(
+            "notification.deliver",
+            {"notification_delivery_id": str(delivery.id)},
+            workspace_id=delivery.workspace_id,
+        )
+    )
+    assert (
+        await db.scalar(
+            sa.select(sa.func.count())
+            .select_from(NotificationDelivery)
+            .where(
+                NotificationDelivery.workspace_id == delivery.workspace_id,
+                NotificationDelivery.dedupe_key == f"web-push:in-app:{delivery.id}",
+            )
+        )
+        == 1
+    )
+
+
+@pytest.mark.asyncio
+async def test_runtime_routes_web_push_delivery_through_dedicated_sender(
+    db: AsyncSession,
+    integration_domain: dict[str, Any],
+) -> None:
+    runtime_now = FIXED_NOW.replace(tzinfo=None)
+    delivery = NotificationDelivery(
+        workspace_id=integration_domain["workspace"].id,
+        audience=NotificationAudience.employee,
+        channel="web_push",
+        recipient_id=integration_domain["user"].id,
+        recipient_address=str(integration_domain["user"].id),
+        subject="Тест",
+        body="Push",
+        status=DeliveryStatus.pending,
+        dedupe_key="runtime-web-push",
+        scheduled_at=runtime_now - timedelta(minutes=1),
+    )
+    db.add(delivery)
+    await db.commit()
+    sent: list[uuid.UUID] = []
+
+    async def send_web_push(item: NotificationDelivery) -> SendResult:
+        sent.append(item.id)
+        return SendResult(provider_message_id="web-push-provider", sent_at=runtime_now)
+
+    handlers = RuntimeHandlers(
+        session_factory=SessionLocal,
+        web_push_sender=send_web_push,
+        now=lambda: runtime_now,
+    )
+    await handlers.deliver_notification(
+        claimed_job(
+            "notification.deliver",
+            {"notification_delivery_id": str(delivery.id)},
+            workspace_id=delivery.workspace_id,
+        )
+    )
+
+    await db.refresh(delivery)
+    assert sent == [delivery.id]
+    assert delivery.status is DeliveryStatus.delivered
+    assert delivery.provider_message_id == "web-push-provider"

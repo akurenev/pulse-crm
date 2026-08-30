@@ -25,11 +25,14 @@ RAM/CPU, p95 запросов, соединения БД и возраст оч�
 
 Обязательные переменные приведены в `.env.example` и README. В production
 нужны отдельные случайные значения `PULSE_SECRET_KEY`, ключа шифрования
-интеграций и одноразового bootstrap token.
+интеграций и одноразового bootstrap token. Для PWA Web Push дополнительно
+задайте одним комплектом `PULSE_WEB_PUSH_VAPID_PUBLIC_KEY`,
+`PULSE_WEB_PUSH_VAPID_PRIVATE_KEY` и `PULSE_WEB_PUSH_VAPID_SUBJECT`; стабильную
+пару создаёт `scripts/generate_vapid_keys.py`.
 
 Используйте только значения из панели конкретного контура. Не переносите в
 issues, документацию или скриншоты `PULSE_DATABASE_URL`, S3 keys, OAuth secrets,
-bot tokens и значения encryption/bootstrap keys.
+bot tokens, приватный VAPID-ключ и значения encryption/bootstrap keys.
 
 ## Deploy
 
@@ -42,7 +45,10 @@ bot tokens и значения encryption/bootstrap keys.
    heartbeat supervisor.
 5. Проверить login, чтение воронки, создание/перемещение тестовой сделки и SSE.
 6. Проверить upload/download тестового вложения и удалить только тестовую запись.
-7. Для первого запуска выполнить одноразовый `/api/v1/auth/bootstrap`, затем
+7. В колокольчике включить push на тестовом PWA-устройстве и выполнить
+   **Проверить**. Убедиться, что webapp имеет исходящий HTTPS-доступ к
+   push-сервису браузера.
+8. Для первого запуска выполнить одноразовый `/api/v1/auth/bootstrap`, затем
    удалить bootstrap token и перезапустить webapp.
 
 ## Наблюдение
@@ -53,6 +59,7 @@ bot tokens и значения encryption/bootstrap keys.
 - stale supervisor heartbeat;
 - возраста старейшего queued job более пяти минут;
 - роста terminal `failed` jobs/deliveries;
+- повторяющихся ошибок доставок `web_push` и массового отключения подписок;
 - заполнения диска БД, аномального числа соединений и p95 API;
 - ошибок IMAP/provider healthcheck.
 

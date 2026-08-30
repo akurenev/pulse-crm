@@ -372,3 +372,27 @@ export interface ApiInAppNotification {
   delivered_at: string;
   created_at: string;
 }
+
+export interface ApiPushConfig {
+  enabled: boolean;
+  public_key: string | null;
+}
+
+export interface ApiPushSubscriptionKeys {
+  p256dh: string;
+  auth: string;
+}
+
+export interface ApiPushSubscriptionPayload {
+  endpoint: string;
+  expiration_time: string | null;
+  keys: ApiPushSubscriptionKeys;
+}
+
+export interface ApiPushSubscriptionDeletePayload {
+  endpoint: string;
+}
+
+export interface ApiPushTestQueued {
+  delivery_id: string;
+}

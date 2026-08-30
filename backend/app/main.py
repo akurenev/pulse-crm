@@ -32,6 +32,7 @@ from app.integrations.runtime import IntegrationRuntime
 from app.integrations.s3 import AttachmentStorage
 from app.integrations.secrets import SecretCipher
 from app.integrations.transports import ChannelAdapterFactory
+from app.integrations.web_push import WebPushSender
 
 
 class JsonFormatter(logging.Formatter):
@@ -122,11 +123,22 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.amocrm_http_client = http_client
     app.state.attachment_storage = attachment_storage
     if settings.job_runner_enabled:
+        web_push_sender = (
+            WebPushSender(
+                session_factory=SessionLocal,
+                cipher=cipher,
+                vapid_private_key=settings.web_push_vapid_private_key or "",
+                vapid_subject=settings.web_push_vapid_subject or "",
+            )
+            if settings.web_push_enabled
+            else None
+        )
         runtime = IntegrationRuntime(
             adapter_factory=channel_factory.build,
             notification_adapter_factory=notification_adapter_factory,
             imap_poller_factory=channel_factory.build_imap_poller,
             attachment_storage=attachment_storage,
+            web_push_sender=web_push_sender,
             extra_handlers={
                 AMO_IMPORT_JOB_TYPE: make_amo_import_handler(
                     cipher=cipher,

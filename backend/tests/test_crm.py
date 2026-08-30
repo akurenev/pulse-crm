@@ -11,15 +11,20 @@ from app.db import SessionLocal
 from app.integrations.models import (
     ChannelConnection,
     ChannelKind,
+    ContactPoint,
     ExternalEntityMap,
+    ExternalIdentity,
     Form,
     NotificationAudience,
     NotificationRule,
     NotificationTemplate,
+    PurchaseSchedule,
+    PurchaseScheduleStatus,
     WebhookEndpoint,
 )
 from app.models import (
     ActivityEvent,
+    Contact,
     CustomFieldDefinition,
     OutboxEvent,
     Pipeline,
@@ -82,6 +87,348 @@ async def test_contact_company_and_task_crud(
     contacts = await client.get("/api/v1/contacts", params={"search": "ada"})
     assert len(companies.json()["items"]) == 1
     assert len(contacts.json()["items"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_contact_update_and_soft_delete_are_versioned(
+    client: httpx.AsyncClient, owner_auth: dict[str, object]
+) -> None:
+    headers = csrf(owner_auth)
+    created = await client.post(
+        "/api/v1/contacts",
+        headers=headers,
+        json={
+            "first_name": "Original",
+            "last_name": "Contact",
+            "primary_email": "original@example.com",
+        },
+    )
+    assert created.status_code == 201, created.text
+    contact = created.json()
+
+    updated = await client.patch(
+        f"/api/v1/contacts/{contact['id']}",
+        headers=headers,
+        json={
+            "expected_version": contact["version"],
+            "first_name": "Updated",
+            "primary_email": "updated@example.com",
+        },
+    )
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["first_name"] == "Updated"
+    assert updated.json()["version"] == contact["version"] + 1
+
+    invalid_null = await client.patch(
+        f"/api/v1/contacts/{contact['id']}",
+        headers=headers,
+        json={"expected_version": updated.json()["version"], "first_name": None},
+    )
+    assert invalid_null.status_code == 422
+
+    contact_id = as_uuid(contact["id"])
+    workspace_id = as_uuid(owner_auth["workspace"]["id"])
+    async with SessionLocal() as db:
+        db.add(
+            ExternalIdentity(
+                workspace_id=workspace_id,
+                contact_id=contact_id,
+                provider="test-provider",
+                connection_scope="global",
+                external_user_id="external-contact-1",
+            )
+        )
+        await db.commit()
+
+    stale_delete = await client.delete(
+        f"/api/v1/contacts/{contact['id']}",
+        headers=headers,
+        params={"expected_version": contact["version"]},
+    )
+    assert stale_delete.status_code == 409
+    assert stale_delete.json()["detail"]["code"] == "version_conflict"
+
+    deleted = await client.delete(
+        f"/api/v1/contacts/{contact['id']}",
+        headers=headers,
+        params={"expected_version": updated.json()["version"]},
+    )
+    assert deleted.status_code == 204, deleted.text
+
+    loaded = await client.get(f"/api/v1/contacts/{contact['id']}")
+    assert loaded.status_code == 404
+    listed = await client.get("/api/v1/contacts", params={"search": "Updated"})
+    assert listed.status_code == 200
+    assert listed.json()["items"] == []
+    repeated = await client.delete(
+        f"/api/v1/contacts/{contact['id']}",
+        headers=headers,
+        params={"expected_version": updated.json()["version"] + 1},
+    )
+    assert repeated.status_code == 404
+
+    async with SessionLocal() as db:
+        stored = await db.get(Contact, contact_id)
+        assert stored is not None
+        assert stored.deleted_at is not None
+        assert stored.version == updated.json()["version"] + 1
+        assert (
+            await db.scalar(
+                sa.select(sa.func.count())
+                .select_from(ContactPoint)
+                .where(ContactPoint.contact_id == contact_id)
+            )
+            == 0
+        )
+        assert (
+            await db.scalar(
+                sa.select(sa.func.count())
+                .select_from(ExternalIdentity)
+                .where(ExternalIdentity.contact_id == contact_id)
+            )
+            == 0
+        )
+        assert (
+            await db.scalar(
+                sa.select(sa.func.count())
+                .select_from(ActivityEvent)
+                .where(
+                    ActivityEvent.entity_id == contact_id,
+                    ActivityEvent.event_type == "contact.deleted",
+                )
+            )
+            == 1
+        )
+
+
+@pytest.mark.asyncio
+async def test_task_update_relations_and_delete_are_versioned(
+    client: httpx.AsyncClient, owner_auth: dict[str, object]
+) -> None:
+    headers = csrf(owner_auth)
+    owner_id = (await client.get("/api/v1/users")).json()[0]["id"]
+    company = await client.post(
+        "/api/v1/companies", headers=headers, json={"name": "Task company"}
+    )
+    contact = await client.post(
+        "/api/v1/contacts", headers=headers, json={"first_name": "Task contact"}
+    )
+    pipeline = (await client.get("/api/v1/pipelines")).json()[0]
+    deal = await client.post(
+        "/api/v1/deals",
+        headers=headers,
+        json={
+            "title": "Task deal",
+            "pipeline_id": pipeline["id"],
+            "stage_id": pipeline["stages"][0]["id"],
+        },
+    )
+    assert company.status_code == contact.status_code == deal.status_code == 201
+
+    initial_due_at = datetime.now(UTC) + timedelta(days=2)
+    created = await client.post(
+        "/api/v1/tasks",
+        headers=headers,
+        json={
+            "title": "Initial task",
+            "due_at": initial_due_at.isoformat(),
+            "assignee_id": owner_id,
+        },
+    )
+    assert created.status_code == 201, created.text
+    task = created.json()
+    new_due_at = initial_due_at + timedelta(days=1)
+    new_remind_at = new_due_at - timedelta(hours=2)
+    updated = await client.patch(
+        f"/api/v1/tasks/{task['id']}",
+        headers=headers,
+        json={
+            "expected_version": task["version"],
+            "title": "Updated task",
+            "description": "Updated description",
+            "task_type": "meeting",
+            "due_at": new_due_at.isoformat(),
+            "remind_at": new_remind_at.isoformat(),
+            "deal_id": deal.json()["id"],
+            "contact_id": contact.json()["id"],
+            "company_id": company.json()["id"],
+        },
+    )
+    assert updated.status_code == 200, updated.text
+    updated_task = updated.json()
+    assert updated_task["title"] == "Updated task"
+    assert updated_task["task_type"] == "meeting"
+    assert updated_task["deal_id"] == deal.json()["id"]
+    assert updated_task["contact_id"] == contact.json()["id"]
+    assert updated_task["company_id"] == company.json()["id"]
+    assert updated_task["version"] == task["version"] + 1
+
+    async with SessionLocal() as db:
+        purchase_schedule = PurchaseSchedule(
+            workspace_id=as_uuid(owner_auth["workspace"]["id"]),
+            deal_id=as_uuid(deal.json()["id"]),
+            contact_id=as_uuid(contact.json()["id"]),
+            assignee_id=as_uuid(owner_id),
+            task_id=as_uuid(task["id"]),
+            scheduled_for=new_due_at,
+            remind_at=new_remind_at,
+        )
+        db.add(purchase_schedule)
+        await db.flush()
+        reminder_event = OutboxEvent(
+            workspace_id=purchase_schedule.workspace_id,
+            event_type="purchase.due_soon",
+            aggregate_type="purchase_schedule",
+            aggregate_id=purchase_schedule.id,
+            payload={"task_id": task["id"]},
+            available_at=new_remind_at,
+        )
+        db.add(reminder_event)
+        await db.commit()
+        purchase_schedule_id = purchase_schedule.id
+        reminder_event_id = reminder_event.id
+
+    invalid_reminder = await client.patch(
+        f"/api/v1/tasks/{task['id']}",
+        headers=headers,
+        json={
+            "expected_version": updated_task["version"],
+            "remind_at": (new_due_at + timedelta(minutes=1)).isoformat(),
+        },
+    )
+    assert invalid_reminder.status_code == 422
+
+    for field in ("title", "task_type", "due_at", "assignee_id", "status"):
+        invalid_null = await client.patch(
+            f"/api/v1/tasks/{task['id']}",
+            headers=headers,
+            json={"expected_version": updated_task["version"], field: None},
+        )
+        assert invalid_null.status_code == 422, (field, invalid_null.text)
+
+    stale_delete = await client.delete(
+        f"/api/v1/tasks/{task['id']}",
+        headers=headers,
+        params={"expected_version": task["version"]},
+    )
+    assert stale_delete.status_code == 409
+    assert stale_delete.json()["detail"]["code"] == "version_conflict"
+
+    deleted = await client.delete(
+        f"/api/v1/tasks/{task['id']}",
+        headers=headers,
+        params={"expected_version": updated_task["version"]},
+    )
+    assert deleted.status_code == 204, deleted.text
+    tasks = await client.get(
+        "/api/v1/tasks", params={"search": "Updated task", "include_completed": True}
+    )
+    assert tasks.status_code == 200
+    assert tasks.json()["items"] == []
+
+    task_id = as_uuid(task["id"])
+    async with SessionLocal() as db:
+        assert await db.get(Task, task_id) is None
+        cancelled_schedule = await db.get(PurchaseSchedule, purchase_schedule_id)
+        assert cancelled_schedule is not None
+        assert cancelled_schedule.status is PurchaseScheduleStatus.cancelled
+        assert cancelled_schedule.task_id is None
+        assert cancelled_schedule.completed_at is not None
+        cancelled_reminder = await db.get(OutboxEvent, reminder_event_id)
+        assert cancelled_reminder is not None
+        assert cancelled_reminder.processed_at is not None
+        assert (
+            await db.scalar(
+                sa.select(sa.func.count())
+                .select_from(ActivityEvent)
+                .where(
+                    ActivityEvent.entity_id == task_id,
+                    ActivityEvent.event_type == "task.deleted",
+                )
+            )
+            == 1
+        )
+
+
+@pytest.mark.asyncio
+async def test_contact_and_task_mutations_are_workspace_scoped(
+    client: httpx.AsyncClient, owner_auth: dict[str, object]
+) -> None:
+    headers = csrf(owner_auth)
+    owner_id = as_uuid(owner_auth["user"]["id"])
+    local_task = await client.post(
+        "/api/v1/tasks",
+        headers=headers,
+        json={
+            "title": "Local task",
+            "due_at": (datetime.now(UTC) + timedelta(days=1)).isoformat(),
+            "assignee_id": str(owner_id),
+        },
+    )
+    assert local_task.status_code == 201, local_task.text
+    async with SessionLocal() as db:
+        other_workspace = Workspace(name="Other workspace", slug="other-workspace")
+        db.add(other_workspace)
+        await db.flush()
+        other_contact = Contact(
+            workspace_id=other_workspace.id,
+            first_name="Other",
+        )
+        other_task = Task(
+            workspace_id=other_workspace.id,
+            title="Other task",
+            due_at=datetime.now(UTC) + timedelta(days=1),
+            assignee_id=owner_id,
+        )
+        db.add_all([other_contact, other_task])
+        await db.commit()
+        other_contact_id = other_contact.id
+        other_task_id = other_task.id
+
+    for method, path, kwargs in (
+        (
+            client.patch,
+            f"/api/v1/contacts/{other_contact_id}",
+            {"json": {"expected_version": 1, "first_name": "Leaked"}},
+        ),
+        (
+            client.delete,
+            f"/api/v1/contacts/{other_contact_id}",
+            {"params": {"expected_version": 1}},
+        ),
+        (
+            client.patch,
+            f"/api/v1/tasks/{other_task_id}",
+            {"json": {"expected_version": 1, "title": "Leaked"}},
+        ),
+        (
+            client.delete,
+            f"/api/v1/tasks/{other_task_id}",
+            {"params": {"expected_version": 1}},
+        ),
+    ):
+        response = await method(path, headers=headers, **kwargs)
+        assert response.status_code == 404, response.text
+
+    foreign_relation = await client.patch(
+        f"/api/v1/tasks/{local_task.json()['id']}",
+        headers=headers,
+        json={
+            "expected_version": local_task.json()["version"],
+            "contact_id": str(other_contact_id),
+        },
+    )
+    assert foreign_relation.status_code == 404
+
+    async with SessionLocal() as db:
+        stored_contact = await db.get(Contact, other_contact_id)
+        stored_task = await db.get(Task, other_task_id)
+        assert stored_contact is not None and stored_contact.deleted_at is None
+        assert stored_contact.first_name == "Other"
+        assert stored_task is not None and stored_task.title == "Other task"
+        stored_local_task = await db.get(Task, as_uuid(local_task.json()["id"]))
+        assert stored_local_task is not None and stored_local_task.contact_id is None
+        assert stored_local_task.version == local_task.json()["version"]
 
 
 @pytest.mark.asyncio

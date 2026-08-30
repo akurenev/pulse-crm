@@ -75,6 +75,10 @@ from app.integrations.notifications import (
 from app.integrations.purchases import ensure_purchase_task
 from app.integrations.s3 import AttachmentStorage, AttachmentValidationError
 from app.integrations.transports import AsyncIMAPPoller
+from app.integrations.web_push import (
+    WebPushDeliverySender,
+    mirror_delivered_in_app_notification,
+)
 from app.integrations.webhooks import VerifiedWebhook, accept_inbound_event
 from app.models import (
     BackgroundJob,
@@ -334,6 +338,7 @@ class RuntimeHandlers:
         inbound_processor: InboundProcessor | None = None,
         form_processor: FormProcessor | None = None,
         notification_expander: NotificationExpander | None = None,
+        web_push_sender: WebPushDeliverySender | None = None,
         now: Clock = _utcnow,
         cleanup_batch_size: int = 1_000,
     ) -> None:
@@ -349,6 +354,7 @@ class RuntimeHandlers:
         )
         self.form_processor: FormProcessor = form_processor or process_form_submission
         self.notification_expander = notification_expander
+        self.web_push_sender = web_push_sender
         self.now = now
         self.cleanup_batch_size = cleanup_batch_size
 
@@ -706,6 +712,15 @@ class RuntimeHandlers:
                 if event is None:
                     raise LookupError("notification source outbox event not found")
                 _require_job_workspace(job, event.workspace_id)
+                if event.event_type == "purchase.due_soon":
+                    schedule = await session.get(PurchaseSchedule, event.aggregate_id)
+                    if (
+                        event.aggregate_type != "purchase_schedule"
+                        or schedule is None
+                        or schedule.workspace_id != event.workspace_id
+                        or schedule.status is not PurchaseScheduleStatus.active
+                    ):
+                        return
                 if self.notification_expander is not None:
                     await self.notification_expander(session, event)
                 else:
@@ -798,6 +813,10 @@ class RuntimeHandlers:
                 raise RuntimeError("notification delivery was claimed before scheduled_at")
             if delivery.channel == "in_app":
                 result = SendResult(provider_message_id=f"in-app:{delivery.id}", sent_at=self.now())
+            elif delivery.channel == "web_push":
+                if self.web_push_sender is None:
+                    raise RuntimeWiringError("web push sender is not configured")
+                result = await self.web_push_sender(delivery)
             else:
                 if self.notification_adapter_factory is None:
                     raise RuntimeWiringError("notification adapter factory is not configured")
@@ -875,6 +894,11 @@ class RuntimeHandlers:
                                 ),
                             },
                         )
+                    )
+                    await mirror_delivered_in_app_notification(
+                        session,
+                        delivery=delivery,
+                        now=result.sent_at,
                     )
 
     async def _mark_delivery_failed_if_terminal(
@@ -1848,6 +1872,7 @@ class IntegrationRuntime:
         inbound_processor: InboundProcessor | None = None,
         form_processor: FormProcessor | None = None,
         notification_expander: NotificationExpander | None = None,
+        web_push_sender: WebPushDeliverySender | None = None,
         extra_handlers: Mapping[str, JobHandler] | None = None,
         concurrency: int = 4,
         scheduler_interval_seconds: float = 2.0,
@@ -1865,6 +1890,7 @@ class IntegrationRuntime:
             inbound_processor=inbound_processor,
             form_processor=form_processor,
             notification_expander=notification_expander,
+            web_push_sender=web_push_sender,
             now=now,
         )
         registry = self.handlers.registry()

@@ -157,7 +157,8 @@ describe("AppShell realtime refresh", () => {
       vi.advanceTimersByTime(100);
       source.emit("task.updated");
       vi.advanceTimersByTime(100);
-      source.emit("contact.updated");
+      source.emit("task.deleted");
+      source.emit("contact.deleted");
       vi.advanceTimersByTime(49);
     });
     expect(invalidateQueries).not.toHaveBeenCalled();
