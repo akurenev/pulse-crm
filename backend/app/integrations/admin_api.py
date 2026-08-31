@@ -39,7 +39,7 @@ from app.integrations.models import (
 )
 from app.integrations.s3 import AttachmentStorage
 from app.integrations.secrets import SecretCipher
-from app.models import BackgroundJob, Membership, Pipeline, Source, Stage
+from app.models import BackgroundJob, Membership, Pipeline, Source, Stage, User
 from app.security import CurrentAdmin
 from app.services.events import record_audit_event, record_domain_event
 
@@ -450,9 +450,12 @@ async def _validate_routing(
                 raise _not_found("stage")
     if assignee_id is not None:
         member_id = await db.scalar(
-            sa.select(Membership.id).where(
+            sa.select(Membership.id)
+            .join(User, User.id == Membership.user_id)
+            .where(
                 Membership.workspace_id == workspace_id,
                 Membership.user_id == assignee_id,
+                User.is_active.is_(True),
             )
         )
         if member_id is None:
@@ -1162,6 +1165,7 @@ async def _validate_rule(
     pipeline_id: uuid.UUID | None,
     stage_id: uuid.UUID | None,
     source_id: uuid.UUID | None,
+    recipients: list[dict[str, Any]],
     require_client_consent: bool,
 ) -> None:
     if event_type not in ALLOWED_NOTIFICATION_EVENTS:
@@ -1178,6 +1182,54 @@ async def _validate_rule(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="client notifications always require consent",
         )
+    if audience is NotificationAudience.employee:
+        if channel != "in_app":
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="employee notifications support only the in-app channel",
+            )
+        if not recipients:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="employee notification recipients are required",
+            )
+        recipient_ids: list[uuid.UUID] = []
+        for recipient in recipients:
+            address = recipient.get("address") if isinstance(recipient, dict) else None
+            raw_recipient_id = (
+                recipient.get("recipient_id") if isinstance(recipient, dict) else None
+            )
+            try:
+                recipient_id = uuid.UUID(str(raw_recipient_id))
+            except (TypeError, ValueError, AttributeError) as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="employee recipient must reference a workspace member",
+                ) from exc
+            if address != str(recipient_id):
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="in-app employee address must match recipient_id",
+                )
+            recipient_ids.append(recipient_id)
+        active_member_ids = set(
+            (
+                await db.scalars(
+                    sa.select(Membership.user_id)
+                    .join(User, User.id == Membership.user_id)
+                    .where(
+                        Membership.workspace_id == workspace_id,
+                        Membership.user_id.in_(set(recipient_ids)),
+                        User.is_active.is_(True),
+                    )
+                )
+            ).all()
+        )
+        if active_member_ids != set(recipient_ids):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="employee recipient must reference an active workspace member",
+            )
     template = await _get_template(db, workspace_id, template_id)
     if template.channel != channel:
         raise HTTPException(
@@ -1234,6 +1286,7 @@ async def create_notification_rule(
         pipeline_id=payload.pipeline_id,
         stage_id=payload.stage_id,
         source_id=payload.source_id,
+        recipients=payload.recipients,
         require_client_consent=payload.require_client_consent,
     )
     entity = NotificationRule(
@@ -1280,6 +1333,7 @@ async def update_notification_rule(
         pipeline_id=values.get("pipeline_id", current.pipeline_id),
         stage_id=values.get("stage_id", current.stage_id),
         source_id=values.get("source_id", current.source_id),
+        recipients=values.get("recipients", current.recipients),
         require_client_consent=values.get("require_client_consent", current.require_client_consent),
     )
     values.update(version=payload.expected_version + 1, updated_at=datetime.now(UTC))

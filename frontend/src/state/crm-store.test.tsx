@@ -1,7 +1,7 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { MemoryRouter, useNavigate } from "react-router-dom";
+import { MemoryRouter, useLocation, useNavigate } from "react-router-dom";
 
 import { DealsPage } from "../features/deals/DealsPage";
 import { ApiError } from "../lib/api";
@@ -97,6 +97,7 @@ const owner: ApiUser = {
   email: "owner@example.com",
   full_name: "Тестовый сотрудник",
   role: "owner",
+  version: 1,
 };
 
 function StoreProbe() {
@@ -176,6 +177,11 @@ function ClearDealRouteButton() {
   return <button type="button" onClick={() => navigate("/deals")}>Убрать сделку из адреса</button>;
 }
 
+function LocationProbe() {
+  const location = useLocation();
+  return <output aria-label="Адрес">{`${location.pathname}${location.search}`}</output>;
+}
+
 describe("CrmProvider deal stage loading", () => {
   let taskPagePromise: Promise<CursorPage<ApiTask>>;
   let deferredWonPage: Promise<CursorPage<ApiDeal>> | null;
@@ -213,7 +219,10 @@ describe("CrmProvider deal stage loading", () => {
     });
   });
 
-  afterEach(cleanup);
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+  });
 
   it("не запрашивает won/lost при старте, но загружает и пагинирует выбранный финальный этап", async () => {
     render(<CrmProvider><StoreProbe /></CrmProvider>);
@@ -291,6 +300,113 @@ describe("CrmProvider deal stage loading", () => {
     await waitFor(() => expect(screen.getByLabelText("Активная воронка")).toHaveTextContent(secondaryPipeline.id));
     expect(screen.getByLabelText("Открытая сделка")).toHaveTextContent("Сделка из уведомления");
     expect(screen.getByLabelText("Сделки")).toHaveTextContent("Сделка из уведомления");
+  });
+
+  it("немедленно закрывает выбранную сделку сотрудника при изменении доступа", async () => {
+    const baseGet = apiMocks.get.getMockImplementation()!;
+    apiMocks.get.mockImplementation((path: string) => {
+      if (path === "/deals/deal-open") {
+        return Promise.resolve(deal("deal-open", "stage-open", "Активная сделка"));
+      }
+      if (path.startsWith("/activity?")) return Promise.resolve({ items: [], next_cursor: null });
+      if (path.startsWith("/custom-fields?")) return Promise.resolve([]);
+      return baseGet(path);
+    });
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <MemoryRouter initialEntries={["/deals"]}>
+        <QueryClientProvider client={queryClient}>
+          <CrmProvider userRole="employee">
+            <DealsPage />
+            <LocationProbe />
+          </CrmProvider>
+        </QueryClientProvider>
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(screen.getByText("Активная сделка")).toBeInTheDocument());
+
+    fireEvent.click(screen.getByText("Активная сделка"));
+    await waitFor(() => expect(apiMocks.get.mock.calls
+      .filter(([path]) => path === "/deals/deal-open")).toHaveLength(1));
+    await waitFor(() => expect(screen.getByRole("dialog", { name: "Активная сделка" })).toBeInTheDocument());
+    expect(screen.getByLabelText("Адрес")).toHaveTextContent("/deals?deal=deal-open");
+
+    act(() => window.dispatchEvent(new Event("pulse:access-changed")));
+
+    expect(screen.queryByRole("dialog", { name: "Активная сделка" })).not.toBeInTheDocument();
+    expect(screen.queryByText("Активная сделка")).not.toBeInTheDocument();
+    await waitFor(() => expect(screen.getByLabelText("Адрес")).toHaveTextContent("/deals"));
+    expect(apiMocks.get.mock.calls.filter(([path]) => path === "/deals/deal-open")).toHaveLength(1);
+  });
+
+  it("инвалидирует незавершённое открытие сделки при изменении доступа", async () => {
+    let resolveDeepLink!: (value: ApiDeal) => void;
+    const deepLinkResponse = new Promise<ApiDeal>((resolve) => { resolveDeepLink = resolve; });
+    const baseGet = apiMocks.get.getMockImplementation()!;
+    apiMocks.get.mockImplementation((path: string) => path === "/deals/deal-deep-link"
+      ? deepLinkResponse
+      : baseGet(path));
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <MemoryRouter initialEntries={["/deals?deal=deal-deep-link"]}>
+        <QueryClientProvider client={queryClient}>
+          <CrmProvider userRole="employee">
+            <DealsPage />
+            <StoreProbe />
+            <LocationProbe />
+          </CrmProvider>
+        </QueryClientProvider>
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(apiMocks.get.mock.calls
+      .some(([path]) => path === "/deals/deal-deep-link")).toBe(true));
+
+    act(() => window.dispatchEvent(new Event("pulse:access-changed")));
+
+    expect(screen.getByLabelText("Открытая сделка")).toHaveTextContent("нет");
+    await waitFor(() => expect(screen.getByLabelText("Адрес")).toHaveTextContent("/deals"));
+    await act(async () => resolveDeepLink(deal(
+      "deal-deep-link",
+      "stage-service-won",
+      "Закрытые данные",
+      secondaryPipeline.id,
+    )));
+
+    expect(screen.getByLabelText("Открытая сделка")).toHaveTextContent("нет");
+    expect(screen.queryByText("Закрытые данные")).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Активная воронка")).toHaveTextContent(pipeline.id);
+  });
+
+  it("не возвращает задачу из запроса, начатого до изменения доступа", async () => {
+    let resolveStaleTasks!: (page: CursorPage<ApiTask>) => void;
+    const staleTasks = new Promise<CursorPage<ApiTask>>((resolve) => { resolveStaleTasks = resolve; });
+    let taskRequests = 0;
+    const baseGet = apiMocks.get.getMockImplementation()!;
+    apiMocks.get.mockImplementation((path: string) => {
+      if (path === "/tasks?limit=100") {
+        taskRequests += 1;
+        return taskRequests === 1 ? staleTasks : Promise.reject(new Error("fresh task request failed"));
+      }
+      return baseGet(path);
+    });
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    render(<CrmProvider><StoreProbe /></CrmProvider>);
+    await waitFor(() => expect(screen.getByLabelText("Статус")).toHaveTextContent("ready"));
+    expect(screen.getByLabelText("Сделки")).toHaveTextContent("Активная сделка");
+    expect(taskRequests).toBe(1);
+
+    act(() => window.dispatchEvent(new Event("pulse:access-changed")));
+    expect(screen.getByLabelText("Сделки")).toHaveTextContent("");
+    await act(async () => resolveStaleTasks({
+      items: [{ ...wonDealTask, id: "task-revoked", title: "Отозванная задача", deal_id: "deal-open" }],
+      next_cursor: null,
+    }));
+
+    act(() => window.dispatchEvent(new Event("pulse:refresh")));
+    await waitFor(() => expect(taskRequests).toBe(2));
+    await waitFor(() => expect(screen.getByLabelText("Статус")).toHaveTextContent("ready"));
+    expect(screen.getByLabelText("Сделки")).toHaveTextContent("Активная сделка");
+    expect(screen.getByLabelText("Задачи сделок")).not.toHaveTextContent("Отозванная задача");
   });
 
   it("не применяет поздний ответ deep-link после удаления deal из URL", async () => {

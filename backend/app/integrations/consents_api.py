@@ -20,6 +20,7 @@ from app.integrations.identity import IdentityNormalizationError, normalize_emai
 from app.integrations.models import ConsentStatus, ContactChannelConsent
 from app.models import Contact
 from app.security import CurrentMutationUser, CurrentUser
+from app.services.access import contact_access_condition, ensure_contact_access
 from app.services.events import record_domain_event
 
 router = APIRouter(tags=["contact-consents"])
@@ -102,24 +103,6 @@ class ConsentRead(BaseModel):
     updated_at: datetime
 
 
-async def _contact_or_404(
-    db: AsyncSession,
-    *,
-    workspace_id: uuid.UUID,
-    contact_id: uuid.UUID,
-) -> Contact:
-    contact = await db.scalar(
-        sa.select(Contact).where(
-            Contact.id == contact_id,
-            Contact.workspace_id == workspace_id,
-            Contact.deleted_at.is_(None),
-        )
-    )
-    if contact is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="contact not found")
-    return contact
-
-
 def _normalized_address(channel: ConsentChannel, address: str) -> str:
     if channel is ConsentChannel.email:
         try:
@@ -151,22 +134,31 @@ async def list_contact_consents(
     context: CurrentUser,
     db: AsyncSession = Depends(get_session),
 ) -> list[ContactChannelConsent]:
-    await _contact_or_404(db, workspace_id=context.workspace_id, contact_id=contact_id)
-    return list(
-        (
-            await db.scalars(
-                sa.select(ContactChannelConsent)
-                .where(
+    rows = (
+        await db.execute(
+            sa.select(Contact, ContactChannelConsent)
+            .outerjoin(
+                ContactChannelConsent,
+                sa.and_(
+                    ContactChannelConsent.contact_id == Contact.id,
                     ContactChannelConsent.workspace_id == context.workspace_id,
-                    ContactChannelConsent.contact_id == contact_id,
-                )
-                .order_by(
-                    ContactChannelConsent.created_at.desc(),
-                    ContactChannelConsent.id.desc(),
-                )
+                ),
             )
-        ).all()
-    )
+            .where(
+                Contact.id == contact_id,
+                Contact.workspace_id == context.workspace_id,
+                Contact.deleted_at.is_(None),
+                contact_access_condition(context),
+            )
+            .order_by(
+                ContactChannelConsent.created_at.desc(),
+                ContactChannelConsent.id.desc(),
+            )
+        )
+    ).all()
+    if not rows:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="contact not found")
+    return [consent for _contact, consent in rows if consent is not None]
 
 
 @router.post("/contacts/{contact_id}/consents", response_model=ConsentRead)
@@ -176,7 +168,7 @@ async def grant_contact_consent(
     context: CurrentMutationUser,
     db: AsyncSession = Depends(get_session),
 ) -> ContactChannelConsent:
-    await _contact_or_404(db, workspace_id=context.workspace_id, contact_id=contact_id)
+    await ensure_contact_access(db, context, contact_id, for_update=True)
     normalized_address = _normalized_address(payload.channel, payload.address)
     consent = await db.scalar(
         sa.select(ContactChannelConsent)
@@ -259,7 +251,7 @@ async def revoke_contact_consent(
     context: CurrentMutationUser,
     db: AsyncSession = Depends(get_session),
 ) -> ContactChannelConsent:
-    await _contact_or_404(db, workspace_id=context.workspace_id, contact_id=contact_id)
+    await ensure_contact_access(db, context, contact_id, for_update=True)
     consent = await db.scalar(
         sa.select(ContactChannelConsent)
         .where(

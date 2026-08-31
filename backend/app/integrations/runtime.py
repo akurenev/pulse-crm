@@ -60,6 +60,7 @@ from app.integrations.models import (
     Message,
     MessageDirection,
     MessageStatus,
+    NotificationAudience,
     NotificationDelivery,
     NotificationRule,
     NotificationTemplate,
@@ -77,6 +78,7 @@ from app.integrations.s3 import AttachmentStorage, AttachmentValidationError
 from app.integrations.transports import AsyncIMAPPoller
 from app.integrations.web_push import (
     WebPushDeliverySender,
+    is_trusted_test_push_delivery,
     mirror_delivered_in_app_notification,
 )
 from app.integrations.webhooks import VerifiedWebhook, accept_inbound_event
@@ -85,14 +87,18 @@ from app.models import (
     Deal,
     DeliveryStatus,
     JobStatus,
+    Membership,
     OutboxEvent,
     RealtimeEvent,
+    Role,
     Session,
     Stage,
     StageType,
     Task,
     TaskStatus,
+    User,
 )
+from app.services.access import notification_target_access_allowed
 from app.services.events import record_domain_event
 from app.services.jobs import (
     ClaimedJob,
@@ -281,6 +287,62 @@ async def _trusted_notification_target(
     if target_exists is None:
         return None, None
     return target_type, target_id
+
+
+async def _active_notification_recipient_role(
+    session: AsyncSession,
+    *,
+    workspace_id: uuid.UUID,
+    recipient_id: uuid.UUID | None,
+    lock: bool = False,
+) -> Role | None:
+    """Return an active workspace member's role, optionally locking identity rows."""
+
+    if recipient_id is None:
+        return None
+    query = (
+        sa.select(Membership.role)
+        .join(User, User.id == Membership.user_id)
+        .where(
+            Membership.workspace_id == workspace_id,
+            Membership.user_id == recipient_id,
+            User.is_active.is_(True),
+        )
+    )
+    if lock:
+        # Role and account activation cannot change between authorization and
+        # the external side effect.  PostgreSQL locks both joined rows; SQLite
+        # ignores FOR UPDATE only in isolated repository tests.
+        query = query.with_for_update(of=(Membership, User))
+    raw_role = await session.scalar(query)
+    if raw_role is None:
+        return None
+    return Role(str(raw_role))
+
+
+def _restricted_notification_variables(
+    event: OutboxEvent,
+    *,
+    target_entity_type: str,
+    target_entity_id: uuid.UUID,
+) -> dict[str, Any]:
+    """Expose only the restricted employee's authorized target to templates.
+
+    Existing templates may reference payload fields, so their keys are kept
+    with empty values.  Raw payload values are never propagated: secondary
+    deal/contact/conversation identifiers can belong to inaccessible records.
+    """
+
+    variables: dict[str, Any] = {str(key): None for key in event.payload}
+    target_id = str(target_entity_id)
+    variables.update(
+        {
+            "event_type": event.event_type,
+            "entity_id": target_id,
+            f"{target_entity_type}_id": target_id,
+        }
+    )
+    return variables
 
 
 def _optional_int(value: Any) -> int | None:
@@ -798,7 +860,7 @@ class RuntimeHandlers:
             session, event
         )
         for rule, template in matching_rows:
-            variables = {
+            default_variables = {
                 "event_type": event.event_type,
                 "entity_id": str(event.aggregate_id),
                 **event.payload,
@@ -815,6 +877,48 @@ class RuntimeHandlers:
                         extra={"rule_id": str(rule.id), "recipient_index": index},
                     )
                     continue
+                recipient_id = _optional_uuid(recipient.get("recipient_id"))
+                variables = default_variables
+                if rule.audience is NotificationAudience.employee:
+                    # Employee identities are internal and verified.  External
+                    # addresses cannot be bound safely to a membership until a
+                    # per-channel verification model exists.
+                    if rule.channel != "in_app" or address != str(recipient_id):
+                        logger.warning(
+                            "employee notification rule has an unverified recipient",
+                            extra={"rule_id": str(rule.id), "recipient_index": index},
+                        )
+                        continue
+                    recipient_role = await _active_notification_recipient_role(
+                        session,
+                        workspace_id=event.workspace_id,
+                        recipient_id=recipient_id,
+                    )
+                    if recipient_role is None or not await notification_target_access_allowed(
+                        session,
+                        workspace_id=event.workspace_id,
+                        recipient_id=recipient_id,
+                        target_entity_type=target_entity_type,
+                        target_entity_id=target_entity_id,
+                    ):
+                        logger.info(
+                            "notification recipient cannot access target",
+                            extra={
+                                "rule_id": str(rule.id),
+                                "recipient_index": index,
+                                "recipient_id": str(recipient_id),
+                            },
+                        )
+                        continue
+                    if target_entity_type is not None and target_entity_id is not None:
+                        # Scrub all employee-audience deliveries with a target,
+                        # including current managers/admins.  A delayed delivery
+                        # can outlive a demotion to the restricted employee role.
+                        variables = _restricted_notification_variables(
+                            event,
+                            target_entity_type=target_entity_type,
+                            target_entity_id=target_entity_id,
+                        )
                 try:
                     await queue_notification(
                         session,
@@ -824,7 +928,7 @@ class RuntimeHandlers:
                         audience=rule.audience,
                         channel=rule.channel,
                         recipient_address=address,
-                        recipient_id=_optional_uuid(recipient.get("recipient_id")),
+                        recipient_id=recipient_id,
                         target_entity_type=target_entity_type,
                         target_entity_id=target_entity_id,
                         contact_id=_optional_uuid(recipient.get("contact_id")),
@@ -865,30 +969,12 @@ class RuntimeHandlers:
             delivery = await self._pending_delivery(delivery_id, job=job)
             if delivery is None:
                 return
+            if delivery.audience is NotificationAudience.employee:
+                await self._deliver_employee_notification_locked(delivery_id, job=job)
+                return
             if _as_utc(delivery.scheduled_at) > _as_utc(self.now()):
                 raise RuntimeError("notification delivery was claimed before scheduled_at")
-            if delivery.channel == "in_app":
-                result = SendResult(provider_message_id=f"in-app:{delivery.id}", sent_at=self.now())
-            elif delivery.channel == "web_push":
-                if self.web_push_sender is None:
-                    raise RuntimeWiringError("web push sender is not configured")
-                result = await self.web_push_sender(delivery)
-            else:
-                if self.notification_adapter_factory is None:
-                    raise RuntimeWiringError("notification adapter factory is not configured")
-                adapter = await _resolve(
-                    self.notification_adapter_factory(delivery.workspace_id, delivery.channel)
-                )
-                text = (
-                    f"{delivery.subject}\n\n{delivery.body}" if delivery.subject else delivery.body
-                )
-                result = await adapter.send_message(
-                    OutboundMessage(
-                        thread_id=delivery.recipient_address,
-                        recipient_id=delivery.recipient_address,
-                        text=text,
-                    )
-                )
+            result = await self._send_notification_delivery(delivery)
             await self._mark_delivery_sent(
                 delivery.id,
                 result,
@@ -903,15 +989,146 @@ class RuntimeHandlers:
         self, delivery_id: uuid.UUID, *, job: ClaimedJob
     ) -> NotificationDelivery | None:
         async with self.session_factory() as session:
-            delivery = await session.get(NotificationDelivery, delivery_id)
-            if delivery is None:
-                raise LookupError("notification delivery not found")
-            _require_job_workspace(job, delivery.workspace_id)
-            if delivery.status in {DeliveryStatus.delivered, DeliveryStatus.failed}:
-                return None
-            if delivery.status not in {DeliveryStatus.pending, DeliveryStatus.processing}:
-                raise ValueError("notification delivery is not sendable")
-            return delivery
+            async with session.begin():
+                delivery = await session.scalar(
+                    sa.select(NotificationDelivery)
+                    .where(NotificationDelivery.id == delivery_id)
+                    .with_for_update()
+                )
+                if delivery is None:
+                    raise LookupError("notification delivery not found")
+                _require_job_workspace(job, delivery.workspace_id)
+                if delivery.status in {DeliveryStatus.delivered, DeliveryStatus.failed}:
+                    return None
+                if delivery.status not in {DeliveryStatus.pending, DeliveryStatus.processing}:
+                    raise ValueError("notification delivery is not sendable")
+                return delivery
+
+    async def _send_notification_delivery(
+        self, delivery: NotificationDelivery
+    ) -> SendResult:
+        if delivery.channel == "in_app":
+            return SendResult(
+                provider_message_id=f"in-app:{delivery.id}",
+                sent_at=self.now(),
+            )
+        if delivery.channel == "web_push":
+            if self.web_push_sender is None:
+                raise RuntimeWiringError("web push sender is not configured")
+            return await self.web_push_sender(delivery)
+        if self.notification_adapter_factory is None:
+            raise RuntimeWiringError("notification adapter factory is not configured")
+        adapter = await _resolve(
+            self.notification_adapter_factory(delivery.workspace_id, delivery.channel)
+        )
+        text = f"{delivery.subject}\n\n{delivery.body}" if delivery.subject else delivery.body
+        return await adapter.send_message(
+            OutboundMessage(
+                thread_id=delivery.recipient_address,
+                recipient_id=delivery.recipient_address,
+                text=text,
+            )
+        )
+
+    async def _deliver_employee_notification_locked(
+        self,
+        delivery_id: uuid.UUID,
+        *,
+        job: ClaimedJob,
+    ) -> None:
+        """Authorize and send an internal notification in one linearized scope.
+
+        Restricted employee ownership is represented by the assignee column on
+        the target row.  Holding that row together with membership/user locks
+        until the provider call completes prevents a reassignment or account
+        change from landing in the authorization-to-send gap.
+        """
+
+        async with self.session_factory() as session:
+            async with session.begin():
+                delivery = await session.scalar(
+                    sa.select(NotificationDelivery)
+                    .where(NotificationDelivery.id == delivery_id)
+                    .with_for_update()
+                )
+                if delivery is None:
+                    raise LookupError("notification delivery not found")
+                _require_job_workspace(job, delivery.workspace_id)
+                if delivery.status in {DeliveryStatus.delivered, DeliveryStatus.failed}:
+                    return
+                if delivery.status not in {DeliveryStatus.pending, DeliveryStatus.processing}:
+                    raise ValueError("notification delivery is not sendable")
+                if _as_utc(delivery.scheduled_at) > _as_utc(self.now()):
+                    raise RuntimeError("notification delivery was claimed before scheduled_at")
+
+                recipient_role = await _active_notification_recipient_role(
+                    session,
+                    workspace_id=delivery.workspace_id,
+                    recipient_id=delivery.recipient_id,
+                    lock=True,
+                )
+                if recipient_role is None or not await self._employee_delivery_is_allowed(
+                    session,
+                    delivery=delivery,
+                    recipient_role=recipient_role,
+                ):
+                    self._suppress_employee_delivery(delivery, job=job)
+                    return
+
+                result = await self._send_notification_delivery(delivery)
+                await self._finalize_delivery(
+                    session,
+                    delivery=delivery,
+                    result=result,
+                    in_app=delivery.channel == "in_app",
+                )
+
+    @staticmethod
+    async def _employee_delivery_is_allowed(
+        session: AsyncSession,
+        *,
+        delivery: NotificationDelivery,
+        recipient_role: Role,
+    ) -> bool:
+        recipient_id = delivery.recipient_id
+        if (
+            recipient_id is None
+            or delivery.channel not in {"in_app", "web_push"}
+            or delivery.recipient_address != str(recipient_id)
+        ):
+            return False
+        if recipient_role is not Role.employee:
+            return True
+        if is_trusted_test_push_delivery(delivery):
+            return True
+        if delivery.target_entity_id is None:
+            return False
+        if delivery.target_entity_type == "deal":
+            target_query = sa.select(Deal.id).where(
+                Deal.id == delivery.target_entity_id,
+                Deal.workspace_id == delivery.workspace_id,
+                Deal.deleted_at.is_(None),
+                Deal.assignee_id == recipient_id,
+            )
+        elif delivery.target_entity_type == "task":
+            target_query = sa.select(Task.id).where(
+                Task.id == delivery.target_entity_id,
+                Task.workspace_id == delivery.workspace_id,
+                Task.assignee_id == recipient_id,
+            )
+        else:
+            return False
+        return await session.scalar(target_query.with_for_update()) is not None
+
+    @staticmethod
+    def _suppress_employee_delivery(
+        delivery: NotificationDelivery,
+        *,
+        job: ClaimedJob,
+    ) -> None:
+        delivery.status = DeliveryStatus.failed
+        delivery.attempts = max(delivery.attempts, job.attempts)
+        delivery.last_error = "notification suppressed: unverified recipient or inaccessible target"
 
     async def _mark_delivery_sent(
         self,
@@ -933,29 +1150,44 @@ class RuntimeHandlers:
                 )
                 if delivery is None or delivery.status is DeliveryStatus.delivered:
                     return
-                delivery.status = DeliveryStatus.delivered
-                delivery.provider_message_id = result.provider_message_id
-                delivery.delivered_at = result.sent_at
-                delivery.attempts += 1
-                delivery.last_error = None
-                if in_app:
-                    session.add(
-                        RealtimeEvent(
-                            workspace_id=delivery.workspace_id,
-                            event_type="notification.delivered",
-                            payload={
-                                "delivery_id": str(delivery.id),
-                                "recipient_id": (
-                                    str(delivery.recipient_id) if delivery.recipient_id else None
-                                ),
-                            },
-                        )
-                    )
-                    await mirror_delivered_in_app_notification(
-                        session,
-                        delivery=delivery,
-                        now=result.sent_at,
-                    )
+                await self._finalize_delivery(
+                    session,
+                    delivery=delivery,
+                    result=result,
+                    in_app=in_app,
+                )
+
+    @staticmethod
+    async def _finalize_delivery(
+        session: AsyncSession,
+        *,
+        delivery: NotificationDelivery,
+        result: SendResult,
+        in_app: bool,
+    ) -> None:
+        delivery.status = DeliveryStatus.delivered
+        delivery.provider_message_id = result.provider_message_id
+        delivery.delivered_at = result.sent_at
+        delivery.attempts += 1
+        delivery.last_error = None
+        if in_app:
+            session.add(
+                RealtimeEvent(
+                    workspace_id=delivery.workspace_id,
+                    event_type="notification.delivered",
+                    payload={
+                        "delivery_id": str(delivery.id),
+                        "recipient_id": (
+                            str(delivery.recipient_id) if delivery.recipient_id else None
+                        ),
+                    },
+                )
+            )
+            await mirror_delivered_in_app_notification(
+                session,
+                delivery=delivery,
+                now=result.sent_at,
+            )
 
     async def _mark_delivery_failed_if_terminal(
         self, delivery_id: uuid.UUID, job: ClaimedJob, error: BaseException

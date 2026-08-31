@@ -57,6 +57,7 @@ const realtimeEventTypes = [
   "contact.deleted",
   "company.created",
   "company.updated",
+  "company.deleted",
 ] as const;
 
 const REALTIME_REFRESH_DEBOUNCE_MS = 250;
@@ -64,7 +65,7 @@ const REALTIME_FALLBACK_INTERVAL_MS = 15_000;
 
 export function AppShell() {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
-  const { session, logout } = useAuth();
+  const { session, logout, refreshSession } = useAuth();
   const navigate = useNavigate();
   const location = useLocation();
   const canManageSettings = session?.user.role === "owner" || session?.user.role === "admin";
@@ -75,12 +76,15 @@ export function AppShell() {
     initials: name.split(/\s+/).slice(0, 2).map((part) => part[0]).join("").toLocaleUpperCase("ru"),
     tone: "violet",
   };
+  const crmIdentityKey = session
+    ? `${session.workspace.id}:${session.user.id}:${session.user.role}`
+    : "anonymous";
   const mobileTitle = navigation.find((item) => item.to === location.pathname)?.label
     ?? (location.pathname === "/settings" ? "Настройки" : "Pulse CRM");
-  useRealtimeRefresh();
+  useRealtimeRefresh(refreshSession);
 
   return (
-    <CrmProvider>
+    <CrmProvider key={crmIdentityKey} currentUser={currentUser} userRole={session?.user.role}>
       <div className={`app-shell${sidebarCollapsed ? " app-shell--collapsed" : ""}`}>
       <aside className="sidebar">
         <BrandMark />
@@ -170,7 +174,7 @@ function NotificationCenter({ size }: { size: number }) {
   );
 }
 
-function useRealtimeRefresh() {
+function useRealtimeRefresh(refreshSession: (options?: { failClosed?: boolean }) => Promise<void>) {
   const queryClient = useQueryClient();
 
   useEffect(() => {
@@ -178,6 +182,8 @@ function useRealtimeRefresh() {
     let refreshTimeout: number | null = null;
     let fallbackInterval: number | null = null;
     let disposed = false;
+    let sessionProbe: Promise<void> | null = null;
+    let hasOpened = false;
 
     const refresh = () => {
       refreshTimeout = null;
@@ -193,6 +199,32 @@ function useRealtimeRefresh() {
       refreshTimeout = window.setTimeout(refresh, REALTIME_REFRESH_DEBOUNCE_MS);
     };
 
+    const purgeAccessState = () => {
+      if (disposed) return;
+      queryClient.removeQueries({
+        predicate: (query) => query.queryKey[0] !== "push",
+      });
+      window.dispatchEvent(new Event("pulse:access-changed"));
+    };
+
+    const probeSession = (failClosed = false, forceLatest = false) => {
+      if (!failClosed && !forceLatest && sessionProbe) return;
+      const probe = failClosed ? refreshSession({ failClosed: true }) : refreshSession();
+      sessionProbe = probe;
+      void probe.catch((error: unknown) => {
+        if (!disposed) console.error("Pulse CRM session probe failed", error);
+      }).finally(() => {
+        if (sessionProbe === probe) sessionProbe = null;
+      });
+    };
+
+    const handleAccessChanged = () => {
+      purgeAccessState();
+      if (refreshTimeout !== null) window.clearTimeout(refreshTimeout);
+      refreshTimeout = null;
+      probeSession(true);
+    };
+
     const stopFallback = () => {
       if (fallbackInterval === null) return;
       window.clearInterval(fallbackInterval);
@@ -201,7 +233,13 @@ function useRealtimeRefresh() {
 
     const startFallback = () => {
       if (disposed || fallbackInterval !== null) return;
-      fallbackInterval = window.setInterval(scheduleRefresh, REALTIME_FALLBACK_INTERVAL_MS);
+      fallbackInterval = window.setInterval(() => {
+        // While realtime is unavailable, an assignment or role change may not
+        // reach this tab. Fail closed before rebuilding the latest REST view.
+        purgeAccessState();
+        probeSession();
+        scheduleRefresh();
+      }, REALTIME_FALLBACK_INTERVAL_MS);
     };
 
     if (typeof EventSource === "undefined") {
@@ -216,13 +254,21 @@ function useRealtimeRefresh() {
     const source = new EventSource("/api/v1/events");
     const handleOpen = () => {
       stopFallback();
+      purgeAccessState();
+      const reconnecting = hasOpened;
+      hasOpened = true;
+      probeSession(reconnecting, true);
       // Reconcile the REST snapshot with events that may have arrived before
       // the server established the stream cursor, and after reconnect gaps.
       scheduleRefresh();
     };
-    const handleError = () => startFallback();
+    const handleError = () => {
+      startFallback();
+      probeSession();
+    };
     source.addEventListener("open", handleOpen);
     source.addEventListener("error", handleError);
+    source.addEventListener("access.changed", handleAccessChanged);
     for (const eventType of realtimeEventTypes) source.addEventListener(eventType, scheduleRefresh);
     // Cover slow or failed initial connections. A successful `open` clears the
     // interval before it can poll while the live stream is healthy.
@@ -234,10 +280,11 @@ function useRealtimeRefresh() {
       if (refreshTimeout !== null) window.clearTimeout(refreshTimeout);
       source.removeEventListener("open", handleOpen);
       source.removeEventListener("error", handleError);
+      source.removeEventListener("access.changed", handleAccessChanged);
       for (const eventType of realtimeEventTypes) source.removeEventListener(eventType, scheduleRefresh);
       source.close();
     };
-  }, [queryClient]);
+  }, [queryClient, refreshSession]);
 }
 
 function UserMenu({ user, email, onLogout }: { user: UserSummary; email: string; onLogout: () => Promise<void> }) {

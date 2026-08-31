@@ -370,6 +370,18 @@ async def test_notification_template_and_rule_crud_enforces_catalog_and_consent(
     )
     assert [item["id"] for item in template_list.json()] == [template["id"]]
 
+    in_app_template_response = await admin_client.post(
+        f"{API_ROOT}/notification-templates",
+        headers=auth(admin_seed.admin_token),
+        json={
+            "name": "New lead in app",
+            "channel": "in_app",
+            "body_template": "Откройте сделку {deal_id}",
+        },
+    )
+    assert in_app_template_response.status_code == 201
+    in_app_template = in_app_template_response.json()
+
     unsafe_client_rule = await admin_client.post(
         f"{API_ROOT}/notification-rules",
         headers=auth(admin_seed.admin_token),
@@ -384,17 +396,40 @@ async def test_notification_template_and_rule_crud_enforces_catalog_and_consent(
     )
     assert unsafe_client_rule.status_code == 422
 
-    pipeline_rule_response = await admin_client.post(
+    spoofed_employee_address = await admin_client.post(
         f"{API_ROOT}/notification-rules",
         headers=auth(admin_seed.admin_token),
         json={
             "template_id": template["id"],
-            "name": "All stages in sales pipeline",
+            "name": "Spoofed employee email",
             "event_type": "lead.created",
             "audience": "employee",
             "channel": "email",
+            "recipients": [
+                {
+                    "address": "unverified-recipient@example.com",
+                    "recipient_id": admin_seed.admin_id,
+                }
+            ],
+        },
+    )
+    assert spoofed_employee_address.status_code == 422
+    assert "only the in-app channel" in spoofed_employee_address.text
+
+    pipeline_rule_response = await admin_client.post(
+        f"{API_ROOT}/notification-rules",
+        headers=auth(admin_seed.admin_token),
+        json={
+            "template_id": in_app_template["id"],
+            "name": "All stages in sales pipeline",
+            "event_type": "lead.created",
+            "audience": "employee",
+            "channel": "in_app",
             "pipeline_id": admin_seed.pipeline_id,
             "stage_id": None,
+            "recipients": [
+                {"address": admin_seed.admin_id, "recipient_id": admin_seed.admin_id}
+            ],
             "is_enabled": True,
         },
     )
@@ -407,13 +442,16 @@ async def test_notification_template_and_rule_crud_enforces_catalog_and_consent(
         f"{API_ROOT}/notification-rules",
         headers=auth(admin_seed.admin_token),
         json={
-            "template_id": template["id"],
+            "template_id": in_app_template["id"],
             "name": "Invalid stage-only filter",
             "event_type": "lead.created",
             "audience": "employee",
-            "channel": "email",
+            "channel": "in_app",
             "pipeline_id": None,
             "stage_id": admin_seed.stage_id,
+            "recipients": [
+                {"address": admin_seed.admin_id, "recipient_id": admin_seed.admin_id}
+            ],
         },
     )
     assert stage_without_pipeline.status_code == 422
@@ -422,13 +460,16 @@ async def test_notification_template_and_rule_crud_enforces_catalog_and_consent(
         f"{API_ROOT}/notification-rules",
         headers=auth(admin_seed.admin_token),
         json={
-            "template_id": template["id"],
+            "template_id": in_app_template["id"],
             "name": "New lead for admins",
             "event_type": "lead.created",
             "audience": "employee",
-            "channel": "email",
+            "channel": "in_app",
             "pipeline_id": admin_seed.pipeline_id,
             "stage_id": admin_seed.stage_id,
+            "recipients": [
+                {"address": admin_seed.admin_id, "recipient_id": admin_seed.admin_id}
+            ],
             "is_enabled": True,
         },
     )
@@ -470,6 +511,111 @@ async def test_notification_template_and_rule_crud_enforces_catalog_and_consent(
             headers=auth(admin_seed.owner_token),
         )
     ).status_code == 204
+    assert (
+        await admin_client.delete(
+            f"{API_ROOT}/notification-templates/{in_app_template['id']}?expected_version=1",
+            headers=auth(admin_seed.owner_token),
+        )
+    ).status_code == 204
+
+
+@pytest.mark.asyncio
+async def test_employee_notification_rules_require_verified_active_in_app_recipient(
+    admin_client: httpx.AsyncClient, admin_seed: AdminSeed
+) -> None:
+    template_response = await admin_client.post(
+        f"{API_ROOT}/notification-templates",
+        headers=auth(admin_seed.admin_token),
+        json={
+            "name": "Verified member in app",
+            "channel": "in_app",
+            "body_template": "Откройте сделку {deal_id}",
+        },
+    )
+    assert template_response.status_code == 201
+    template_id = template_response.json()["id"]
+    base_payload = {
+        "template_id": template_id,
+        "name": "Verified member rule",
+        "event_type": "lead.created",
+        "audience": "employee",
+        "channel": "in_app",
+        "recipients": [
+            {"address": admin_seed.admin_id, "recipient_id": admin_seed.admin_id}
+        ],
+    }
+
+    mismatched_address = await admin_client.post(
+        f"{API_ROOT}/notification-rules",
+        headers=auth(admin_seed.admin_token),
+        json={
+            **base_payload,
+            "recipients": [
+                {
+                    "address": admin_seed.owner_id,
+                    "recipient_id": admin_seed.admin_id,
+                }
+            ],
+        },
+    )
+    assert mismatched_address.status_code == 422
+
+    foreign_member_id = uuid.uuid4()
+    foreign_member = await admin_client.post(
+        f"{API_ROOT}/notification-rules",
+        headers=auth(admin_seed.admin_token),
+        json={
+            **base_payload,
+            "recipients": [
+                {"address": str(foreign_member_id), "recipient_id": str(foreign_member_id)}
+            ],
+        },
+    )
+    assert foreign_member.status_code == 422
+
+    async with SessionLocal() as db:
+        inactive_user = User(
+            email="inactive-notification@example.com",
+            full_name="Inactive Notification User",
+            password_hash="unused",
+            is_active=False,
+        )
+        db.add(inactive_user)
+        await db.flush()
+        db.add(
+            Membership(
+                workspace_id=uuid.UUID(admin_seed.workspace_id),
+                user_id=inactive_user.id,
+                role=Role.employee,
+            )
+        )
+        await db.commit()
+        inactive_user_id = str(inactive_user.id)
+    inactive_member = await admin_client.post(
+        f"{API_ROOT}/notification-rules",
+        headers=auth(admin_seed.admin_token),
+        json={
+            **base_payload,
+            "recipients": [
+                {"address": inactive_user_id, "recipient_id": inactive_user_id}
+            ],
+        },
+    )
+    assert inactive_member.status_code == 422
+
+    created = await admin_client.post(
+        f"{API_ROOT}/notification-rules",
+        headers=auth(admin_seed.admin_token),
+        json=base_payload,
+    )
+    assert created.status_code == 201
+    rejected_update = await admin_client.patch(
+        f"{API_ROOT}/notification-rules/{created.json()['id']}",
+        headers=auth(admin_seed.admin_token),
+        json={"expected_version": 1, "channel": "email"},
+    )
+    assert rejected_update.status_code == 422
+    assert "only the in-app channel" in rejected_update.text
 
 
 @pytest.mark.asyncio

@@ -2,7 +2,10 @@ import { expect, test } from "@playwright/test";
 
 test("creates a contact and switches to companies", async ({ page }) => {
   await page.goto("/contacts");
-  const importedContact = page.getByRole("button", { name: /Анна Смирнова/ });
+  const importedContact = page.getByRole("region", { name: "Список контактов" })
+    .locator("button.data-row")
+    .filter({ has: page.getByText("Анна Смирнова", { exact: true }) });
+  await expect(importedContact).toHaveCount(1);
   await expect(importedContact).toContainText("VIP");
   await importedContact.click();
   const importedDialog = page.getByRole("dialog", { name: "Анна Смирнова" });
@@ -90,12 +93,19 @@ test("creates a deal field and makes it required for a pipeline stage", async ({
 
 test("renames a pipeline and manages its open stages", async ({ page }) => {
   await page.goto("/settings");
-  const pipeline = page.locator(".settings-section").first();
+  let pipeline = page.locator(".settings-section").filter({
+    has: page.getByRole("button", { name: "Переименовать воронку Повторные продажи", exact: true }),
+  });
+  await expect(pipeline).toHaveCount(1);
 
   await pipeline.getByRole("button", { name: "Переименовать воронку Повторные продажи" }).click();
   let editor = page.locator(".settings-editor");
   await editor.getByLabel("Название воронки").fill("Продажи и продления");
   await editor.getByRole("button", { name: "Сохранить название" }).click();
+  pipeline = page.locator(".settings-section").filter({
+    has: page.getByRole("button", { name: "Переименовать воронку Продажи и продления", exact: true }),
+  });
+  await expect(pipeline).toHaveCount(1);
   await expect(pipeline.getByText("Продажи и продления", { exact: true })).toBeVisible();
 
   await pipeline.getByRole("button", { name: "Добавить этап в воронку Продажи и продления" }).click();
@@ -118,8 +128,22 @@ test("renames a pipeline and manages its open stages", async ({ page }) => {
   editor = page.locator(".settings-editor");
   await editor.getByLabel("Название воронки").fill("Воронка для удаления");
   await editor.getByRole("button", { name: "Создать воронку" }).click();
-  const removablePipeline = page.locator(".settings-section").filter({ hasText: "Воронка для удаления" });
+  const removablePipeline = page.locator(".settings-section").filter({
+    has: page.getByRole("button", { name: "Удалить воронку Воронка для удаления", exact: true }),
+  });
+  await expect(removablePipeline).toHaveCount(1);
   page.once("dialog", (dialog) => void dialog.accept());
   await removablePipeline.getByRole("button", { name: "Удалить воронку Воронка для удаления" }).click();
   await expect(removablePipeline).toHaveCount(0);
+});
+
+test("creates an invitation for the employee role", async ({ page }) => {
+  await page.goto("/settings");
+  await page.getByRole("tab", { name: "Пользователи", exact: true }).click();
+  const role = page.getByRole("combobox", { name: "Роль" });
+  await expect(role.getByRole("option", { name: "Сотрудник", exact: true })).toHaveAttribute("value", "employee");
+  await page.getByRole("textbox", { name: "Email" }).fill("employee@example.com");
+  await role.selectOption("employee");
+  await page.getByRole("button", { name: "Создать приглашение", exact: true }).click();
+  await expect(page.getByRole("status")).toContainText("Приглашение готово");
 });

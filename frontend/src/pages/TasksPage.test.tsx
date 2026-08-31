@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { PropsWithChildren } from "react";
 import { MemoryRouter, useLocation } from "react-router-dom";
@@ -8,21 +8,34 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ApiTask, ApiUser, CursorPage } from "../types/api";
 import TasksPage from "./TasksPage";
 
-const { deleteMock, getMock, patchMock, postMock } = vi.hoisted(() => ({
+const { deleteMock, getMock, patchMock, postMock, permissionState } = vi.hoisted(() => ({
   deleteMock: vi.fn(),
   getMock: vi.fn(),
   patchMock: vi.fn(),
   postMock: vi.fn(),
+  permissionState: { isEmployee: false },
 }));
 
 vi.mock("../lib/api", () => ({
+  ApiError: class ApiError extends Error {
+    constructor(message: string, public readonly status: number, public readonly details?: unknown) {
+      super(message);
+    }
+  },
   api: { delete: deleteMock, get: getMock, patch: patchMock, post: postMock },
   remoteEnabled: true,
 }));
 
+const currentUser = {
+  id: "user-employee",
+  name: "Текущий Сотрудник",
+  initials: "ТС",
+  tone: "violet" as const,
+};
+
 vi.mock("../state/crm-store", () => ({
   CrmProvider: ({ children }: PropsWithChildren) => children,
-  useCrm: () => ({ deals: [{ id: "deal-1", title: "Тестовая сделка" }] }),
+  useCrm: () => ({ currentUser, deals: [{ id: "deal-1", title: "Тестовая сделка" }], isEmployee: permissionState.isEmployee }),
 }));
 
 const assignee: ApiUser = {
@@ -30,6 +43,7 @@ const assignee: ApiUser = {
   email: "owner@example.com",
   full_name: "Тестовый Пользователь",
   role: "owner",
+  version: 1,
 };
 
 function task(
@@ -78,11 +92,13 @@ function renderPage(initialEntry = "/tasks") {
 let deletedTaskIds = new Set<string>();
 
 beforeEach(() => {
+  permissionState.isEmployee = false;
   deletedTaskIds = new Set<string>();
   deleteMock.mockReset();
   getMock.mockReset();
   patchMock.mockReset();
   postMock.mockReset();
+  postMock.mockResolvedValue(task("task-created", "Новая задача", "open", "deal-1", { assignee_id: currentUser.id }));
   deleteMock.mockImplementation((path: string) => {
     const taskId = path.match(/^\/tasks\/([^?]+)/)?.[1];
     if (taskId) deletedTaskIds.add(taskId);
@@ -146,7 +162,10 @@ describe("TasksPage", () => {
 
     const dialog = await screen.findByRole("dialog", { name: "Редактировать задачу" });
     expect(within(dialog).getByRole("textbox", { name: "Название" })).toHaveValue("Задача из уведомления");
-    expect(getMock).toHaveBeenCalledWith("/tasks/task-deep-link");
+    expect(getMock).toHaveBeenCalledWith(
+      "/tasks/task-deep-link",
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
 
     await user.click(within(dialog).getByRole("button", { name: "Закрыть" }));
     await waitFor(() => expect(screen.queryByRole("dialog", { name: "Редактировать задачу" })).not.toBeInTheDocument());
@@ -164,16 +183,17 @@ describe("TasksPage", () => {
     expect(await screen.findByText("Позвонить по повторному заказу")).toBeInTheDocument();
     expect(screen.queryByText("Отправить предложение")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Просрочено" })).toHaveAttribute("aria-pressed", "true");
-    expect(getMock).toHaveBeenCalledWith("/tasks?limit=25&scope=overdue");
+    expect(getMock).toHaveBeenCalledWith("/tasks?limit=25&scope=overdue", expect.objectContaining({ signal: expect.any(AbortSignal) }));
 
     await user.click(screen.getByRole("button", { name: "Показать закрытые" }));
     expect(await screen.findByText("Завершённый звонок")).toBeInTheDocument();
-    expect(getMock).toHaveBeenCalledWith("/tasks?limit=25&scope=overdue&include_completed=true");
+    expect(getMock).toHaveBeenCalledWith("/tasks?limit=25&scope=overdue&include_completed=true", expect.objectContaining({ signal: expect.any(AbortSignal) }));
 
     await user.type(screen.getByPlaceholderText("Поиск по задачам"), "звонок");
     await waitFor(() => {
       expect(getMock).toHaveBeenCalledWith(
         `/tasks?limit=25&scope=overdue&include_completed=true&search=${encodeURIComponent("звонок")}`,
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
       );
     });
   });
@@ -183,18 +203,18 @@ describe("TasksPage", () => {
     renderPage();
 
     expect(await screen.findByText("Отправить предложение")).toBeInTheDocument();
-    expect(getMock).toHaveBeenCalledWith("/tasks?limit=25");
+    expect(getMock).toHaveBeenCalledWith("/tasks?limit=25", expect.objectContaining({ signal: expect.any(AbortSignal) }));
     await user.click(screen.getByRole("button", { name: "Следующая страница" }));
 
     expect(await screen.findByText("Вторая страница")).toBeInTheDocument();
     expect(screen.getByText("Страница 2")).toBeInTheDocument();
-    expect(getMock).toHaveBeenCalledWith("/tasks?limit=25&cursor=tasks-page-2");
+    expect(getMock).toHaveBeenCalledWith("/tasks?limit=25&cursor=tasks-page-2", expect.objectContaining({ signal: expect.any(AbortSignal) }));
 
     await user.click(screen.getByRole("button", { name: "Показать закрытые" }));
 
     expect(await screen.findByText("Завершённая задача")).toBeInTheDocument();
     expect(screen.getByText(/Страница 1 ·/)).toBeInTheDocument();
-    expect(getMock).toHaveBeenCalledWith("/tasks?limit=25&include_completed=true");
+    expect(getMock).toHaveBeenCalledWith("/tasks?limit=25&include_completed=true", expect.objectContaining({ signal: expect.any(AbortSignal) }));
     expect(screen.getByRole("button", { name: "Скрыть закрытые" })).toHaveAttribute("aria-pressed", "true");
 
     await user.click(screen.getByRole("button", { name: "Скрыть закрытые" }));
@@ -211,6 +231,77 @@ describe("TasksPage", () => {
     expect(await screen.findByRole("dialog", { name: "Новая задача" })).toBeInTheDocument();
   });
 
+  it("locks employee assignment to the current user and hides task deletion", async () => {
+    permissionState.isEmployee = true;
+    const user = userEvent.setup();
+    renderPage();
+
+    await screen.findByText("Отправить предложение");
+    expect(screen.queryByRole("button", { name: "Удалить задачу «Отправить предложение»" })).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Добавить задачу" }));
+    const createDialog = await screen.findByRole("dialog", { name: "Новая задача" });
+    expect(within(createDialog).queryByRole("combobox", { name: "Исполнитель" })).not.toBeInTheDocument();
+    expect(within(createDialog).getByLabelText("Исполнитель")).toHaveTextContent(currentUser.name);
+    await user.type(within(createDialog).getByRole("textbox", { name: "Название" }), "Позвонить клиенту");
+    await user.type(within(createDialog).getByLabelText("Срок"), "2030-09-01T12:30");
+    await user.click(within(createDialog).getByRole("button", { name: "Создать задачу" }));
+
+    await waitFor(() => expect(postMock).toHaveBeenCalledWith("/tasks", expect.objectContaining({
+      assignee_id: currentUser.id,
+      title: "Позвонить клиенту",
+    })));
+  });
+
+  it("omits redacted relations when an employee edits task fields", async () => {
+    permissionState.isEmployee = true;
+    const user = userEvent.setup();
+    renderPage();
+
+    await user.click(await screen.findByRole("button", { name: "Открыть задачу «Отправить предложение»" }));
+    const dialog = await screen.findByRole("dialog", { name: "Редактировать задачу" });
+    expect(within(dialog).queryByRole("combobox", { name: "Сделка" })).not.toBeInTheDocument();
+    const title = within(dialog).getByRole("textbox", { name: "Название" });
+    await user.clear(title);
+    await user.type(title, "Уточнить предложение");
+    await user.click(within(dialog).getByRole("button", { name: "Сохранить" }));
+
+    await waitFor(() => expect(patchMock).toHaveBeenCalledWith(
+      "/tasks/task-1",
+      expect.objectContaining({ expected_version: 1, title: "Уточнить предложение" }),
+    ));
+    const payload = patchMock.mock.calls[0][1] as Record<string, unknown>;
+    expect(payload).not.toHaveProperty("assignee_id");
+    expect(payload).not.toHaveProperty("deal_id");
+    expect(payload).not.toHaveProperty("contact_id");
+    expect(payload).not.toHaveProperty("company_id");
+  });
+
+  it("fails closed immediately for an open employee task while the refreshed list is pending", async () => {
+    permissionState.isEmployee = true;
+    let listRequests = 0;
+    const pendingRefresh = new Promise<CursorPage<ApiTask>>(() => undefined);
+    getMock.mockImplementation((path: string) => {
+      if (path === "/users") return Promise.resolve([assignee]);
+      if (path.startsWith("/tasks?")) {
+        listRequests += 1;
+        return listRequests === 1
+          ? Promise.resolve({ items: [task("task-1", "Отправить предложение", "open", "deal-1")], next_cursor: null })
+          : pendingRefresh;
+      }
+      return Promise.reject(new Error(`Unexpected GET ${path}`));
+    });
+    const { queryClient } = renderPage("/tasks?task=task-1&view=compact");
+    expect(await screen.findByRole("dialog", { name: "Редактировать задачу" })).toBeInTheDocument();
+
+    act(() => window.dispatchEvent(new Event("pulse:access-changed")));
+
+    expect(screen.queryByRole("dialog", { name: "Редактировать задачу" })).not.toBeInTheDocument();
+    expect(screen.queryByText("Отправить предложение")).not.toBeInTheDocument();
+    await waitFor(() => expect(screen.getByRole("status", { name: "Текущий адрес" })).toHaveTextContent("/tasks?view=compact"));
+    expect(listRequests).toBe(2);
+    expect(queryClient.getQueryData(["tasks", "detail", "task-1"])).toBeUndefined();
+  });
+
   it("edits a task and refreshes task consumers", async () => {
     const user = userEvent.setup();
     const refreshListener = vi.fn();
@@ -218,7 +309,7 @@ describe("TasksPage", () => {
     renderPage();
 
     await screen.findByText("Отправить предложение");
-    await user.click(screen.getByRole("button", { name: "Редактировать задачу «Отправить предложение»" }));
+    await user.click(screen.getByRole("button", { name: "Открыть задачу «Отправить предложение»" }));
 
     const dialog = await screen.findByRole("dialog", { name: "Редактировать задачу" });
     const title = within(dialog).getByRole("textbox", { name: "Название" });
@@ -265,7 +356,7 @@ describe("TasksPage", () => {
     const { queryClient } = renderPage();
 
     await screen.findByText("Автоматическая задача");
-    await user.click(screen.getByRole("button", { name: "Редактировать задачу «Автоматическая задача»" }));
+    await user.click(screen.getByRole("button", { name: "Открыть задачу «Автоматическая задача»" }));
     const dialog = await screen.findByRole("dialog", { name: "Редактировать задачу" });
     expect(within(dialog).getByRole("combobox", { name: "Тип" })).toHaveValue("next_purchase");
     expect(within(dialog).getByRole("combobox", { name: "Сделка" })).toHaveValue("deal-outside-current-pipeline");
@@ -285,6 +376,21 @@ describe("TasksPage", () => {
         deal_id: "deal-outside-current-pipeline",
       }),
     ));
+  });
+
+  it("opens the task from the row and navigates to its linked deal from a separate link", async () => {
+    const user = userEvent.setup();
+    renderPage();
+
+    const row = await screen.findByRole("button", { name: "Открыть задачу «Отправить предложение»" });
+    expect(screen.queryByRole("button", { name: "Редактировать задачу «Отправить предложение»" })).not.toBeInTheDocument();
+    await user.click(row);
+    expect(await screen.findByRole("dialog", { name: "Редактировать задачу" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Закрыть" }));
+
+    await user.click(screen.getByRole("link", { name: "Открыть сделку для задачи «Отправить предложение»" }));
+    expect(screen.getByRole("status", { name: "Текущий адрес" })).toHaveTextContent("/deals?deal=deal-1");
+    expect(screen.queryByRole("dialog", { name: "Редактировать задачу" })).not.toBeInTheDocument();
   });
 
   it("requires confirmation before deleting and removes the task from the query", async () => {

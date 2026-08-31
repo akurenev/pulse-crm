@@ -30,6 +30,8 @@ from app.services.jobs import SessionFactory
 MAX_ACTIVE_SUBSCRIPTIONS_PER_USER = 10
 MAX_WEB_PUSH_PAYLOAD_BYTES = 3_000
 DEFAULT_WEB_PUSH_URL = "/"
+TEST_PUSH_SUBJECT = "Pulse CRM"
+TEST_PUSH_BODY = "Тестовое push-уведомление. Уведомления настроены правильно."
 
 
 class WebPushDeliveryError(RuntimeError):
@@ -64,6 +66,37 @@ class _NoRedirectSession:
     def post(self, *args: Any, **kwargs: Any) -> Any:
         kwargs["allow_redirects"] = False
         return self._session.post(*args, **kwargs)
+
+
+def is_trusted_test_push_delivery(delivery: NotificationDelivery) -> bool:
+    """Recognize only the targetless delivery produced by ``POST /push/test``.
+
+    Targetless employee deliveries are otherwise denied by the runtime.  The
+    complete shape is checked so a generic notification rule cannot acquire
+    the test endpoint's narrow exception merely by choosing a similar key.
+    """
+
+    if delivery.recipient_id is None:
+        return False
+    prefix = (
+        f"web-push:test:{delivery.workspace_id}:{delivery.recipient_id}:"
+    )
+    bucket = delivery.dedupe_key.removeprefix(prefix)
+    return bool(
+        delivery.audience is NotificationAudience.employee
+        and delivery.channel == "web_push"
+        and delivery.rule_id is None
+        and delivery.template_id is None
+        and delivery.recipient_address == str(delivery.recipient_id)
+        and delivery.subject == TEST_PUSH_SUBJECT
+        and delivery.body == TEST_PUSH_BODY
+        and delivery.target_entity_type is None
+        and delivery.target_entity_id is None
+        and delivery.dedupe_key.startswith(prefix)
+        and bucket
+        and bucket.isascii()
+        and bucket.isdecimal()
+    )
 
 
 def _as_utc(value: datetime) -> datetime:
@@ -647,6 +680,8 @@ __all__ = [
     "MAX_WEB_PUSH_PAYLOAD_BYTES",
     "QueuedWebPushDelivery",
     "DEFAULT_WEB_PUSH_URL",
+    "TEST_PUSH_BODY",
+    "TEST_PUSH_SUBJECT",
     "WebPushDeliveryError",
     "WebPushDeliverySender",
     "WebPushSender",
@@ -655,6 +690,7 @@ __all__ = [
     "endpoint_hash",
     "enqueue_web_push_delivery",
     "has_active_subscription",
+    "is_trusted_test_push_delivery",
     "mirror_delivered_in_app_notification",
     "register_subscription",
     "subscription_aad",

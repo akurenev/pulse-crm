@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import uuid
 from collections.abc import Mapping
@@ -8,9 +9,9 @@ from typing import Any
 
 import pytest
 import sqlalchemy as sa
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.db import SessionLocal
+from app.db import SessionLocal, engine
 from app.integrations.channels.base import (
     AdapterHealth,
     AttachmentReference,
@@ -19,7 +20,11 @@ from app.integrations.channels.base import (
     OutboundMessage,
     SendResult,
 )
-from app.integrations.inbound import process_form_submission, process_inbound_event
+from app.integrations.inbound import (
+    InboundRoutingError,
+    process_form_submission,
+    process_inbound_event,
+)
 from app.integrations.models import (
     Attachment,
     ChannelConnection,
@@ -57,7 +62,7 @@ from app.integrations.runtime import (
 )
 from app.integrations.s3 import AttachmentStorage
 from app.integrations.secrets import SecretCipher
-from app.integrations.web_push import register_subscription
+from app.integrations.web_push import TEST_PUSH_BODY, TEST_PUSH_SUBJECT, register_subscription
 from app.models import (
     ActivityEvent,
     BackgroundJob,
@@ -65,11 +70,14 @@ from app.models import (
     Deal,
     DealContact,
     DeliveryStatus,
+    Membership,
     OutboxEvent,
     RealtimeEvent,
+    Role,
     Source,
     Task,
     TaskStatus,
+    User,
     Workspace,
 )
 from app.services.jobs import ClaimedJob
@@ -504,6 +512,200 @@ async def test_static_notification_expansion_materializes_tenant_owned_target(
 
 
 @pytest.mark.asyncio
+async def test_static_notification_skips_foreign_target_for_restricted_employee(
+    db: AsyncSession,
+    integration_domain: dict[str, Any],
+) -> None:
+    workspace = integration_domain["workspace"]
+    user = integration_domain["user"]
+    deal = integration_domain["deal"]
+    membership = await db.scalar(
+        sa.select(Membership).where(
+            Membership.workspace_id == workspace.id,
+            Membership.user_id == user.id,
+        )
+    )
+    assert membership is not None
+    membership.role = Role.employee
+    other_user = User(
+        email="other-assignee@example.com",
+        full_name="Other Assignee",
+        password_hash="not-used-in-service-tests",
+    )
+    db.add(other_user)
+    await db.flush()
+    deal.assignee_id = other_user.id
+
+    template = NotificationTemplate(
+        workspace_id=workspace.id,
+        name="Restricted employee target",
+        channel="in_app",
+        subject_template="CRM event",
+        body_template="Open {entity_id}",
+        is_active=True,
+    )
+    db.add(template)
+    await db.flush()
+    rule = NotificationRule(
+        workspace_id=workspace.id,
+        template_id=template.id,
+        name="Restricted employee target rule",
+        event_type="deal.stage_changed",
+        audience=NotificationAudience.employee,
+        channel="in_app",
+        recipients=[{"address": str(user.id), "recipient_id": str(user.id)}],
+        delay_seconds=0,
+        require_client_consent=False,
+        is_enabled=True,
+    )
+    event = OutboxEvent(
+        workspace_id=workspace.id,
+        event_type="deal.stage_changed",
+        aggregate_type="deal",
+        aggregate_id=deal.id,
+        payload={},
+        available_at=FIXED_NOW,
+    )
+    db.add_all([rule, event])
+    await db.commit()
+
+    handlers = RuntimeHandlers(session_factory=SessionLocal, now=lambda: FIXED_NOW)
+    await handlers.expand_notification(
+        claimed_job(
+            JOB_NOTIFICATION_EXPAND,
+            {"outbox_event_id": str(event.id)},
+            workspace_id=workspace.id,
+        )
+    )
+
+    delivery = await db.scalar(
+        sa.select(NotificationDelivery).where(
+            NotificationDelivery.workspace_id == workspace.id,
+            NotificationDelivery.dedupe_key.like(f"%:event:{event.id}:recipient:%"),
+        )
+    )
+    assert delivery is None
+
+
+@pytest.mark.asyncio
+async def test_static_notification_scrubs_secondary_ids_before_manager_is_demoted(
+    db: AsyncSession,
+    integration_domain: dict[str, Any],
+) -> None:
+    workspace = integration_domain["workspace"]
+    user = integration_domain["user"]
+    membership = await db.scalar(
+        sa.select(Membership).where(
+            Membership.workspace_id == workspace.id,
+            Membership.user_id == user.id,
+        )
+    )
+    assert membership is not None
+    assert membership.role is Role.owner
+    other_user = User(
+        email="secondary-owner@example.com",
+        full_name="Secondary Owner",
+        password_hash="not-used-in-service-tests",
+    )
+    db.add(other_user)
+    await db.flush()
+    foreign_deal = Deal(
+        workspace_id=workspace.id,
+        pipeline_id=integration_domain["pipeline"].id,
+        stage_id=integration_domain["stage"].id,
+        assignee_id=other_user.id,
+        title="Inaccessible linked deal",
+    )
+    db.add(foreign_deal)
+    await db.flush()
+    own_task = Task(
+        workspace_id=workspace.id,
+        title="Own task with inaccessible references",
+        status=TaskStatus.open,
+        due_at=FIXED_NOW + timedelta(hours=1),
+        assignee_id=user.id,
+        deal_id=foreign_deal.id,
+    )
+    db.add(own_task)
+    await db.flush()
+    foreign_contact_id = uuid.uuid4()
+    foreign_conversation_id = uuid.uuid4()
+    template = NotificationTemplate(
+        workspace_id=workspace.id,
+        name="Restricted variables",
+        channel="in_app",
+        body_template=(
+            "task={task_id}; deal={deal_id}; contact={contact_id}; "
+            "conversation={conversation_id}; entity={entity_id}"
+        ),
+        is_active=True,
+    )
+    db.add(template)
+    await db.flush()
+    rule = NotificationRule(
+        workspace_id=workspace.id,
+        template_id=template.id,
+        name="Restricted variables rule",
+        event_type="task.due_soon",
+        audience=NotificationAudience.employee,
+        channel="in_app",
+        recipients=[{"address": str(user.id), "recipient_id": str(user.id)}],
+        delay_seconds=0,
+        require_client_consent=False,
+        is_enabled=True,
+    )
+    event = OutboxEvent(
+        workspace_id=workspace.id,
+        event_type="task.due_soon",
+        aggregate_type="task",
+        aggregate_id=own_task.id,
+        payload={
+            "task_id": str(own_task.id),
+            "deal_id": str(foreign_deal.id),
+            "contact_id": str(foreign_contact_id),
+            "conversation_id": str(foreign_conversation_id),
+        },
+        available_at=FIXED_NOW,
+    )
+    db.add_all([rule, event])
+    await db.commit()
+
+    handlers = RuntimeHandlers(session_factory=SessionLocal, now=lambda: FIXED_NOW)
+    await handlers.expand_notification(
+        claimed_job(
+            JOB_NOTIFICATION_EXPAND,
+            {"outbox_event_id": str(event.id)},
+            workspace_id=workspace.id,
+        )
+    )
+
+    delivery = await db.scalar(
+        sa.select(NotificationDelivery).where(
+            NotificationDelivery.workspace_id == workspace.id,
+            NotificationDelivery.dedupe_key.like(f"%:event:{event.id}:recipient:%"),
+        )
+    )
+    assert delivery is not None
+    assert str(own_task.id) in delivery.body
+    assert str(foreign_deal.id) not in delivery.body
+    assert str(foreign_contact_id) not in delivery.body
+    assert str(foreign_conversation_id) not in delivery.body
+
+    membership.role = Role.employee
+    await db.commit()
+    await handlers.deliver_notification(
+        claimed_job(
+            "notification.deliver",
+            {"notification_delivery_id": str(delivery.id)},
+            workspace_id=workspace.id,
+        )
+    )
+    await db.refresh(delivery)
+    assert delivery.status is DeliveryStatus.delivered
+    assert str(foreign_deal.id) not in delivery.body
+
+
+@pytest.mark.asyncio
 async def test_runtime_rejects_cross_workspace_claim_before_domain_mutation(
     db: AsyncSession,
     integration_domain: dict[str, Any],
@@ -583,6 +785,10 @@ async def test_provider_inbound_reuses_conversation_and_deduplicates_message(
     original_conversation_id = conversation.id
     original_contact_id = conversation.contact_id
     original_deal_id = conversation.deal_id
+    assert original_contact_id is not None
+    routed_contact = await db.get(Contact, original_contact_id)
+    assert routed_contact is not None
+    assert routed_contact.assignee_id == integration_domain["user"].id
 
     second = inbound_event(
         integration_domain,
@@ -643,6 +849,35 @@ async def test_provider_inbound_reuses_conversation_and_deduplicates_message(
     routed_deal = await db.get(Deal, original_deal_id)
     assert routed_deal is not None
     assert routed_deal.source_id == integration_domain["source"].id
+
+
+@pytest.mark.asyncio
+async def test_provider_inbound_rejects_inactive_default_assignee(
+    db: AsyncSession,
+    integration_domain: dict[str, Any],
+) -> None:
+    connection = channel_connection(integration_domain)
+    db.add(connection)
+    await db.flush()
+    integration_domain["user"].is_active = False
+    event = inbound_event(
+        integration_domain,
+        connection,
+        event_id="inactive-route-event",
+        message_id="inactive-route-message",
+        text="Не должно быть маршрутизировано",
+    )
+    db.add(event)
+    await db.flush()
+
+    with pytest.raises(InboundRoutingError, match="active workspace member"):
+        await process_inbound_event(db, event, adapter_factory=lambda _: RecordingAdapter())
+
+    assert await db.scalar(
+        sa.select(sa.func.count(Conversation.id)).where(
+            Conversation.channel_connection_id == connection.id
+        )
+    ) == 0
 
 
 @pytest.mark.asyncio
@@ -757,6 +992,9 @@ async def test_generic_and_form_submissions_create_contacts_deals_and_timeline_e
     assert {contact.primary_email for contact in contacts} == {
         "ivan@example.com",
         "maria@example.com",
+    }
+    assert {contact.assignee_id for contact in contacts} == {
+        integration_domain["user"].id
     }
     assert {deal.title for deal in deals} == {"Webhook deal", "Form deal"}
     assert {event.event_type for event in routed_events} == {
@@ -1230,3 +1468,233 @@ async def test_runtime_routes_web_push_delivery_through_dedicated_sender(
     assert sent == [delivery.id]
     assert delivery.status is DeliveryStatus.delivered
     assert delivery.provider_message_id == "web-push-provider"
+
+
+@pytest.mark.asyncio
+async def test_restricted_employee_delivery_requires_owned_target_or_exact_test_push(
+    db: AsyncSession,
+    integration_domain: dict[str, Any],
+) -> None:
+    runtime_now = FIXED_NOW.replace(tzinfo=None)
+    workspace = integration_domain["workspace"]
+    user = integration_domain["user"]
+    membership = await db.scalar(
+        sa.select(Membership).where(
+            Membership.workspace_id == workspace.id,
+            Membership.user_id == user.id,
+        )
+    )
+    assert membership is not None
+    membership.role = Role.employee
+    own_task = Task(
+        workspace_id=workspace.id,
+        title="Owned notification task",
+        status=TaskStatus.open,
+        due_at=FIXED_NOW + timedelta(hours=1),
+        assignee_id=user.id,
+    )
+    db.add(own_task)
+    await db.flush()
+    generic = NotificationDelivery(
+        workspace_id=workspace.id,
+        audience=NotificationAudience.employee,
+        channel="web_push",
+        recipient_id=user.id,
+        recipient_address=str(user.id),
+        subject="Generic",
+        body="Targetless",
+        status=DeliveryStatus.pending,
+        dedupe_key="runtime-employee-targetless",
+        scheduled_at=runtime_now - timedelta(minutes=1),
+    )
+    exact_test = NotificationDelivery(
+        workspace_id=workspace.id,
+        audience=NotificationAudience.employee,
+        channel="web_push",
+        recipient_id=user.id,
+        recipient_address=str(user.id),
+        subject=TEST_PUSH_SUBJECT,
+        body=TEST_PUSH_BODY,
+        status=DeliveryStatus.pending,
+        dedupe_key=f"web-push:test:{workspace.id}:{user.id}:12345",
+        scheduled_at=runtime_now - timedelta(minutes=1),
+    )
+    owned = NotificationDelivery(
+        workspace_id=workspace.id,
+        audience=NotificationAudience.employee,
+        channel="web_push",
+        recipient_id=user.id,
+        recipient_address=str(user.id),
+        subject="Owned deal",
+        body="Open it",
+        target_entity_type="deal",
+        target_entity_id=integration_domain["deal"].id,
+        status=DeliveryStatus.pending,
+        dedupe_key="runtime-employee-owned",
+        scheduled_at=runtime_now - timedelta(minutes=1),
+    )
+    owned_task = NotificationDelivery(
+        workspace_id=workspace.id,
+        audience=NotificationAudience.employee,
+        channel="web_push",
+        recipient_id=user.id,
+        recipient_address=str(user.id),
+        subject="Owned task",
+        body="Open it",
+        target_entity_type="task",
+        target_entity_id=own_task.id,
+        status=DeliveryStatus.pending,
+        dedupe_key="runtime-employee-owned-task",
+        scheduled_at=runtime_now - timedelta(minutes=1),
+    )
+    external = NotificationDelivery(
+        workspace_id=workspace.id,
+        audience=NotificationAudience.employee,
+        channel="email",
+        recipient_id=user.id,
+        recipient_address="unverified-recipient@example.com",
+        subject="Spoofed",
+        body="Do not send",
+        target_entity_type="deal",
+        target_entity_id=integration_domain["deal"].id,
+        status=DeliveryStatus.pending,
+        dedupe_key="runtime-employee-external",
+        scheduled_at=runtime_now - timedelta(minutes=1),
+    )
+    db.add_all([generic, exact_test, owned, owned_task, external])
+    await db.commit()
+    pushed: list[uuid.UUID] = []
+    adapter = RecordingAdapter()
+
+    async def send_web_push(item: NotificationDelivery) -> SendResult:
+        pushed.append(item.id)
+        return SendResult(provider_message_id=f"push:{item.id}", sent_at=runtime_now)
+
+    handlers = RuntimeHandlers(
+        session_factory=SessionLocal,
+        notification_adapter_factory=lambda _workspace_id, _channel: adapter,
+        web_push_sender=send_web_push,
+        now=lambda: runtime_now,
+    )
+    for delivery in (generic, exact_test, owned, owned_task, external):
+        await handlers.deliver_notification(
+            claimed_job(
+                "notification.deliver",
+                {"notification_delivery_id": str(delivery.id)},
+                workspace_id=workspace.id,
+            )
+        )
+
+    for delivery in (generic, exact_test, owned, owned_task, external):
+        await db.refresh(delivery)
+    assert generic.status is DeliveryStatus.failed
+    assert external.status is DeliveryStatus.failed
+    assert exact_test.status is DeliveryStatus.delivered
+    assert owned.status is DeliveryStatus.delivered
+    assert owned_task.status is DeliveryStatus.delivered
+    assert pushed == [exact_test.id, owned.id, owned_task.id]
+    assert adapter.sent == []
+
+
+@pytest.mark.asyncio
+async def test_restricted_employee_rechecks_ownership_after_delivery_has_started(
+    db: AsyncSession,
+    integration_domain: dict[str, Any],
+) -> None:
+    runtime_now = FIXED_NOW.replace(tzinfo=None)
+    workspace = integration_domain["workspace"]
+    user = integration_domain["user"]
+    deal = integration_domain["deal"]
+    membership = await db.scalar(
+        sa.select(Membership).where(
+            Membership.workspace_id == workspace.id,
+            Membership.user_id == user.id,
+        )
+    )
+    assert membership is not None
+    membership.role = Role.employee
+    other_user = User(
+        email="race-assignee@example.com",
+        full_name="Race Assignee",
+        password_hash="not-used-in-service-tests",
+    )
+    db.add(other_user)
+    await db.flush()
+    delivery = NotificationDelivery(
+        workspace_id=workspace.id,
+        audience=NotificationAudience.employee,
+        channel="web_push",
+        recipient_id=user.id,
+        recipient_address=str(user.id),
+        subject="Race",
+        body="Must not leak",
+        target_entity_type="deal",
+        target_entity_id=deal.id,
+        status=DeliveryStatus.pending,
+        dedupe_key="runtime-employee-race",
+        scheduled_at=runtime_now - timedelta(minutes=1),
+    )
+    db.add(delivery)
+    await db.commit()
+
+    target_check_reached = asyncio.Event()
+    continue_target_check = asyncio.Event()
+
+    class TargetBarrierSession(AsyncSession):
+        async def scalar(self, statement: Any, *args: Any, **kwargs: Any) -> Any:
+            descriptions = getattr(statement, "column_descriptions", ())
+            checks_deal = any(
+                item.get("entity") is Deal
+                for item in descriptions
+                if isinstance(item, dict)
+            )
+            if checks_deal and not target_check_reached.is_set():
+                target_check_reached.set()
+                await continue_target_check.wait()
+            return await super().scalar(statement, *args, **kwargs)
+
+    barrier_sessions = async_sessionmaker(
+        engine,
+        class_=TargetBarrierSession,
+        expire_on_commit=False,
+        autoflush=False,
+    )
+    pushed: list[uuid.UUID] = []
+
+    async def send_web_push(item: NotificationDelivery) -> SendResult:
+        pushed.append(item.id)
+        return SendResult(provider_message_id="unexpected", sent_at=runtime_now)
+
+    handlers = RuntimeHandlers(
+        session_factory=barrier_sessions,
+        web_push_sender=send_web_push,
+        now=lambda: runtime_now,
+    )
+    delivery_task = asyncio.create_task(
+        handlers.deliver_notification(
+            claimed_job(
+                "notification.deliver",
+                {"notification_delivery_id": str(delivery.id)},
+                workspace_id=workspace.id,
+            )
+        )
+    )
+    try:
+        await asyncio.wait_for(target_check_reached.wait(), timeout=2)
+        async with SessionLocal() as reassignment_session:
+            async with reassignment_session.begin():
+                reassigned = await reassignment_session.get(Deal, deal.id)
+                assert reassigned is not None
+                reassigned.assignee_id = other_user.id
+        continue_target_check.set()
+        await asyncio.wait_for(delivery_task, timeout=2)
+    finally:
+        continue_target_check.set()
+        if not delivery_task.done():
+            delivery_task.cancel()
+
+    await db.refresh(delivery)
+    assert pushed == []
+    assert delivery.status is DeliveryStatus.failed
+    assert delivery.last_error is not None
+    assert "suppressed" in delivery.last_error

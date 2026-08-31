@@ -26,6 +26,8 @@ interface NewDealInput {
 }
 
 interface CrmStore {
+  currentUser: UserSummary;
+  isEmployee: boolean;
   deals: Deal[];
   pipeline: Pipeline;
   pipelines: Pipeline[];
@@ -175,7 +177,13 @@ function mapRemoteTasks(tasks: ApiTask[], loadedUsers: ApiUser[]): Deal["tasks"]
   }));
 }
 
-export function CrmProvider({ children }: PropsWithChildren) {
+interface CrmProviderProps extends PropsWithChildren {
+  currentUser?: UserSummary;
+  userRole?: ApiUser["role"];
+}
+
+export function CrmProvider({ children, currentUser = demoUsers.ak, userRole = "owner" }: CrmProviderProps) {
+  const isEmployee = userRole === "employee";
   const [deals, setDeals] = useState<Deal[]>(() => remoteEnabled ? [] : initialDeals);
   const [pipeline, setPipeline] = useState<Pipeline>(demoPipeline);
   const [pipelines, setPipelines] = useState<Pipeline[]>(() => remoteEnabled ? [] : [demoPipeline]);
@@ -203,6 +211,7 @@ export function CrmProvider({ children }: PropsWithChildren) {
   const activePipelineId = useRef(remoteEnabled ? "" : demoPipeline.id);
   const activeDealSearch = useRef("");
   const dealRequestGeneration = useRef(0);
+  const taskRequestGeneration = useRef(0);
   const requestedFinalStageIds = useRef(new Set<string>());
   const tasksByDealRef = useRef(new Map<string, ApiTask[]>());
   const dealMutationLocksRef = useRef(new Set<string>());
@@ -238,7 +247,31 @@ export function CrmProvider({ children }: PropsWithChildren) {
 
   useEffect(() => {
     if (!remoteEnabled) return;
-    const refreshTasks = () => setTaskRefreshTick((value) => value + 1);
+    const purgeRevokedAccess = () => {
+      dealRequestGeneration.current += 1;
+      taskRequestGeneration.current += 1;
+      openDealGeneration.current += 1;
+      selectedDealIdRef.current = null;
+      tasksByDealRef.current.clear();
+      requestedFinalStageIds.current.clear();
+      setDeals([]);
+      setSelectedDealId(null);
+      setNextCursorByStage({});
+      setLoadedStageIds({});
+      setStageLoadErrorByStage({});
+      setLoadingStageId(null);
+      setLoading(true);
+    };
+    window.addEventListener("pulse:access-changed", purgeRevokedAccess);
+    return () => window.removeEventListener("pulse:access-changed", purgeRevokedAccess);
+  }, []);
+
+  useEffect(() => {
+    if (!remoteEnabled) return;
+    const refreshTasks = () => {
+      taskRequestGeneration.current += 1;
+      setTaskRefreshTick((value) => value + 1);
+    };
     window.addEventListener("pulse:tasks-refresh", refreshTasks);
     return () => window.removeEventListener("pulse:tasks-refresh", refreshTasks);
   }, []);
@@ -332,9 +365,10 @@ export function CrmProvider({ children }: PropsWithChildren) {
   useEffect(() => {
     if (!remoteEnabled || metadataRevision === 0) return;
     let active = true;
+    const generation = ++taskRequestGeneration.current;
     void api.get<CursorPage<ApiTask>>("/tasks?limit=100")
       .then((taskPage) => {
-        if (!active) return;
+        if (!active || generation !== taskRequestGeneration.current) return;
         const tasksByDeal = new Map<string, ApiTask[]>();
         for (const task of taskPage.items) {
           if (!task.deal_id) continue;
@@ -347,6 +381,7 @@ export function CrmProvider({ children }: PropsWithChildren) {
         })));
       })
       .catch((reason: unknown) => {
+        if (!active || generation !== taskRequestGeneration.current) return;
         console.error("Pulse CRM deal tasks bootstrap failed", reason);
       });
     return () => { active = false; };
@@ -360,8 +395,12 @@ export function CrmProvider({ children }: PropsWithChildren) {
     selectedDealId && pendingDealMutationIds.has(selectedDealId),
   );
   const dealAssignees = useMemo(
-    () => remoteEnabled ? users.map((user) => userSummary(user)) : Object.values(demoUsers),
-    [users],
+    () => isEmployee
+      ? [currentUser]
+      : remoteEnabled
+        ? users.map((user) => userSummary(user))
+        : Object.values(demoUsers),
+    [currentUser, isEmployee, users],
   );
 
   const removeDealLocally = useCallback((dealId: string) => {
@@ -493,7 +532,7 @@ export function CrmProvider({ children }: PropsWithChildren) {
     if (signal?.aborted) return;
     const generation = ++openDealGeneration.current;
     const existing = deals.find((deal) => deal.id === dealId);
-    if (existing) {
+    if (existing && (!remoteEnabled || !isEmployee)) {
       selectedDealIdRef.current = dealId;
       setSelectedDealId(dealId);
       return;
@@ -501,9 +540,15 @@ export function CrmProvider({ children }: PropsWithChildren) {
     if (!remoteEnabled) throw new ApiError("Сделка не найдена", 404);
 
     const path = `/deals/${encodeURIComponent(dealId)}`;
-    const persisted = signal
-      ? await api.get<ApiDeal>(path, { signal })
-      : await api.get<ApiDeal>(path);
+    let persisted: ApiDeal;
+    try {
+      persisted = signal
+        ? await api.get<ApiDeal>(path, { signal })
+        : await api.get<ApiDeal>(path);
+    } catch (reason) {
+      if (reason instanceof ApiError && reason.status === 404) removeDealLocally(dealId);
+      throw reason;
+    }
     if (signal?.aborted || generation !== openDealGeneration.current) return;
     const targetPipeline = pipelines.find((item) => item.id === persisted.pipeline_id);
     if (!targetPipeline) throw new Error("Воронка сделки недоступна");
@@ -536,7 +581,7 @@ export function CrmProvider({ children }: PropsWithChildren) {
     if (targetStage.stageType !== "open") requestedFinalStageIds.current.add(targetStage.id);
     selectedDealIdRef.current = dealId;
     setSelectedDealId(dealId);
-  }, [deals, pipelines, sources, users]);
+  }, [deals, isEmployee, pipelines, removeDealLocally, sources, users]);
 
   const loadStageDeals = useCallback(async (stageId: string) => {
     if (loadedStageIds[stageId] || loadingStageId) return;
@@ -761,7 +806,7 @@ export function CrmProvider({ children }: PropsWithChildren) {
       currency: "RUB",
       source: input.source,
       sourceLabel: sourceLabels[input.source],
-      assignee: initialDeals[3].assignee,
+      assignee: isEmployee ? currentUser : initialDeals[3].assignee,
       dueDate: new Date(Date.now() + 86_400_000).toISOString().slice(0, 10),
       stageId: pipeline.stages[0]?.id ?? demoPipeline.stages[0].id,
       status: "open",
@@ -774,7 +819,7 @@ export function CrmProvider({ children }: PropsWithChildren) {
     };
 
     setDeals((items) => [optimistic, ...items]);
-    openDealGeneration.current += 1;
+    const creationGeneration = ++openDealGeneration.current;
     selectedDealIdRef.current = optimistic.id;
     setSelectedDealId(optimistic.id);
 
@@ -793,19 +838,22 @@ export function CrmProvider({ children }: PropsWithChildren) {
         source_id: sourceId,
         tags: [],
         custom_fields: { subtitle: input.subtitle },
+        ...(isEmployee ? { assignee_id: currentUser.id } : {}),
       });
       const persisted = { ...optimistic, id: created.id, tags: created.tags, version: created.version };
+      if (creationGeneration !== openDealGeneration.current) return persisted;
       setDeals((items) => items.map((deal) => (deal.id === optimistic.id ? persisted : deal)));
       selectedDealIdRef.current = persisted.id;
       setSelectedDealId(persisted.id);
       return persisted;
     } catch (error) {
+      if (creationGeneration !== openDealGeneration.current) throw error;
       setDeals((items) => items.filter((deal) => deal.id !== optimistic.id));
       selectedDealIdRef.current = null;
       setSelectedDealId(null);
       throw error;
     }
-  }, [pipeline, sources]);
+  }, [currentUser, isEmployee, pipeline, sources]);
 
   const deleteDeal = useCallback(async (dealId: string) => {
     const current = deals.find((deal) => deal.id === dealId);
@@ -954,6 +1002,8 @@ export function CrmProvider({ children }: PropsWithChildren) {
 
   const value = useMemo<CrmStore>(
     () => ({
+      currentUser,
+      isEmployee,
       deals,
       pipeline,
       pipelines,
@@ -986,7 +1036,7 @@ export function CrmProvider({ children }: PropsWithChildren) {
       retryMessage,
       toggleTask,
     }),
-    [addDeal, dealAssignees, deals, deleteDeal, error, loadMoreDeals, loadStageDeals, loadedStageIds, loading, loadingStageId, moveDeal, nextCursorByStage, openDeal, pipeline, pipelines, retryMessage, selectDeal, selectPipeline, selectedDeal, selectedDealId, selectedDealMutationPending, sendMessage, setDealAssignee, setDealCompany, setDealContact, setDealCustomFields, setDealSearch, setDealTags, setNextPurchase, stageLoadErrorByStage, toggleTask],
+    [addDeal, currentUser, dealAssignees, deals, deleteDeal, error, isEmployee, loadMoreDeals, loadStageDeals, loadedStageIds, loading, loadingStageId, moveDeal, nextCursorByStage, openDeal, pipeline, pipelines, retryMessage, selectDeal, selectPipeline, selectedDeal, selectedDealId, selectedDealMutationPending, sendMessage, setDealAssignee, setDealCompany, setDealContact, setDealCustomFields, setDealSearch, setDealTags, setNextPurchase, stageLoadErrorByStage, toggleTask],
   );
 
   return <CrmContext.Provider value={value}>{children}</CrmContext.Provider>;

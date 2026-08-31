@@ -1,28 +1,54 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { ApiCompany, ApiContact, CursorPage } from "../types/api";
+import type { ApiCompany, ApiContact, ApiUser, CursorPage } from "../types/api";
 import ContactsPage from "./ContactsPage";
 
-const { deleteMock, getMock, patchMock, postMock } = vi.hoisted(() => ({
+const { deleteMock, getMock, patchMock, postMock, permissionState } = vi.hoisted(() => ({
   deleteMock: vi.fn(),
   getMock: vi.fn(),
   patchMock: vi.fn(),
   postMock: vi.fn(),
+  permissionState: { isEmployee: false },
 }));
 
 vi.mock("../lib/api", () => ({
+  ApiError: class ApiError extends Error {
+    constructor(message: string, public readonly status: number, public readonly details?: unknown) {
+      super(message);
+    }
+  },
   api: { delete: deleteMock, get: getMock, patch: patchMock, post: postMock },
   remoteEnabled: true,
 }));
 
-const contact = (id: string, firstName: string): ApiContact => ({
+const currentUser = {
+  id: "user-current",
+  name: "Текущий Сотрудник",
+  initials: "ТС",
+  tone: "violet" as const,
+};
+
+const responsibleUser: ApiUser = {
+  id: "user-responsible",
+  email: "responsible@example.com",
+  full_name: "Мария Ответственная",
+  role: "employee",
+  version: 1,
+};
+
+vi.mock("../state/crm-store", () => ({
+  useCrm: () => ({ currentUser, isEmployee: permissionState.isEmployee }),
+}));
+
+const contact = (id: string, firstName: string, assigneeId: string | null = null): ApiContact => ({
   id,
   first_name: firstName,
   last_name: "Контакт",
   company_id: null,
+  assignee_id: assigneeId,
   primary_email: `${id}@example.com`,
   primary_phone: "+7 000 000-00-00",
   emails: [],
@@ -49,11 +75,12 @@ const company = (id: string, name: string): ApiCompany => ({
 
 function renderPage() {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return render(
+  const rendered = render(
     <QueryClientProvider client={queryClient}>
       <ContactsPage />
     </QueryClientProvider>,
   );
+  return { ...rendered, queryClient };
 }
 
 function requestedPaths() {
@@ -61,11 +88,13 @@ function requestedPaths() {
 }
 
 beforeEach(() => {
+  permissionState.isEmployee = false;
   deleteMock.mockReset();
   getMock.mockReset();
   patchMock.mockReset();
   postMock.mockReset();
   getMock.mockImplementation((path: string) => {
+    if (path === "/users") return Promise.resolve([responsibleUser]);
     const [pathname, query = ""] = path.split("?");
     const params = new URLSearchParams(query);
     const search = params.get("search");
@@ -135,6 +164,7 @@ describe("ContactsPage pagination", () => {
     const user = userEvent.setup();
     let contactAttempts = 0;
     getMock.mockImplementation((path: string) => {
+      if (path === "/users") return Promise.resolve([responsibleUser]);
       if (path.startsWith("/contacts?")) {
         contactAttempts += 1;
         if (contactAttempts === 1) return Promise.reject(new TypeError("Network request failed"));
@@ -162,6 +192,19 @@ describe("ContactsPage pagination", () => {
 
     const dialog = await screen.findByRole("dialog", { name: "Новый контакт" });
     expect(dialog).toHaveAttribute("id", "new-client-dialog");
+    expect(within(dialog).getByRole("combobox", { name: "Ответственный" })).toHaveValue(currentUser.id);
+  });
+
+  it("maps the contact assignee returned by the API through workspace users", async () => {
+    const assignedContact = contact("contact-assigned", "Назначенный", responsibleUser.id);
+    getMock.mockImplementation((path: string) => {
+      if (path === "/users") return Promise.resolve([responsibleUser]);
+      if (path.startsWith("/contacts?")) return Promise.resolve({ items: [assignedContact], next_cursor: null });
+      return Promise.resolve({ items: [], next_cursor: null });
+    });
+    renderPage();
+
+    expect(await screen.findByText("Мария Ответственная")).toBeInTheDocument();
   });
 });
 
@@ -170,6 +213,7 @@ describe("ContactsPage contact management", () => {
     const user = userEvent.setup();
     let storedContact = contact("contact-edit", "Анна");
     getMock.mockImplementation((path: string) => {
+      if (path === "/users") return Promise.resolve([responsibleUser]);
       const pathname = path.split("?")[0];
       if (pathname === "/contacts") return Promise.resolve({ items: [storedContact], next_cursor: null });
       if (pathname === "/activity" || pathname.endsWith("/purchases")) return Promise.resolve({ items: [], next_cursor: null });
@@ -199,6 +243,7 @@ describe("ContactsPage contact management", () => {
     const email = within(detail).getByLabelText("Email");
     const phone = within(detail).getByLabelText("Телефон");
     const tags = within(detail).getByLabelText("Теги");
+    const assigneeSelect = within(detail).getByRole("combobox", { name: "Ответственный" });
     await user.clear(firstName);
     await user.type(firstName, "Мария");
     await user.clear(lastName);
@@ -208,6 +253,7 @@ describe("ContactsPage contact management", () => {
     await user.clear(phone);
     await user.type(phone, "+7 999 123-45-67");
     await user.type(tags, " VIP, Партнёр, vip ");
+    await user.selectOptions(assigneeSelect, responsibleUser.id);
     await user.click(within(detail).getByRole("button", { name: "Сохранить" }));
 
     await waitFor(() => expect(patchMock).toHaveBeenCalledWith("/contacts/contact-edit", {
@@ -219,6 +265,7 @@ describe("ContactsPage contact management", () => {
       emails: ["maria@example.com"],
       phones: ["+7 999 123-45-67"],
       tags: ["VIP", "Партнёр"],
+      assignee_id: responsibleUser.id,
     }));
     expect(await within(detail).findByRole("heading", { name: "Мария Новая" })).toBeInTheDocument();
     expect(screen.getByText("Контакт обновлён")).toBeInTheDocument();
@@ -226,11 +273,71 @@ describe("ContactsPage contact management", () => {
     expect(await screen.findByText("Мария Новая")).toBeInTheDocument();
   });
 
+  it("restricts employee contacts to the current assignee and removes company and delete actions", async () => {
+    permissionState.isEmployee = true;
+    postMock.mockResolvedValue(contact("contact-created", "Новый", currentUser.id));
+    const user = userEvent.setup();
+    renderPage();
+
+    await user.click(await screen.findByText("Первый Контакт"));
+    const detail = await screen.findByRole("dialog", { name: "Первый Контакт" });
+    expect(within(detail).queryByRole("button", { name: "Удалить контакт" })).not.toBeInTheDocument();
+    expect(within(detail).queryByText("Компания", { exact: true })).not.toBeInTheDocument();
+    await user.click(within(detail).getByRole("button", { name: "Закрыть" }));
+
+    expect(screen.queryByRole("button", { name: "Компании" })).not.toBeInTheDocument();
+    expect(requestedPaths().some((path) => path.startsWith("/companies?"))).toBe(false);
+    await user.click(screen.getByRole("button", { name: "Добавить контакт" }));
+    const createDialog = await screen.findByRole("dialog", { name: "Новый контакт" });
+    expect(within(createDialog).queryByRole("combobox", { name: "Ответственный" })).not.toBeInTheDocument();
+    expect(within(createDialog).getByLabelText("Ответственный")).toHaveTextContent(currentUser.name);
+    await user.type(within(createDialog).getByLabelText("Имя"), "Новый");
+    await user.click(within(createDialog).getByRole("button", { name: "Сохранить" }));
+
+    await waitFor(() => expect(postMock).toHaveBeenCalledOnce());
+    expect(postMock.mock.calls[0][1]).not.toHaveProperty("assignee_id");
+  });
+
+  it("fails closed for an employee contact while the refreshed list is pending", async () => {
+    permissionState.isEmployee = true;
+    let contactRequests = 0;
+    const pendingRefresh = new Promise<CursorPage<ApiContact>>(() => undefined);
+    getMock.mockImplementation((path: string) => {
+      if (path === "/users") return Promise.resolve([responsibleUser]);
+      if (path.startsWith("/contacts?")) {
+        contactRequests += 1;
+        return contactRequests === 1
+          ? Promise.resolve({ items: [contact("contact-1", "Первый", currentUser.id)], next_cursor: null })
+          : pendingRefresh;
+      }
+      if (path.startsWith("/activity?") || path.endsWith("/purchases?limit=100")) {
+        return Promise.resolve({ items: [], next_cursor: null });
+      }
+      return Promise.reject(new Error(`Unexpected GET ${path}`));
+    });
+    const user = userEvent.setup();
+    const { queryClient } = renderPage();
+
+    await user.click(await screen.findByText("Первый Контакт"));
+    expect(await screen.findByRole("dialog", { name: "Первый Контакт" })).toBeInTheDocument();
+    await waitFor(() => expect(queryClient.getQueryData(["activity", "contact", "contact-1"])).toBeDefined());
+    await waitFor(() => expect(queryClient.getQueryData(["contact-purchases", "contact-1"])).toBeDefined());
+
+    act(() => window.dispatchEvent(new Event("pulse:access-changed")));
+
+    expect(screen.queryByRole("dialog", { name: "Первый Контакт" })).not.toBeInTheDocument();
+    expect(queryClient.getQueryData(["activity", "contact", "contact-1"])).toBeUndefined();
+    expect(queryClient.getQueryData(["contact-purchases", "contact-1"])).toBeUndefined();
+    expect(screen.queryByText("Первый Контакт")).not.toBeInTheDocument();
+    await waitFor(() => expect(contactRequests).toBe(2));
+  });
+
   it("requires confirmation before deleting and removes the contact from cached pages", async () => {
     const user = userEvent.setup();
     let deleted = false;
     const storedContact = contact("contact-delete", "Удаляемый");
     getMock.mockImplementation((path: string) => {
+      if (path === "/users") return Promise.resolve([responsibleUser]);
       const pathname = path.split("?")[0];
       if (pathname === "/contacts") return Promise.resolve({ items: deleted ? [] : [storedContact], next_cursor: null });
       if (pathname === "/activity" || pathname.endsWith("/purchases")) return Promise.resolve({ items: [], next_cursor: null });
@@ -244,7 +351,10 @@ describe("ContactsPage contact management", () => {
 
     await user.click(await screen.findByText("Удаляемый Контакт"));
     const detail = await screen.findByRole("dialog", { name: "Удаляемый Контакт" });
-    await user.click(within(detail).getByRole("button", { name: "Удалить контакт" }));
+    const deleteButton = within(detail).getByRole("button", { name: "Удалить контакт" });
+    expect(deleteButton).toHaveClass("icon-button", "record-delete-button");
+    expect(deleteButton).not.toHaveTextContent("Удалить");
+    await user.click(deleteButton);
     const confirmation = await screen.findByRole("dialog", { name: "Удалить контакт?" });
     expect(confirmation).toHaveTextContent("Это действие нельзя отменить");
     expect(deleteMock).not.toHaveBeenCalled();
@@ -254,6 +364,41 @@ describe("ContactsPage contact management", () => {
     await waitFor(() => expect(deleteMock).toHaveBeenCalledWith("/contacts/contact-delete?expected_version=1"));
     await waitFor(() => expect(screen.queryByText("Удаляемый Контакт")).not.toBeInTheDocument());
     expect(screen.getByText("Контакт удалён")).toBeInTheDocument();
+  });
+
+  it("deletes a company with the same icon and confirmation pattern", async () => {
+    const user = userEvent.setup();
+    let deleted = false;
+    const storedCompany = company("company-delete", "Удаляемая компания");
+    getMock.mockImplementation((path: string) => {
+      if (path === "/users") return Promise.resolve([responsibleUser]);
+      const pathname = path.split("?")[0];
+      if (pathname === "/contacts") return Promise.resolve({ items: [], next_cursor: null });
+      if (pathname === "/companies") return Promise.resolve({ items: deleted ? [] : [storedCompany], next_cursor: null });
+      if (pathname === "/activity") return Promise.resolve({ items: [], next_cursor: null });
+      return Promise.reject(new Error(`Unexpected GET ${path}`));
+    });
+    deleteMock.mockImplementation(() => {
+      deleted = true;
+      return Promise.resolve(undefined);
+    });
+    renderPage();
+
+    await user.click(screen.getByRole("button", { name: "Компании" }));
+    await user.click(await screen.findByText("Удаляемая компания"));
+    const detail = await screen.findByRole("dialog", { name: "Удаляемая компания" });
+    const deleteButton = within(detail).getByRole("button", { name: "Удалить компанию" });
+    expect(deleteButton).toHaveClass("icon-button", "record-delete-button");
+    expect(deleteButton).not.toHaveTextContent("Удалить");
+    await user.click(deleteButton);
+
+    const confirmation = await screen.findByRole("dialog", { name: "Удалить компанию?" });
+    expect(confirmation).toHaveTextContent("без возможности восстановления");
+    await user.click(within(confirmation).getByRole("button", { name: "Удалить компанию" }));
+
+    await waitFor(() => expect(deleteMock).toHaveBeenCalledWith("/companies/company-delete?expected_version=1"));
+    await waitFor(() => expect(screen.queryByText("Удаляемая компания")).not.toBeInTheDocument());
+    expect(screen.getByText("Компания удалена")).toBeInTheDocument();
   });
 
   it("keeps the confirmation open and shows an error when deletion fails", async () => {

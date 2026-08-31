@@ -24,9 +24,10 @@ from app.integrations.models import (
     MessageDirection,
     MessageStatus,
 )
-from app.models import BackgroundJob, JobStatus
+from app.models import BackgroundJob, Deal, JobStatus
 from app.pagination import decode_cursor, encode_cursor
 from app.security import CurrentMutationUser, CurrentUser
+from app.services.access import deal_access_condition, ensure_deal_access, is_employee
 from app.services.data_access import enforce_cursor_page_budget
 
 router = APIRouter(tags=["messages"])
@@ -81,6 +82,7 @@ async def get_deal_messages(
     cursor: str | None = None,
     limit: int = Query(default=50, ge=1, le=100),
 ) -> MessagePage:
+    await ensure_deal_access(db, context, deal_id)
     await enforce_cursor_page_budget(
         db,
         workspace_id=context.workspace_id,
@@ -97,6 +99,7 @@ async def get_deal_messages(
             limit=limit,
             before_created_at=decoded.created_at if decoded else None,
             before_id=decoded.entity_id if decoded else None,
+            required_deal_assignee_id=(context.user_id if is_employee(context) else None),
         )
     except MessagingNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
@@ -126,6 +129,7 @@ async def post_deal_message(
     context: CurrentMutationUser,
     db: AsyncSession = Depends(get_session),
 ) -> MessageRead:
+    await ensure_deal_access(db, context, deal_id)
     try:
         message, connection = await queue_outbound_message(
             db,
@@ -133,6 +137,7 @@ async def post_deal_message(
             deal_id=deal_id,
             actor_id=context.user_id,
             body=payload.body,
+            required_deal_assignee_id=(context.user_id if is_employee(context) else None),
         )
     except MessagingNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
@@ -154,6 +159,7 @@ async def post_conversation_message(
     context: CurrentMutationUser,
     db: AsyncSession = Depends(get_session),
 ) -> MessageRead:
+    await ensure_deal_access(db, context, deal_id)
     try:
         message, connection = await queue_outbound_message(
             db,
@@ -162,6 +168,7 @@ async def post_conversation_message(
             actor_id=context.user_id,
             body=payload.body,
             conversation_id=conversation_id,
+            required_deal_assignee_id=(context.user_id if is_employee(context) else None),
         )
     except MessagingNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
@@ -177,23 +184,49 @@ async def retry_message(
     context: CurrentMutationUser,
     db: AsyncSession = Depends(get_session),
 ) -> MessageRead:
-    row = (
+    own_deal = sa.exists(
+        sa.select(Deal.id).where(
+            Deal.id == Conversation.deal_id,
+            Deal.workspace_id == context.workspace_id,
+            Deal.deleted_at.is_(None),
+            deal_access_condition(context),
+        )
+    )
+    access_filters = (own_deal,) if is_employee(context) else ()
+    route_row = (
         await db.execute(
-            sa.select(Message, ChannelConnection)
-            .join(Conversation, Conversation.id == Message.conversation_id)
+            sa.select(Conversation, ChannelConnection)
+            .select_from(Conversation)
+            .join(Message, Message.conversation_id == Conversation.id)
             .join(ChannelConnection, ChannelConnection.id == Conversation.channel_connection_id)
             .where(
                 Message.id == message_id,
                 Message.workspace_id == context.workspace_id,
                 Message.direction == MessageDirection.outbound,
                 ChannelConnection.workspace_id == context.workspace_id,
+                *access_filters,
             )
-            .with_for_update(of=Message)
+            .with_for_update(of=Conversation)
         )
     ).one_or_none()
-    if row is None:
+    if route_row is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="message not found")
-    message, connection = row
+    conversation, connection = route_row
+    if conversation.deal_id is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="deal not found")
+    await ensure_deal_access(db, context, conversation.deal_id, for_update=True)
+    message = await db.scalar(
+        sa.select(Message)
+        .where(
+            Message.id == message_id,
+            Message.workspace_id == context.workspace_id,
+            Message.conversation_id == conversation.id,
+            Message.direction == MessageDirection.outbound,
+        )
+        .with_for_update()
+    )
+    if message is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="message not found")
     if message.status is not MessageStatus.failed:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="message is not failed")
     message.status = MessageStatus.queued

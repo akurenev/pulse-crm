@@ -1,16 +1,17 @@
 import * as Dialog from "@radix-ui/react-dialog";
 import { keepPreviousData, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Building2, ChevronLeft, ChevronRight, Pencil, Plus, RefreshCw, Search, Trash2, Users, X } from "lucide-react";
-import { useEffect, useMemo, useState, type FormEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 
 import { Avatar } from "../components/Avatar";
 import { Button } from "../components/Button";
 import { contacts, users } from "../data/demo";
-import { api, remoteEnabled } from "../lib/api";
+import { ApiError, api, remoteEnabled } from "../lib/api";
 import { parseDealTags } from "../lib/deal-tags";
 import { formatLongDate, formatMoney } from "../lib/format";
-import type { ApiActivity, ApiCompany, ApiContact, ApiDeal, CursorPage } from "../types/api";
-import type { Contact } from "../types/crm";
+import { useCrm } from "../state/crm-store";
+import type { ApiActivity, ApiCompany, ApiContact, ApiDeal, ApiUser, CursorPage } from "../types/api";
+import type { Contact, UserSummary } from "../types/crm";
 
 const CLIENTS_PAGE_SIZE = 25;
 const CLIENT_SEARCH_DELAY_MS = 350;
@@ -33,7 +34,16 @@ function listPagePath(collection: "contacts" | "companies", cursor: string | nul
   return `/${collection}?${params.toString()}`;
 }
 
-function contactFromApi(contact: ApiContact): Contact {
+function apiUserSummary(user: ApiUser): UserSummary {
+  return {
+    id: user.id,
+    name: user.full_name,
+    initials: user.full_name.split(/\s+/).slice(0, 2).map((part) => part[0]).join("").toLocaleUpperCase("ru"),
+    tone: "violet",
+  };
+}
+
+function contactFromApi(contact: ApiContact, usersById: ReadonlyMap<string, UserSummary>): Contact {
   return {
     id: contact.id,
     name: `${contact.first_name} ${contact.last_name}`.trim(),
@@ -43,7 +53,7 @@ function contactFromApi(contact: ApiContact): Contact {
     tags: contact.tags,
     deals: 0,
     revenue: 0,
-    assignee: null,
+    assignee: contact.assignee_id ? usersById.get(contact.assignee_id) ?? null : null,
   };
 }
 
@@ -58,6 +68,7 @@ function replacePrimaryContactPoint(values: string[], previous: string | null, n
 }
 
 export default function ContactsPage() {
+  const { currentUser, isEmployee } = useCrm();
   const queryClient = useQueryClient();
   const [demoContacts, setDemoContacts] = useState<Contact[]>(contacts);
   const [demoCompanies, setDemoCompanies] = useState<ApiCompany[]>(() => Array.from(new Set(contacts.map((contact) => contact.company).filter((name) => name !== "—"))).map((name, index) => ({
@@ -87,36 +98,45 @@ export default function ContactsPage() {
   const [notice, setNotice] = useState<string | null>(null);
   const [noteSaving, setNoteSaving] = useState(false);
   const [noteError, setNoteError] = useState("");
+  const [accessRevision, setAccessRevision] = useState(0);
   const [contactCursors, setContactCursors] = useState<Array<string | null>>([null]);
   const [companyCursors, setCompanyCursors] = useState<Array<string | null>>([null]);
+  const accessGeneration = useRef(0);
   const normalizedSearch = search.trim().toLocaleLowerCase("ru");
   const debouncedSearch = useDebouncedValue(normalizedSearch, CLIENT_SEARCH_DELAY_MS);
   const contactCursor = contactCursors.at(-1) ?? null;
   const companyCursor = companyCursors.at(-1) ?? null;
   const remoteContacts = useQuery({
-    queryKey: ["contacts", debouncedSearch, contactCursor],
+    queryKey: ["contacts", debouncedSearch, contactCursor, accessRevision],
     queryFn: ({ signal }) => api.get<CursorPage<ApiContact>>(
       listPagePath("contacts", contactCursor, debouncedSearch),
       { signal },
     ),
     enabled: remoteEnabled && view === "contacts",
-    placeholderData: keepPreviousData,
+    placeholderData: accessRevision > 0 ? undefined : keepPreviousData,
     staleTime: 30_000,
   });
+  const remoteUsers = useQuery({
+    queryKey: ["users"],
+    queryFn: () => api.get<ApiUser[]>("/users"),
+    enabled: remoteEnabled,
+  });
   const remoteCompanies = useQuery({
-    queryKey: ["companies", debouncedSearch, companyCursor],
+    queryKey: ["companies", debouncedSearch, companyCursor, accessRevision],
     queryFn: ({ signal }) => api.get<CursorPage<ApiCompany>>(
       listPagePath("companies", companyCursor, debouncedSearch),
       { signal },
     ),
-    enabled: remoteEnabled && view === "companies",
-    placeholderData: keepPreviousData,
+    enabled: remoteEnabled && !isEmployee && view === "companies",
+    placeholderData: accessRevision > 0 ? undefined : keepPreviousData,
     staleTime: 30_000,
   });
   const sourceContacts = useMemo<Contact[]>(() => {
     if (!remoteEnabled) return demoContacts;
-    return (remoteContacts.data?.items ?? []).map(contactFromApi);
-  }, [demoContacts, remoteContacts.data]);
+    const usersById = new Map((remoteUsers.data ?? []).map((user) => [user.id, apiUserSummary(user)]));
+    usersById.set(currentUser.id, currentUser);
+    return (remoteContacts.data?.items ?? []).map((contact) => contactFromApi(contact, usersById));
+  }, [currentUser, demoContacts, remoteContacts.data, remoteUsers.data]);
   const visibleContacts = useMemo(
     () => sourceContacts.filter((contact) => `${contact.name} ${contact.company} ${contact.email} ${contact.phone} ${contact.tags.join(" ")}`.toLocaleLowerCase("ru").includes(normalizedSearch)),
     [normalizedSearch, sourceContacts],
@@ -129,9 +149,9 @@ export default function ContactsPage() {
     () => sourceCompanies.filter((company) => `${company.name} ${company.email ?? ""} ${company.phone ?? ""} ${company.tags.join(" ")}`.toLocaleLowerCase("ru").includes(normalizedSearch)),
     [normalizedSearch, sourceCompanies],
   );
-  const loading = view === "contacts" ? remoteContacts.isLoading : remoteCompanies.isLoading;
-  const failed = view === "contacts" ? remoteContacts.isError : remoteCompanies.isError;
-  const fetching = view === "contacts" ? remoteContacts.isFetching : remoteCompanies.isFetching;
+  const loading = view === "contacts" ? remoteContacts.isLoading || remoteUsers.isLoading : remoteCompanies.isLoading;
+  const failed = view === "contacts" ? remoteContacts.isError || remoteUsers.isError : remoteCompanies.isError;
+  const fetching = view === "contacts" ? remoteContacts.isFetching || remoteUsers.isFetching : remoteCompanies.isFetching;
   const activeCursors = view === "contacts" ? contactCursors : companyCursors;
   const nextCursor = view === "contacts" ? remoteContacts.data?.next_cursor : remoteCompanies.data?.next_cursor;
   const currentPage = activeCursors.length;
@@ -141,22 +161,67 @@ export default function ContactsPage() {
   const selectedEntityType = selectedContact ? "contact" : selectedCompany ? "company" : null;
   const detailActivityQuery = useQuery({
     queryKey: ["activity", selectedEntityType, selectedEntityId],
-    queryFn: () => api.get<CursorPage<ApiActivity>>(`/activity?limit=20&entity_type=${selectedEntityType}&entity_id=${selectedEntityId}`),
+    queryFn: ({ signal }) => api.get<CursorPage<ApiActivity>>(
+      `/activity?limit=20&entity_type=${selectedEntityType}&entity_id=${selectedEntityId}`,
+      { signal },
+    ),
     enabled: remoteEnabled && Boolean(selectedEntityId && selectedEntityType),
   });
   const purchasesQuery = useQuery({
     queryKey: ["contact-purchases", selectedContact?.id],
-    queryFn: () => api.get<CursorPage<ApiDeal>>(`/contacts/${selectedContact?.id}/purchases?limit=100`),
+    queryFn: ({ signal }) => api.get<CursorPage<ApiDeal>>(
+      `/contacts/${selectedContact?.id}/purchases?limit=100`,
+      { signal },
+    ),
     enabled: remoteEnabled && Boolean(selectedContact?.id),
   });
   const selectedPurchases = purchasesQuery.data?.items ?? [];
   const selectedRevenue = selectedPurchases.reduce((sum, deal) => sum + Number(deal.amount ?? 0), 0);
   const selectedDemoNames = selectedContact ? demoContactNames(selectedContact) : { firstName: "", lastName: "" };
+  const availableAssignees = useMemo(() => {
+    const remote = (remoteUsers.data ?? []).map(apiUserSummary);
+    const candidates = remoteEnabled ? remote : Object.values(users);
+    return candidates.some((user) => user.id === currentUser.id) ? candidates : [currentUser, ...candidates];
+  }, [currentUser, remoteUsers.data]);
+
+  useEffect(() => {
+    if (!isEmployee || view === "contacts") return;
+    setView("contacts");
+    setSelectedCompany(null);
+    setDialogOpen(false);
+  }, [isEmployee, view]);
+
+  useEffect(() => {
+    if (!remoteEnabled) return;
+    const handleAccessChanged = () => {
+      accessGeneration.current += 1;
+      const contactId = selectedContact?.id;
+      if (selectedEntityId && selectedEntityType) {
+        queryClient.removeQueries({ queryKey: ["activity", selectedEntityType, selectedEntityId] });
+      }
+      if (contactId) {
+        queryClient.removeQueries({ queryKey: ["contact-purchases", contactId] });
+      }
+      setSelectedContact(null);
+      setSelectedApiContact(null);
+      setSelectedCompany(null);
+      setDialogOpen(false);
+      setContactEditing(false);
+      setDeleteConfirmOpen(false);
+      setDeleteError("");
+      setSaveError("");
+      setContactCursors([null]);
+      setAccessRevision((value) => value + 1);
+    };
+    window.addEventListener("pulse:access-changed", handleAccessChanged);
+    return () => window.removeEventListener("pulse:access-changed", handleAccessChanged);
+  }, [queryClient, selectedContact?.id, selectedEntityId, selectedEntityType]);
 
   async function createEntity(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const form = event.currentTarget;
     const data = new FormData(form);
+    if (isEmployee && view === "companies") return;
     setSaving(true);
     setSaveError("");
     try {
@@ -173,6 +238,7 @@ export default function ContactsPage() {
             phones: phone ? [phone] : [],
             tags: [],
             custom_fields: {},
+            ...(!isEmployee ? { assignee_id: String(data.get("assignee_id") ?? "") || null } : {}),
           });
           setContactCursors([null]);
           await queryClient.invalidateQueries({ queryKey: ["contacts"] });
@@ -203,7 +269,9 @@ export default function ContactsPage() {
           tags: [],
           deals: 0,
           revenue: 0,
-          assignee: users.ak,
+          assignee: isEmployee
+            ? currentUser
+            : availableAssignees.find((user) => user.id === String(data.get("assignee_id") ?? "")) ?? currentUser,
         }, ...items]);
       } else {
         const now = new Date().toISOString();
@@ -259,6 +327,13 @@ export default function ContactsPage() {
     } : page);
   }
 
+  function removeCompanyFromQueryCache(companyId: string) {
+    queryClient.setQueriesData<CursorPage<ApiCompany>>({ queryKey: ["companies"] }, (page) => page ? {
+      ...page,
+      items: page.items.filter((company) => company.id !== companyId),
+    } : page);
+  }
+
   async function updateContact(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!selectedContact) return;
@@ -268,6 +343,7 @@ export default function ContactsPage() {
     const email = String(data.get("email") ?? "").trim();
     const phone = String(data.get("phone") ?? "").trim();
     const tags = parseDealTags(String(data.get("tags") ?? ""));
+    const mutationGeneration = accessGeneration.current;
     setSaving(true);
     setSaveError("");
     try {
@@ -282,10 +358,12 @@ export default function ContactsPage() {
           emails: replacePrimaryContactPoint(selectedApiContact.emails, selectedApiContact.primary_email, email),
           phones: replacePrimaryContactPoint(selectedApiContact.phones, selectedApiContact.primary_phone, phone),
           tags,
+          ...(!isEmployee ? { assignee_id: String(data.get("assignee_id") ?? "") || null } : {}),
         });
+        if (mutationGeneration !== accessGeneration.current) return;
         updateContactQueryCache(updated);
         setSelectedApiContact(updated);
-        setSelectedContact(contactFromApi(updated));
+        setSelectedContact(contactFromApi(updated, new Map(availableAssignees.map((user) => [user.id, user]))));
         await queryClient.invalidateQueries({ queryKey: ["contacts"] });
       } else {
         const updated: Contact = {
@@ -294,6 +372,9 @@ export default function ContactsPage() {
           email: email || "—",
           phone: phone || "—",
           tags,
+          assignee: isEmployee
+            ? selectedContact.assignee
+            : availableAssignees.find((user) => user.id === String(data.get("assignee_id") ?? "")) ?? null,
         };
         setDemoContacts((items) => items.map((contact) => contact.id === updated.id ? updated : contact));
         setSelectedContact(updated);
@@ -307,24 +388,35 @@ export default function ContactsPage() {
     }
   }
 
-  async function deleteContact() {
-    if (!selectedContact) return;
+  async function deleteSelectedRecord() {
+    const entity = selectedContact ?? selectedCompany;
+    if (isEmployee || !entity) return;
+    const entityKind = selectedContact ? "Контакт" : "Компания";
+    const collection = selectedContact ? "contacts" : "companies";
+    const version = selectedContact ? selectedApiContact?.version : selectedCompany?.version;
     setDeleting(true);
     setDeleteError("");
     try {
       if (remoteEnabled) {
-        if (!selectedApiContact) throw new Error("Contact version is unavailable");
-        await api.delete(`/contacts/${selectedContact.id}?expected_version=${selectedApiContact.version}`);
-        removeContactFromQueryCache(selectedContact.id);
-        await queryClient.invalidateQueries({ queryKey: ["contacts"] });
+        if (version == null) throw new Error("Record version is unavailable");
+        await api.delete(`/${collection}/${entity.id}?expected_version=${version}`);
+        if (selectedContact) removeContactFromQueryCache(entity.id);
+        else removeCompanyFromQueryCache(entity.id);
+        await queryClient.invalidateQueries({ queryKey: [collection] });
+      } else if (selectedContact) {
+        setDemoContacts((items) => items.filter((contact) => contact.id !== entity.id));
       } else {
-        setDemoContacts((items) => items.filter((contact) => contact.id !== selectedContact.id));
+        setDemoCompanies((items) => items.filter((company) => company.id !== entity.id));
       }
       setDeleteConfirmOpen(false);
       closeRecord();
-      setNotice("Контакт удалён");
-    } catch {
-      setDeleteError("Не удалось удалить контакт. Обновите страницу и попробуйте ещё раз.");
+      setNotice(`${entityKind} ${selectedContact ? "удалён" : "удалена"}`);
+    } catch (reason) {
+      setDeleteError(reason instanceof ApiError && reason.status === 404
+        ? `${entityKind} уже ${selectedContact ? "удалён" : "удалена"} другим пользователем. Закройте карточку и обновите список.`
+        : reason instanceof ApiError && reason.status === 409
+          ? `${entityKind} была изменена другим пользователем. Закройте карточку, откройте её снова и повторите удаление.`
+          : `Не удалось удалить ${selectedContact ? "контакт" : "компанию"}. Обновите страницу и попробуйте ещё раз.`);
     } finally {
       setDeleting(false);
     }
@@ -356,7 +448,7 @@ export default function ContactsPage() {
 
   function retryActiveList() {
     if (view === "contacts") {
-      void remoteContacts.refetch();
+      void Promise.all([remoteContacts.refetch(), remoteUsers.refetch()]);
     } else {
       void remoteCompanies.refetch();
     }
@@ -390,11 +482,11 @@ export default function ContactsPage() {
       {notice ? <button className="toast" type="button" onClick={() => setNotice(null)}>{notice}</button> : null}
       <header className="page-header">
         <div><h1>Клиенты</h1><p>{remoteEnabled ? `Страница ${currentPage} · ${visibleRecordCount} записей` : `${visibleRecordCount} записей в рабочей базе`}</p></div>
-        <Button className="contacts-page__desktop-add" variant="primary" aria-controls="new-client-dialog" onClick={() => setDialogOpen(true)}><Plus size={17} /> {view === "contacts" ? "Новый контакт" : "Новая компания"}</Button>
+        <Button className="contacts-page__desktop-add" variant="primary" aria-controls="new-client-dialog" onClick={() => setDialogOpen(true)}><Plus size={17} /> {isEmployee || view === "contacts" ? "Новый контакт" : "Новая компания"}</Button>
       </header>
       <div className="content-toolbar">
-        <label className="search-control"><Search size={18} /><input value={search} onChange={(event) => updateSearch(event.target.value)} placeholder="Имя, компания, тег, телефон или email" /></label>
-        <div className="view-switch" aria-label="Тип клиентов"><button className={view === "contacts" ? "is-active" : ""} type="button" aria-label="Контакты" onClick={() => setView("contacts")}><Users size={18} /></button><button className={view === "companies" ? "is-active" : ""} type="button" aria-label="Компании" onClick={() => setView("companies")}><Building2 size={18} /></button></div>
+        <label className="search-control"><Search size={18} /><input value={search} onChange={(event) => updateSearch(event.target.value)} placeholder={isEmployee ? "Имя, тег, телефон или email" : "Имя, компания, тег, телефон или email"} /></label>
+        {!isEmployee ? <div className="view-switch" aria-label="Тип клиентов"><button className={view === "contacts" ? "is-active" : ""} type="button" aria-label="Контакты" onClick={() => setView("contacts")}><Users size={18} /></button><button className={view === "companies" ? "is-active" : ""} type="button" aria-label="Компании" onClick={() => setView("companies")}><Building2 size={18} /></button></div> : null}
       </div>
 
       {loading ? <div className="route-loading" role="status">Загружаем клиентов…</div> : null}
@@ -406,7 +498,7 @@ export default function ContactsPage() {
         <div className="data-table__header"><span>Клиент</span><span>Контакты</span><span>Сделки</span><span>Следующая покупка</span><span>Ответственный</span></div>
         {visibleContacts.map((contact) => (
           <button className="data-row" type="button" key={contact.id} onClick={() => openContact(contact)}>
-            <span className="data-row__primary"><span className="company-avatar">{contact.name.slice(0, 1)}</span><span><strong>{contact.name}</strong><small>{[...(contact.company === "—" ? [] : [contact.company]), ...contact.tags].join(" · ") || "—"}</small></span></span>
+            <span className="data-row__primary"><span className="company-avatar">{contact.name.slice(0, 1)}</span><span><strong>{contact.name}</strong><small>{[...(!isEmployee && contact.company !== "—" ? [contact.company] : []), ...contact.tags].join(" · ") || "—"}</small></span></span>
             <span className="data-row__contact"><strong>{contact.phone}</strong><small>{contact.email}</small></span>
             <span>{remoteEnabled ? <><strong>—</strong><small>см. карточку</small></> : <><strong>{contact.deals}</strong><small>{formatMoney(contact.revenue)}</small></>}</span>
             <span>{contact.nextPurchaseAt ? formatLongDate(contact.nextPurchaseAt) : "Не запланирована"}</span>
@@ -414,7 +506,7 @@ export default function ContactsPage() {
           </button>
         ))}
       </section> : null}
-      {!loading && !failed && view === "companies" ? <section className="data-table" role="region" aria-label="Список компаний">
+      {!isEmployee && !loading && !failed && view === "companies" ? <section className="data-table" role="region" aria-label="Список компаний">
         <div className="data-table__header"><span>Компания</span><span>Контакты</span><span>Теги</span><span>Сайт</span><span>Обновлено</span></div>
         {visibleCompanies.map((company) => (
           <button className="data-row" type="button" key={company.id} onClick={() => setSelectedCompany(company)}>
@@ -434,7 +526,7 @@ export default function ContactsPage() {
       <button
         className="mobile-fab contacts-page__mobile-add"
         type="button"
-        aria-label={view === "contacts" ? "Добавить контакт" : "Добавить компанию"}
+        aria-label={isEmployee || view === "contacts" ? "Добавить контакт" : "Добавить компанию"}
         aria-controls="new-client-dialog"
         onClick={() => setDialogOpen(true)}
       >
@@ -445,11 +537,14 @@ export default function ContactsPage() {
         <Dialog.Portal>
           <Dialog.Overlay className="dialog-overlay" />
           <Dialog.Content id="new-client-dialog" className="dialog-content">
-            <div className="dialog-header"><div><Dialog.Title>{view === "contacts" ? "Новый контакт" : "Новая компания"}</Dialog.Title><Dialog.Description>Запись будет доступна всей команде.</Dialog.Description></div><Dialog.Close className="icon-button" aria-label="Закрыть"><X size={20} /></Dialog.Close></div>
+            <div className="dialog-header"><div><Dialog.Title>{isEmployee || view === "contacts" ? "Новый контакт" : "Новая компания"}</Dialog.Title><Dialog.Description>Запись будет доступна всей команде.</Dialog.Description></div><Dialog.Close className="icon-button" aria-label="Закрыть"><X size={20} /></Dialog.Close></div>
             <form className="form-stack" onSubmit={(event) => void createEntity(event)}>
               {view === "contacts" ? <><label className="field"><span>Имя</span><input name="first_name" required autoFocus /></label><label className="field"><span>Фамилия</span><input name="last_name" /></label></> : <label className="field"><span>Название</span><input name="name" required autoFocus /></label>}
               <label className="field"><span>Email</span><input name="email" type="email" /></label>
               <label className="field"><span>Телефон</span><input name="phone" type="tel" /></label>
+              {view === "contacts" ? (isEmployee
+                ? <div className="field" aria-label="Ответственный"><span>Ответственный</span><strong>{currentUser.name}</strong></div>
+                : <label className="field"><span>Ответственный</span><select name="assignee_id" required defaultValue={currentUser.id}>{availableAssignees.map((user) => <option key={user.id} value={user.id}>{user.name}</option>)}</select></label>) : null}
               {view === "companies" ? <label className="field"><span>Сайт</span><input name="website" type="url" placeholder="https://" /></label> : null}
               {saveError ? <p className="form-error" role="alert">{saveError}</p> : null}
               <div className="dialog-actions"><Dialog.Close asChild><Button type="button">Отмена</Button></Dialog.Close><Button type="submit" variant="primary" disabled={saving}>{saving ? "Сохраняем…" : "Сохранить"}</Button></div>
@@ -477,8 +572,9 @@ export default function ContactsPage() {
               <div className="record-dialog__header-actions">
                 {selectedContact && !contactEditing ? <>
                   <Button compact aria-label="Редактировать контакт" onClick={() => { setSaveError(""); setContactEditing(true); }}><Pencil size={15} /><span className="record-dialog__action-label">Редактировать</span></Button>
-                  <Button compact variant="danger" aria-label="Удалить контакт" onClick={() => { setDeleteError(""); setDeleteConfirmOpen(true); }}><Trash2 size={15} /><span className="record-dialog__action-label">Удалить</span></Button>
+                  {!isEmployee ? <button type="button" className="icon-button record-delete-button" aria-label="Удалить контакт" title="Удалить контакт" onClick={() => { setDeleteError(""); setDeleteConfirmOpen(true); }}><Trash2 size={16} aria-hidden="true" /></button> : null}
                 </> : null}
+                {selectedCompany && !isEmployee ? <button type="button" className="icon-button record-delete-button" aria-label="Удалить компанию" title="Удалить компанию" onClick={() => { setDeleteError(""); setDeleteConfirmOpen(true); }}><Trash2 size={16} aria-hidden="true" /></button> : null}
                 <Dialog.Close className="icon-button" aria-label="Закрыть"><X size={20} /></Dialog.Close>
               </div>
             </div>
@@ -488,13 +584,16 @@ export default function ContactsPage() {
               <label className="field"><span>Email</span><input name="email" type="email" defaultValue={selectedApiContact?.primary_email ?? (selectedContact.email === "—" ? "" : selectedContact.email)} /></label>
               <label className="field"><span>Телефон</span><input name="phone" type="tel" defaultValue={selectedApiContact?.primary_phone ?? (selectedContact.phone === "—" ? "" : selectedContact.phone)} /></label>
               <label className="field"><span>Теги</span><input name="tags" defaultValue={(selectedApiContact?.tags ?? selectedContact.tags).join(", ")} placeholder="Например: VIP, постоянный клиент" /></label>
+              {isEmployee
+                ? <div className="field" aria-label="Ответственный"><span>Ответственный</span><strong>{selectedContact.assignee?.name ?? currentUser.name}</strong></div>
+                : <label className="field"><span>Ответственный</span><select name="assignee_id" defaultValue={selectedApiContact?.assignee_id ?? ""}><option value="">Не назначен</option>{availableAssignees.map((user) => <option key={user.id} value={user.id}>{user.name}</option>)}</select></label>}
               {saveError ? <p className="form-error" role="alert">{saveError}</p> : null}
               <div className="dialog-actions"><Button type="button" onClick={() => { setSaveError(""); setContactEditing(false); }}>Отмена</Button><Button type="submit" variant="primary" disabled={saving}>{saving ? "Сохраняем…" : "Сохранить"}</Button></div>
             </form> : null}
             {selectedContact && !contactEditing ? <div className="record-detail-grid">
               <div><small>Телефон</small><strong>{selectedContact.phone}</strong></div>
               <div><small>Email</small><strong>{selectedContact.email}</strong></div>
-              <div><small>Компания</small><strong>{selectedContact.company}</strong></div>
+              {!isEmployee ? <div><small>Компания</small><strong>{selectedContact.company}</strong></div> : null}
               <div><small>Ответственный</small><strong>{selectedContact.assignee?.name ?? "Не назначен"}</strong></div>
               <div className="record-detail-grid__wide"><small>Теги</small><strong>{selectedContact.tags.length ? selectedContact.tags.join(", ") : "Нет тегов"}</strong></div>
               <div><small>Покупок</small><strong>{remoteEnabled ? selectedPurchases.length : selectedContact.deals}</strong></div>
@@ -529,19 +628,20 @@ export default function ContactsPage() {
         </Dialog.Portal>
       </Dialog.Root>
 
-      <Dialog.Root open={deleteConfirmOpen} onOpenChange={(open) => { if (!deleting) { setDeleteConfirmOpen(open); if (!open) setDeleteError(""); } }}>
+      {!isEmployee ? <Dialog.Root open={deleteConfirmOpen} onOpenChange={(open) => { if (!deleting) { setDeleteConfirmOpen(open); if (!open) setDeleteError(""); } }}>
         <Dialog.Portal>
           <Dialog.Overlay className="dialog-overlay dialog-overlay--confirm" />
-          <Dialog.Content className="dialog-content confirm-dialog">
+          <Dialog.Content className="dialog-content task-delete-dialog confirm-dialog">
             <div className="dialog-header">
-              <div><Dialog.Title>Удалить контакт?</Dialog.Title><Dialog.Description>«{selectedContact?.name}» будет удалён из списка. Это действие нельзя отменить.</Dialog.Description></div>
+              <div><Dialog.Title>{selectedContact ? "Удалить контакт?" : "Удалить компанию?"}</Dialog.Title><Dialog.Description>Это действие нельзя отменить.</Dialog.Description></div>
               <Dialog.Close className="icon-button" aria-label="Закрыть подтверждение" disabled={deleting}><X size={20} /></Dialog.Close>
             </div>
+            <p className="task-delete-dialog__copy">{selectedContact ? "Контакт" : "Компания"} <strong>«{selectedContact?.name ?? selectedCompany?.name}»</strong> будет {selectedContact ? "удалён" : "удалена"} без возможности восстановления.</p>
             {deleteError ? <p className="form-error" role="alert">{deleteError}</p> : null}
-            <div className="dialog-actions"><Dialog.Close asChild><Button type="button" disabled={deleting}>Отмена</Button></Dialog.Close><Button type="button" variant="danger" disabled={deleting} onClick={() => void deleteContact()}>{deleting ? "Удаляем…" : "Удалить контакт"}</Button></div>
+            <div className="dialog-actions"><Dialog.Close asChild><Button type="button" disabled={deleting}>Отмена</Button></Dialog.Close><Button type="button" variant="danger" disabled={deleting} onClick={() => void deleteSelectedRecord()}>{deleting ? "Удаляем…" : selectedContact ? "Удалить контакт" : "Удалить компанию"}</Button></div>
           </Dialog.Content>
         </Dialog.Portal>
-      </Dialog.Root>
+      </Dialog.Root> : null}
     </div>
   );
 }

@@ -18,9 +18,9 @@ from app.config import Settings, get_settings
 from app.db import SessionLocal
 from app.integrations.models import NotificationDelivery, WebPushSubscription
 from app.integrations.secrets import SecretCipher
-from app.integrations.web_push import subscription_aad
+from app.integrations.web_push import is_trusted_test_push_delivery, subscription_aad
 from app.main import app
-from app.models import DeliveryStatus, Membership, OutboxEvent
+from app.models import DeliveryStatus, Membership, OutboxEvent, Role
 
 
 def _base64url(value: bytes) -> str:
@@ -181,6 +181,13 @@ async def test_push_subscription_is_encrypted_idempotent_capped_and_queues_test(
     owner_auth: dict[str, object],
 ) -> None:
     workspace_id = _workspace_id(owner_auth)
+    async with SessionLocal() as role_db:
+        membership = await role_db.scalar(
+            sa.select(Membership).where(Membership.workspace_id == workspace_id)
+        )
+        assert membership is not None
+        membership.role = Role.employee
+        await role_db.commit()
     csrf = str(owner_auth["csrf_token"])
     headers = {"X-CSRF-Token": csrf}
     settings = _vapid_settings()
@@ -283,6 +290,7 @@ async def test_push_subscription_is_encrypted_idempotent_capped_and_queues_test(
         assert delivery.channel == "web_push"
         assert delivery.recipient_id == user_id
         assert delivery.status is DeliveryStatus.pending
+        assert is_trusted_test_push_delivery(delivery)
         assert (
             await db.scalar(
                 sa.select(sa.func.count())

@@ -75,3 +75,27 @@ def record_audit_event(
     )
     db.add(activity)
     return activity
+
+
+def record_access_change(
+    db: AsyncSession,
+    *,
+    workspace_id: uuid.UUID,
+    recipient_ids: set[uuid.UUID | None],
+    resource: str,
+) -> None:
+    """Tell affected users to discard cached records without exposing record IDs."""
+
+    for recipient_id in sorted(
+        (value for value in recipient_ids if value is not None), key=str
+    ):
+        db.add(
+            RealtimeEvent(
+                workspace_id=workspace_id,
+                event_type="access.changed",
+                payload={
+                    "recipient_id": str(recipient_id),
+                    "resource": resource,
+                },
+            )
+        )

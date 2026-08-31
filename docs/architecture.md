@@ -23,7 +23,8 @@ Production состоит из трёх ресурсов:
 | `app.api.auth` | bootstrap, email/password, сессии, CSRF, приглашения и роли |
 | `app.api.crm` | компании, контакты, воронки, сделки, поля, задачи и activity |
 | `app.integrations` | сообщения, webhook/form, каналы, S3, уведомления и импорт |
-| `app.services.events` | атомарные activity/outbox/realtime события |
+| `app.services.events` | атомарные activity/outbox/realtime и targeted access-change события |
+| `app.services.access` | единые row-level проверки объектов для ограниченной роли сотрудника |
 | `app.services.jobs` | очередь, leases, retry/backoff и supervisor |
 | `app.api.events` | replayable SSE по монотонному `event_id` |
 | `frontend` | responsive SPA и optimistic UI |
@@ -60,10 +61,13 @@ HTTP response          supervisor claims outbox/job
                       external channel / notification
 ```
 
-Внешний HTTP/SMTP/S3 вызов не выполняется под блокировкой доменной строки.
-Результат доставки фиксируется отдельной короткой транзакцией. Повторная
-доставка проверяет состояние сообщения или уведомления и безопасно завершается,
-если работа уже выполнена.
+Обычно внешний HTTP/SMTP/S3 вызов не выполняется под блокировкой доменной
+строки, а результат доставки фиксируется отдельной короткой транзакцией.
+Исключение — персональное employee-уведомление: worker удерживает блокировки
+delivery, активного membership и целевой сделки/задачи до завершения sender,
+чтобы переназначение не создало TOCTOU-утечку прежнему ответственному.
+Повторная доставка проверяет состояние сообщения или уведомления и безопасно
+завершается, если работа уже выполнена.
 
 ## Очередь и расписание
 
@@ -86,6 +90,10 @@ owner/until lease и последнюю ошибку. Административ
 не позволяет поставить следующую страницу. После успешного завершения отдельное
 идемпотентное задание формирует канонический JSON-отчёт в приватном S3; UI
 получает его только по короткоживущей подписанной ссылке.
+Обновление ответственного или основного контакта импортированной сделки
+синхронизирует производный агрегат в порядке блокировок
+`Deal → PurchaseSchedule → Task`; при несопоставленном ответственном fallback
+ограничен активными `owner`/`admin`, иначе транзакция откатывается.
 
 ## Поиск и пагинация
 
@@ -100,23 +108,32 @@ owner/until lease и последнюю ошибку. Административ
 PostgreSQL DDL в Alembic-миграции. Они перечислены как управляемые миграцией в
 `backend/alembic/env.py`, поэтому autogenerate/check не предлагает удалить их
 как отсутствующие в ORM metadata. Обычные metadata-индексы продолжают
-сравниваться без исключений.
+сравниваться без исключений. Для выборки контактов сотрудника добавлен индекс
+по `(workspace_id, assignee_id, deleted_at, created_at, id)`.
 
 ## Защита
 
 - Argon2id, HttpOnly/Secure/SameSite cookies, CSRF и отзыв сессии;
-- `owner/admin/manager` с проверкой роли в endpoint;
+- `owner/admin/manager/employee` с проверкой роли и текущего membership в
+  endpoint; `employee` дополнительно ограничен `assignee_id == user_id` для
+  сделок, контактов и задач, а связанные компании доступны только на чтение;
 - optimistic locking для изменяемых записей, HTTP 409 при stale version;
 - HMAC-SHA256, replay window и `Idempotency-Key` для generic webhook;
 - provider secret для Telegram/MAX webhook;
 - AES-GCM для токенов интеграций, master key только в environment;
 - MIME/расширение/размер до 20 МБ, запрет архивов и executable;
 - authenticated upload в приватный S3 и signed GET с коротким TTL;
+- вложения клиентских сообщений и внутренних заметок используют разные
+  доменные таблицы; `NoteAttachment` связан с неизменяемым событием заметки и
+  никогда не передаётся transport-обработчику переписки;
 - аудит выдачи signed URL без записи самого URL или S3-ключа;
 - массовый экспорт отсутствует; будущий endpoint требует `owner`, явный
   `PULSE_CRM_EXPORT_ENABLED=true` и отдельный security review;
 - `Cache-Control: no-store` для API и минимальный SSE payload без содержимого
   заметок, сообщений и согласий;
+- targeted `access.changed` без ID объекта сбрасывает клиентские карточки и
+  кэши при переназначении; SSE прекращается при отзыве сессии, перечитывает роль
+  и ограничивает replay последними 1000 событиями;
 - `cursor_access_buckets` атомарно ограничивает продолжение пагинации по паре
   workspace/user/resource; первая страница не учитывается, превышение окна
   возвращает HTTP 429 и создаёт безопасное audit-событие;

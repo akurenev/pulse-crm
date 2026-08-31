@@ -1,8 +1,8 @@
 import * as Dialog from "@radix-ui/react-dialog";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { Check, ChevronLeft, ChevronRight, Circle, Pencil, Plus, Search, Trash2, X } from "lucide-react";
+import { ArrowUpRight, Check, ChevronLeft, ChevronRight, Circle, Plus, Search, Trash2, X } from "lucide-react";
 import { useDeferredValue, useEffect, useMemo, useState, type FormEvent } from "react";
-import { useSearchParams } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 
 import { Avatar } from "../components/Avatar";
 import { Button } from "../components/Button";
@@ -62,7 +62,7 @@ function taskPagePath(
 }
 
 export default function TasksPage() {
-  const { deals } = useCrm();
+  const { currentUser, deals, isEmployee } = useCrm();
   const [tasks, setTasks] = useState<TaskItem[]>(() => seedTasks);
   const [filter, setFilter] = useState<TaskFilter>("all");
   const [showCompleted, setShowCompleted] = useState(false);
@@ -81,14 +81,18 @@ export default function TasksPage() {
   const [createError, setCreateError] = useState("");
   const [editError, setEditError] = useState("");
   const [deleteError, setDeleteError] = useState("");
+  const [accessRevision, setAccessRevision] = useState(0);
   const [searchParams, setSearchParams] = useSearchParams();
   const routedTaskId = deepLinkEntityId(searchParams, "task");
   const queryClient = useQueryClient();
   const taskCursor = taskCursors.at(-1) ?? null;
   const deferredSearch = useDeferredValue(search.trim().toLocaleLowerCase("ru"));
   const taskQuery = useQuery({
-    queryKey: ["tasks", filter, showCompleted, deferredSearch, taskCursor],
-    queryFn: () => api.get<CursorPage<ApiTask>>(taskPagePath(taskCursor, filter, showCompleted, deferredSearch)),
+    queryKey: ["tasks", filter, showCompleted, deferredSearch, taskCursor, accessRevision],
+    queryFn: ({ signal }) => api.get<CursorPage<ApiTask>>(
+      taskPagePath(taskCursor, filter, showCompleted, deferredSearch),
+      { signal },
+    ),
     enabled: remoteEnabled,
   });
   const userQuery = useQuery({
@@ -101,8 +105,11 @@ export default function TasksPage() {
     : null;
   const taskDetailQuery = useQuery({
     queryKey: ["tasks", "detail", routedTaskId],
-    queryFn: () => api.get<ApiTask>(`/tasks/${encodeURIComponent(routedTaskId!)}`),
-    enabled: remoteEnabled && Boolean(routedTaskId) && taskQuery.isSuccess && !pagedRoutedApiTask,
+    queryFn: ({ signal }) => api.get<ApiTask>(`/tasks/${encodeURIComponent(routedTaskId!)}`, { signal }),
+    enabled: remoteEnabled
+      && Boolean(routedTaskId)
+      && taskQuery.isSuccess
+      && !pagedRoutedApiTask,
   });
   const routedApiTask = pagedRoutedApiTask ?? taskDetailQuery.data ?? null;
   const remoteTaskItems = useMemo<TaskItem[]>(() => {
@@ -117,7 +124,8 @@ export default function TasksPage() {
     return visibleApiTasks.map((task) => {
       const user = usersById.get(task.assignee_id);
       const dueDate = new Date(task.due_at);
-      const name = user?.full_name ?? "Не назначен";
+      const currentAssignee = task.assignee_id === currentUser.id ? currentUser : null;
+      const name = currentAssignee?.name ?? user?.full_name ?? "Не назначен";
       return {
         id: task.id,
         title: task.title,
@@ -128,11 +136,11 @@ export default function TasksPage() {
           id: task.assignee_id,
           name,
           initials: name.split(/\s+/).slice(0, 2).map((part) => part[0]).join("").toLocaleUpperCase("ru"),
-          tone: demoUsers.ak.tone,
+          tone: currentAssignee?.tone ?? demoUsers.ak.tone,
         },
       };
     });
-  }, [routedApiTask, taskQuery.data, userQuery.data]);
+  }, [currentUser, routedApiTask, taskQuery.data, userQuery.data]);
   const sourceTasks = remoteEnabled ? remoteTaskItems : tasks;
   const editingTask = editingTaskSnapshot;
   const deletingTask = deletingTaskSnapshot;
@@ -149,6 +157,25 @@ export default function TasksPage() {
       return matchesCompletion && matchesFilter && matchesSearch;
     });
   }, [filter, search, showCompleted, sourceTasks]);
+
+  useEffect(() => {
+    if (!remoteEnabled) return;
+    const handleAccessChanged = () => {
+      const taskId = routedTaskId ?? editingTaskId;
+      if (taskId) queryClient.removeQueries({ queryKey: ["tasks", "detail", taskId] });
+      setSearchParams((current) => {
+        const next = new URLSearchParams(current);
+        next.delete("task");
+        return next;
+      }, { replace: true });
+      setEditingTaskId(null);
+      setEditingTaskSnapshot(null);
+      setEditingApiTask(null);
+      setAccessRevision((value) => value + 1);
+    };
+    window.addEventListener("pulse:access-changed", handleAccessChanged);
+    return () => window.removeEventListener("pulse:access-changed", handleAccessChanged);
+  }, [editingTaskId, queryClient, routedTaskId, setSearchParams]);
 
   useEffect(() => {
     if (!routedTaskId) {
@@ -214,6 +241,7 @@ export default function TasksPage() {
   }
 
   function openDeleteConfirmation(taskId: string) {
+    if (isEmployee) return;
     setDeleteError("");
     setDeletingTaskId(taskId);
     setDeletingTaskSnapshot(sourceTasks.find((task) => task.id === taskId) ?? null);
@@ -258,7 +286,7 @@ export default function TasksPage() {
     const title = String(data.get("title") ?? "").trim();
     const dueAt = new Date(String(data.get("due_at") ?? ""));
     const remindRaw = String(data.get("remind_at") ?? "");
-    const assigneeId = String(data.get("assignee_id") ?? "");
+    const assigneeId = isEmployee ? currentUser.id : String(data.get("assignee_id") ?? "");
     setCreating(true);
     setCreateError("");
     try {
@@ -275,7 +303,9 @@ export default function TasksPage() {
         setTaskCursors([null]);
         await refreshTasks();
       } else {
-        const assignee = Object.values(demoUsers).find((user) => user.id === assigneeId) ?? demoUsers.ak;
+        const assignee = isEmployee
+          ? currentUser
+          : Object.values(demoUsers).find((user) => user.id === assigneeId) ?? demoUsers.ak;
         setTasks((items) => [{
           id: `task-${crypto.randomUUID()}`,
           title,
@@ -315,8 +345,10 @@ export default function TasksPage() {
           task_type: String(data.get("task_type") ?? "follow_up"),
           due_at: dueAt.toISOString(),
           remind_at: remindRaw ? new Date(remindRaw).toISOString() : null,
-          assignee_id: assigneeId,
-          deal_id: String(data.get("deal_id") ?? "") || null,
+          ...(!isEmployee ? {
+            assignee_id: assigneeId,
+            deal_id: String(data.get("deal_id") ?? "") || null,
+          } : {}),
         });
         await refreshTasks();
       } else {
@@ -334,7 +366,7 @@ export default function TasksPage() {
   }
 
   async function deleteTask() {
-    if (!deletingTaskId || !deletingTask) return;
+    if (isEmployee || !deletingTaskId || !deletingTask) return;
     setDeleting(true);
     setDeleteError("");
     try {
@@ -380,25 +412,42 @@ export default function TasksPage() {
       {routedTaskId && taskDetailQuery.isError ? <div className="load-error" role="alert">Задача не найдена или недоступна</div> : null}
       {!taskQuery.isLoading && !userQuery.isLoading && !taskQuery.isError && !userQuery.isError ? <section className="task-board">
         <header><span>Статус</span><span>Задача</span><span>Срок</span><span>Исполнитель</span><span>Действия</span></header>
-        {visible.map((task) => (
-          <div className={`task-table-row task-table-row--${task.status}`} key={task.id}>
-            <button
-              type="button"
-              className="task-check"
-              onClick={() => void toggleTask(task.id)}
-              aria-label={`${task.status === "done" ? "Возобновить" : "Завершить"} задачу «${task.title}»`}
+        {visible.map((task) => {
+          const taskDealId = remoteEnabled
+            ? (taskQuery.data?.items.find((item) => item.id === task.id) ?? (routedApiTask?.id === task.id ? routedApiTask : null))?.deal_id ?? null
+            : null;
+          return (
+            <div
+              className={`task-table-row task-table-row--${task.status}`}
+              key={task.id}
             >
-              {task.status === "done" ? <Check size={16} /> : <Circle size={16} />}
-            </button>
-            <span className="task-table-row__summary"><strong>{task.title}</strong><small>{task.entity}</small></span>
-            <time>{task.dueAt}</time>
-            <span className="owner-line"><Avatar user={task.assignee} size="sm" /> {task.assignee.name}</span>
-            <span className="task-table-row__actions">
-              <button type="button" className="icon-button" onClick={() => openTaskEditor(task.id)} aria-label={`Редактировать задачу «${task.title}»`}><Pencil size={16} aria-hidden="true" /></button>
-              <button type="button" className="icon-button task-delete-button" onClick={() => openDeleteConfirmation(task.id)} aria-label={`Удалить задачу «${task.title}»`}><Trash2 size={16} aria-hidden="true" /></button>
-            </span>
-          </div>
-        ))}
+              <button type="button" className="task-table-row__open" aria-label={`Открыть задачу «${task.title}»`} onClick={() => openTaskEditor(task.id)} />
+              <button
+                type="button"
+                className="task-check"
+                onClick={() => void toggleTask(task.id)}
+                aria-label={`${task.status === "done" ? "Возобновить" : "Завершить"} задачу «${task.title}»`}
+              >
+                {task.status === "done" ? <Check size={16} /> : <Circle size={16} />}
+              </button>
+              <span className="task-table-row__summary">
+                <strong>{task.title}</strong>
+                <small className="task-table-row__meta">
+                  <span>{task.entity}</span>
+                  {taskDealId ? <Link
+                    to={`/deals?deal=${encodeURIComponent(taskDealId)}`}
+                    aria-label={`Открыть сделку для задачи «${task.title}»`}
+                  >Открыть сделку <ArrowUpRight size={13} aria-hidden="true" /></Link> : null}
+                </small>
+              </span>
+              <time>{task.dueAt}</time>
+              <span className="owner-line"><Avatar user={task.assignee} size="sm" /> {task.assignee.name}</span>
+              <span className="task-table-row__actions">
+                {!isEmployee ? <button type="button" className="icon-button task-delete-button" onClick={() => openDeleteConfirmation(task.id)} aria-label={`Удалить задачу «${task.title}»`}><Trash2 size={16} aria-hidden="true" /></button> : null}
+              </span>
+            </div>
+          );
+        })}
         {!visible.length ? <p className="empty-copy">Задачи не найдены</p> : null}
       </section> : null}
       {!taskQuery.isLoading && showPagination ? <nav className="list-pagination" aria-label="Пагинация задач">
@@ -418,7 +467,9 @@ export default function TasksPage() {
               <label className="field"><span>Тип</span><select name="task_type" defaultValue="follow_up"><option value="follow_up">Связаться</option><option value="meeting">Встреча</option><option value="purchase">Следующая покупка</option></select></label>
               <label className="field"><span>Срок</span><input name="due_at" type="datetime-local" required /></label>
               <label className="field"><span>Напомнить</span><input name="remind_at" type="datetime-local" /></label>
-              <label className="field"><span>Исполнитель</span><select name="assignee_id" required defaultValue={remoteEnabled ? userQuery.data?.[0]?.id : demoUsers.ak.id}>{remoteEnabled ? (userQuery.data ?? []).map((user) => <option key={user.id} value={user.id}>{user.full_name}</option>) : Object.values(demoUsers).map((user) => <option key={user.id} value={user.id}>{user.name}</option>)}</select></label>
+              {isEmployee
+                ? <div className="field" aria-label="Исполнитель"><span>Исполнитель</span><strong>{currentUser.name}</strong><input name="assignee_id" type="hidden" value={currentUser.id} /></div>
+                : <label className="field"><span>Исполнитель</span><select name="assignee_id" required defaultValue={remoteEnabled ? userQuery.data?.[0]?.id : demoUsers.ak.id}>{remoteEnabled ? (userQuery.data ?? []).map((user) => <option key={user.id} value={user.id}>{user.full_name}</option>) : Object.values(demoUsers).map((user) => <option key={user.id} value={user.id}>{user.name}</option>)}</select></label>}
               <label className="field"><span>Сделка</span><select name="deal_id" defaultValue=""><option value="">Без привязки</option>{deals.map((deal) => <option key={deal.id} value={deal.id}>{deal.title}</option>)}</select></label>
               {createError ? <p className="form-error" role="alert">{createError}</p> : null}
               <div className="dialog-actions"><Dialog.Close asChild><Button type="button">Отмена</Button></Dialog.Close><Button type="submit" variant="primary" disabled={creating}>{creating ? "Создаём…" : "Создать задачу"}</Button></div>
@@ -437,15 +488,17 @@ export default function TasksPage() {
               <label className="field"><span>Тип</span><select name="task_type" defaultValue={editingTaskType}>{preservesUnknownTaskType ? <option value={editingTaskType}>{preservedTaskTypeLabel(editingTaskType)}</option> : null}<option value="follow_up">Связаться</option><option value="meeting">Встреча</option><option value="purchase">Следующая покупка</option></select></label>
               <label className="field"><span>Срок</span><input name="due_at" type="datetime-local" required defaultValue={toDateTimeLocal(editingApiTask?.due_at ?? null)} /></label>
               <label className="field"><span>Напомнить</span><input name="remind_at" type="datetime-local" defaultValue={toDateTimeLocal(editingApiTask?.remind_at ?? null)} /></label>
-              <label className="field"><span>Исполнитель</span><select name="assignee_id" required defaultValue={editingApiTask?.assignee_id ?? editingTask.assignee.id}>{remoteEnabled ? (userQuery.data ?? []).map((user) => <option key={user.id} value={user.id}>{user.full_name}</option>) : Object.values(demoUsers).map((user) => <option key={user.id} value={user.id}>{user.name}</option>)}</select></label>
-              <label className="field"><span>Сделка</span><select name="deal_id" defaultValue={editingDealId}><option value="">Без привязки</option>{preservesUnloadedDeal ? <option value={editingDealId}>Текущая сделка (вне загруженного списка)</option> : null}{deals.map((deal) => <option key={deal.id} value={deal.id}>{deal.title}</option>)}</select></label>
+              {isEmployee
+                ? <div className="field" aria-label="Исполнитель"><span>Исполнитель</span><strong>{editingTask.assignee.name}</strong><input name="assignee_id" type="hidden" value={editingApiTask?.assignee_id ?? editingTask.assignee.id} /></div>
+                : <label className="field"><span>Исполнитель</span><select name="assignee_id" required defaultValue={editingApiTask?.assignee_id ?? editingTask.assignee.id}>{remoteEnabled ? (userQuery.data ?? []).map((user) => <option key={user.id} value={user.id}>{user.full_name}</option>) : Object.values(demoUsers).map((user) => <option key={user.id} value={user.id}>{user.name}</option>)}</select></label>}
+              {!isEmployee ? <label className="field"><span>Сделка</span><select name="deal_id" defaultValue={editingDealId}><option value="">Без привязки</option>{preservesUnloadedDeal ? <option value={editingDealId}>Текущая сделка (вне загруженного списка)</option> : null}{deals.map((deal) => <option key={deal.id} value={deal.id}>{deal.title}</option>)}</select></label> : null}
               {editError ? <p className="form-error" role="alert">{editError}</p> : null}
               <div className="dialog-actions"><Dialog.Close asChild><Button type="button" disabled={editing}>Отмена</Button></Dialog.Close><Button type="submit" variant="primary" disabled={editing}>{editing ? "Сохраняем…" : "Сохранить"}</Button></div>
             </form> : null}
           </Dialog.Content>
         </Dialog.Portal>
       </Dialog.Root>
-      <Dialog.Root open={Boolean(deletingTaskId)} onOpenChange={(open) => { if (!open && !deleting) closeDeleteConfirmation(); }}>
+      {!isEmployee ? <Dialog.Root open={Boolean(deletingTaskId)} onOpenChange={(open) => { if (!open && !deleting) closeDeleteConfirmation(); }}>
         <Dialog.Portal>
           <Dialog.Overlay className="dialog-overlay" />
           <Dialog.Content className="dialog-content task-delete-dialog" aria-describedby="delete-task-description">
@@ -455,7 +508,7 @@ export default function TasksPage() {
             <div className="dialog-actions"><Dialog.Close asChild><Button type="button" disabled={deleting}>Отмена</Button></Dialog.Close><Button type="button" variant="danger" disabled={deleting} onClick={() => void deleteTask()}>{deleting ? "Удаляем…" : "Удалить задачу"}</Button></div>
           </Dialog.Content>
         </Dialog.Portal>
-      </Dialog.Root>
+      </Dialog.Root> : null}
     </div>
   );
 }

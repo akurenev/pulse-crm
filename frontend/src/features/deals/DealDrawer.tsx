@@ -26,13 +26,20 @@ import { ApiError, api, remoteEnabled } from "../../lib/api";
 import { parseDealTags } from "../../lib/deal-tags";
 import { formatLongDate, formatMoney, formatTime } from "../../lib/format";
 import { DealMutationInProgressError } from "../../state/crm-store";
-import type { ApiActivity, ApiCompany, ApiContact, ApiCustomField, CursorPage } from "../../types/api";
+import type { ApiActivity, ApiAttachmentDownload, ApiCompany, ApiContact, ApiCustomField, ApiNoteAttachment, CursorPage } from "../../types/api";
 import type { Deal, Pipeline, UserSummary } from "../../types/crm";
+
+const MAX_NOTE_FILES = 5;
+const MAX_NOTE_FILE_BYTES = 20 * 1024 * 1024;
+const NOTE_FILE_ACCEPT = ".jpg,.jpeg,.png,.gif,.webp,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.odt,.ods,.odp,.rtf,.txt,.csv";
 
 interface DealDrawerProps {
   deal: Deal | null;
   pipeline: Pipeline;
   assignees: UserSummary[];
+  canAccessCompanies?: boolean;
+  canDelete?: boolean;
+  canManageAssignee?: boolean;
   mutationPending: boolean;
   onClose: () => void;
   onMove: (dealId: string, stageId: string) => Promise<void>;
@@ -48,26 +55,38 @@ interface DealDrawerProps {
   onDelete: (dealId: string) => Promise<void>;
 }
 
-export function DealDrawer({ deal, pipeline, assignees, mutationPending, onClose, onMove, onSetNextPurchase, onSetContact, onSetCompany, onSetAssignee, onSetTags, onSetCustomFields, onSendMessage, onRetryMessage, onToggleTask, onDelete }: DealDrawerProps) {
+export function DealDrawer({ deal, pipeline, assignees, canAccessCompanies = true, canDelete = true, canManageAssignee = true, mutationPending, onClose, onMove, onSetNextPurchase, onSetContact, onSetCompany, onSetAssignee, onSetTags, onSetCustomFields, onSendMessage, onRetryMessage, onToggleTask, onDelete }: DealDrawerProps) {
   const queryClient = useQueryClient();
-  const mobileModal = useMediaQuery("(max-width: 720px)");
+  const overlayModal = useMediaQuery("(max-width: 1100px)");
   const [tab, setTab] = useState("details");
   const [messageError, setMessageError] = useState("");
   const [noteError, setNoteError] = useState("");
   const [noteSaving, setNoteSaving] = useState(false);
+  const [noteFiles, setNoteFiles] = useState<File[]>([]);
+  const [noteFilesInvalid, setNoteFilesInvalid] = useState(false);
+  const [downloadingNoteAttachmentId, setDownloadingNoteAttachmentId] = useState<string | null>(null);
+  const [noteDownloadError, setNoteDownloadError] = useState("");
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [deleteError, setDeleteError] = useState("");
   const [stageError, setStageError] = useState("");
   const historyQuery = useQuery({
     queryKey: ["activity", "deal", deal?.id],
-    queryFn: () => api.get<CursorPage<ApiActivity>>(`/activity?limit=100&entity_type=deal&entity_id=${deal?.id}`),
+    queryFn: ({ signal }) => api.get<CursorPage<ApiActivity>>(
+      `/activity?limit=100&entity_type=deal&entity_id=${deal?.id}`,
+      { signal },
+    ),
     enabled: remoteEnabled && Boolean(deal?.id),
   });
   useEffect(() => {
     setDeleteConfirmOpen(false);
     setDeleteError("");
     setStageError("");
+    setTab("details");
+    setNoteFiles([]);
+    setNoteFilesInvalid(false);
+    setNoteError("");
+    setNoteDownloadError("");
   }, [deal?.id]);
   if (!deal) return null;
 
@@ -114,13 +133,58 @@ export function DealDrawer({ deal, pipeline, assignees, mutationPending, onClose
     setNoteSaving(true);
     setNoteError("");
     try {
-      await api.post<ApiActivity>(`/deals/${deal.id}/notes`, { body });
+      if (noteFiles.length) {
+        const upload = new FormData();
+        upload.set("body", body);
+        for (const file of noteFiles) upload.append("files", file);
+        await api.upload<ApiActivity>(`/deals/${deal.id}/notes/with-attachments`, upload);
+      } else {
+        await api.post<ApiActivity>(`/deals/${deal.id}/notes`, { body });
+      }
       form.reset();
+      setNoteFiles([]);
       await queryClient.invalidateQueries({ queryKey: ["activity", "deal", deal.id] });
-    } catch {
-      setNoteError("Не удалось сохранить заметку");
+    } catch (reason) {
+      setNoteError(noteMutationErrorMessage(reason));
     } finally {
       setNoteSaving(false);
+    }
+  }
+
+  function selectNoteFiles(files: FileList | null) {
+    const next = Array.from(files ?? []);
+    if (next.length > MAX_NOTE_FILES) {
+      setNoteFiles([]);
+      setNoteFilesInvalid(true);
+      setNoteError(`К одной заметке можно прикрепить не больше ${MAX_NOTE_FILES} файлов.`);
+      return;
+    }
+    const oversized = next.find((file) => file.size > MAX_NOTE_FILE_BYTES);
+    if (oversized) {
+      setNoteFiles([]);
+      setNoteFilesInvalid(true);
+      setNoteError(`Файл «${oversized.name}» превышает лимит 20 МБ.`);
+      return;
+    }
+    setNoteFilesInvalid(false);
+    setNoteError("");
+    setNoteFiles(next);
+  }
+
+  async function downloadNoteAttachment(attachment: ApiNoteAttachment) {
+    setDownloadingNoteAttachmentId(attachment.id);
+    setNoteDownloadError("");
+    try {
+      const download = await api.get<ApiAttachmentDownload>(`/note-attachments/${attachment.id}/download`);
+      const link = document.createElement("a");
+      link.href = download.url;
+      link.target = "_blank";
+      link.rel = "noopener noreferrer";
+      link.click();
+    } catch {
+      setNoteDownloadError("Не удалось открыть файл. Обновите карточку и повторите.");
+    } finally {
+      setDownloadingNoteAttachmentId(null);
     }
   }
 
@@ -139,9 +203,13 @@ export function DealDrawer({ deal, pipeline, assignees, mutationPending, onClose
     }
   }
 
+  const activityItems = historyQuery.data?.items ?? [];
+  const noteItems = activityItems.filter((event) => event.event_type === "deal.note.created");
+  const historyItems = activityItems.filter((event) => event.event_type !== "deal.note.created");
+
   return (
     <>
-      <Dialog.Root open modal={mobileModal && !deleteConfirmOpen} onOpenChange={(open) => { if (!open && !deleteConfirmOpen) onClose(); }}>
+      <Dialog.Root open modal={overlayModal && !(canDelete && deleteConfirmOpen)} onOpenChange={(open) => { if (!open && !(canDelete && deleteConfirmOpen)) onClose(); }}>
       <Dialog.Portal>
         <Dialog.Overlay className="drawer-overlay" />
         <Dialog.Content className="deal-drawer" aria-describedby={undefined} aria-busy={mutationPending}>
@@ -157,7 +225,7 @@ export function DealDrawer({ deal, pipeline, assignees, mutationPending, onClose
               </select>
             </label>
             <div className="deal-drawer__header-actions">
-              <button
+              {canDelete ? <button
                 type="button"
                 className="icon-button deal-drawer__delete"
                 aria-label="Удалить сделку"
@@ -166,7 +234,7 @@ export function DealDrawer({ deal, pipeline, assignees, mutationPending, onClose
                 onClick={() => { setDeleteError(""); setDeleteConfirmOpen(true); }}
               >
                 <Trash2 size={18} aria-hidden="true" />
-              </button>
+              </button> : null}
               <Dialog.Close className="icon-button deal-drawer__close" aria-label="Закрыть карточку">
                 <X size={19} />
               </Dialog.Close>
@@ -177,6 +245,7 @@ export function DealDrawer({ deal, pipeline, assignees, mutationPending, onClose
           <Tabs.Root value={tab} onValueChange={setTab} className="deal-tabs">
             <Tabs.List aria-label="Разделы сделки">
               <Tabs.Trigger value="details">Детали</Tabs.Trigger>
+              <Tabs.Trigger value="fields">Поля</Tabs.Trigger>
               <Tabs.Trigger value="tasks">Задачи</Tabs.Trigger>
               <Tabs.Trigger value="messages">Переписка{deal.messages.length ? <span>{deal.messages.length}</span> : null}</Tabs.Trigger>
               <Tabs.Trigger value="history">История</Tabs.Trigger>
@@ -191,13 +260,15 @@ export function DealDrawer({ deal, pipeline, assignees, mutationPending, onClose
                   </div>
                   {deal.phone ? <div className="deal-details__row deal-details__row--phone"><dt className="deal-details__label"><Phone size={17} aria-hidden="true" /><span className="deal-details__label-text">Телефон</span></dt><dd className="deal-details__value"><a href={`tel:${deal.phone}`}>{deal.phone}</a></dd></div> : null}
                   {deal.email ? <div className="deal-details__row deal-details__row--email"><dt className="deal-details__label"><Mail size={17} aria-hidden="true" /><span className="deal-details__label-text">Email</span></dt><dd className="deal-details__value"><a href={`mailto:${deal.email}`}>{deal.email}</a></dd></div> : null}
-                  <div className="deal-details__row deal-details__row--company">
+                  {canAccessCompanies ? <div className="deal-details__row deal-details__row--company">
                     <dt className="deal-details__label"><Building2 size={17} aria-hidden="true" /><span className="deal-details__label-text">Компания</span></dt>
                     <dd className="deal-details__value"><CompanyPicker deal={deal} disabled={mutationPending} onSave={onSetCompany} /></dd>
-                  </div>
+                  </div> : null}
                   <div className="deal-details__row deal-details__row--owner">
                     <dt className="deal-details__label"><UserRoundCheck size={17} aria-hidden="true" /><span className="deal-details__label-text">Ответственный</span></dt>
-                    <dd className="deal-details__value"><AssigneePicker key={deal.id} deal={deal} assignees={assignees} disabled={mutationPending} onSave={onSetAssignee} /></dd>
+                    <dd className="deal-details__value">{canManageAssignee
+                      ? <AssigneePicker key={deal.id} deal={deal} assignees={assignees} disabled={mutationPending} onSave={onSetAssignee} />
+                      : <span className="relation-value owner-value"><span className="owner-line"><Avatar user={deal.assignee} size="sm" /><span>{deal.assignee.name}</span></span></span>}</dd>
                   </div>
                   <div className="deal-details__row deal-details__row--tags">
                     <dt className="deal-details__label"><Tag size={17} aria-hidden="true" /><span className="deal-details__label-text">Теги</span></dt>
@@ -208,9 +279,56 @@ export function DealDrawer({ deal, pipeline, assignees, mutationPending, onClose
                     <dd className="deal-details__value"><NextPurchaseEditor key={deal.id} deal={deal} disabled={mutationPending} onSave={onSetNextPurchase} /></dd>
                   </div>
                 </dl>
+                <form key={deal.id} className="note-composer note-composer--details" onSubmit={(event) => void handleNote(event)}>
+                  <label htmlFor={`deal-note-${deal.id}`}>Заметка о сделке</label>
+                  <textarea id={`deal-note-${deal.id}`} name="note" rows={3} maxLength={10_000} required placeholder="Зафиксировать договорённость или итог разговора" />
+                  <div className="note-composer__file-row">
+                    <label className="note-file-picker">
+                      <Paperclip size={15} aria-hidden="true" />
+                      <span>Прикрепить файлы</span>
+                      <input
+                        type="file"
+                        multiple
+                        accept={NOTE_FILE_ACCEPT}
+                        aria-label="Добавить файлы к заметке"
+                        disabled={noteSaving}
+                        onChange={(event) => selectNoteFiles(event.target.files)}
+                      />
+                    </label>
+                    <small>До 5 файлов, каждый до 20 МБ</small>
+                  </div>
+                  {noteFiles.length ? <ul className="note-file-selection" aria-label="Файлы заметки">
+                    {noteFiles.map((file, index) => <li key={`${file.name}:${file.size}:${index}`}>
+                      <Paperclip size={13} aria-hidden="true" />
+                      <span title={file.name}>{file.name}</span>
+                      <small>{formatFileSize(file.size)}</small>
+                      <button type="button" aria-label={`Убрать файл ${file.name}`} disabled={noteSaving} onClick={() => setNoteFiles((current) => current.filter((_, itemIndex) => itemIndex !== index))}><X size={13} aria-hidden="true" /></button>
+                    </li>)}
+                  </ul> : null}
+                  <p className="note-composer__privacy">Вложения сохраняются в заметке CRM и не отправляются клиенту в переписке.</p>
+                  <button type="submit" disabled={noteSaving || noteFilesInvalid}>{noteSaving ? "Сохраняем…" : "Добавить заметку"}</button>
+                  {noteError ? <small className="message-error" role="alert">{noteError}</small> : null}
+                </form>
+                <section className="deal-notes" aria-labelledby={`deal-notes-title-${deal.id}`}>
+                  <header><h3 id={`deal-notes-title-${deal.id}`}>Заметки</h3><small>{historyQuery.isError ? "Ошибка загрузки" : noteItems.length || "Нет заметок"}</small></header>
+                  {historyQuery.isLoading ? <p className="empty-copy">Загружаем заметки…</p> : null}
+                  {historyQuery.isError ? <div className="drawer-query-error" role="alert"><p>Не удалось загрузить заметки.</p><button type="button" onClick={() => void historyQuery.refetch()}>Повторить</button></div> : null}
+                  {!historyQuery.isError ? <ol className="deal-notes__list">
+                    {noteItems.map((event) => <li key={event.id}>
+                      <p>{activityDetail(event)}</p>
+                      {(event.attachments ?? []).length ? <ul className="note-attachments" aria-label="Вложения заметки">
+                        {(event.attachments ?? []).map((attachment) => <li key={attachment.id}><button type="button" disabled={downloadingNoteAttachmentId === attachment.id} onClick={() => void downloadNoteAttachment(attachment)}><Paperclip size={14} aria-hidden="true" /><span title={attachment.original_filename}>{attachment.original_filename}</span><small>{formatFileSize(attachment.size_bytes)}</small></button></li>)}
+                      </ul> : null}
+                      <time>{formatActivityDate(event.occurred_at)}</time>
+                    </li>)}
+                  </ol> : null}
+                  {!historyQuery.isLoading && !historyQuery.isError && !noteItems.length ? <p className="empty-copy">Договорённости и приложенные документы появятся здесь.</p> : null}
+                  {noteDownloadError ? <p className="message-error" role="alert">{noteDownloadError}</p> : null}
+                </section>
+              </Tabs.Content>
+
+              <Tabs.Content value="fields" className="drawer-section drawer-section--fields">
                 <CustomFieldsEditor key={deal.id} deal={deal} disabled={mutationPending} onSave={onSetCustomFields} />
-                <DrawerTasks deal={deal} onToggleTask={onToggleTask} />
-                <DrawerMessages deal={deal} onSubmit={handleMessage} onRetryMessage={onRetryMessage} error={messageError} />
               </Tabs.Content>
 
               <Tabs.Content value="tasks" className="drawer-section">
@@ -222,22 +340,18 @@ export function DealDrawer({ deal, pipeline, assignees, mutationPending, onClose
               </Tabs.Content>
 
               <Tabs.Content value="history" className="drawer-section">
-                <form className="note-composer" onSubmit={(event) => void handleNote(event)}>
-                  <textarea name="note" rows={3} maxLength={10_000} placeholder="Добавить заметку к сделке" aria-label="Текст заметки" />
-                  <button type="submit" disabled={noteSaving}>{noteSaving ? "Сохраняем…" : "Добавить заметку"}</button>
-                  {noteError ? <small className="message-error" role="alert">{noteError}</small> : null}
-                </form>
                 {historyQuery.isLoading ? <p className="empty-copy timeline-loading">Загружаем историю…</p> : null}
-                <ol className="timeline">
-                  {remoteEnabled ? (historyQuery.data?.items ?? []).map((event) => (
+                {historyQuery.isError ? <div className="drawer-query-error drawer-query-error--timeline" role="alert"><p>Не удалось загрузить историю сделки.</p><button type="button" onClick={() => void historyQuery.refetch()}>Повторить</button></div> : null}
+                {!historyQuery.isError ? <ol className="timeline">
+                  {remoteEnabled ? historyItems.map((event) => (
                     <li key={event.id}><span /><div><strong>{activityTitle(event.event_type)}</strong><p>{activityDetail(event)}</p><time>{formatActivityDate(event.occurred_at)}</time></div></li>
                   )) : <>
                     <li><span /><div><strong>Сделка создана</strong><p>Источник: {deal.sourceLabel}</p><time>Сегодня</time></div></li>
                     <li><span /><div><strong>Назначен ответственный</strong><p>{deal.assignee.name}</p><time>Сегодня</time></div></li>
                     <li><span /><div><strong>Этап изменён</strong><p>{pipeline.stages.find((stage) => stage.id === deal.stageId)?.name}</p><time>Сегодня</time></div></li>
                   </>}
-                </ol>
-                {remoteEnabled && !historyQuery.isLoading && !historyQuery.data?.items.length ? <p className="empty-copy">История пока пуста</p> : null}
+                </ol> : null}
+                {remoteEnabled && !historyQuery.isLoading && !historyQuery.isError && !historyItems.length ? <p className="empty-copy">История пока пуста</p> : null}
               </Tabs.Content>
             </div>
           </Tabs.Root>
@@ -245,7 +359,7 @@ export function DealDrawer({ deal, pipeline, assignees, mutationPending, onClose
       </Dialog.Portal>
       </Dialog.Root>
 
-      <Dialog.Root
+      {canDelete ? <Dialog.Root
         open={deleteConfirmOpen}
         onOpenChange={(open) => {
           if (!deleting) {
@@ -271,7 +385,7 @@ export function DealDrawer({ deal, pipeline, assignees, mutationPending, onClose
             </div>
           </Dialog.Content>
         </Dialog.Portal>
-      </Dialog.Root>
+      </Dialog.Root> : null}
     </>
   );
 }
@@ -299,6 +413,26 @@ function activityDetail(event: ApiActivity) {
 
 function formatActivityDate(value: string) {
   return new Intl.DateTimeFormat("ru-RU", { dateStyle: "medium", timeStyle: "short" }).format(new Date(value));
+}
+
+function formatFileSize(bytes: number) {
+  if (bytes < 1024) return `${bytes} Б`;
+  if (bytes < 1024 * 1024) return `${Math.ceil(bytes / 1024)} КБ`;
+  return `${(bytes / (1024 * 1024)).toLocaleString("ru-RU", { maximumFractionDigits: 1 })} МБ`;
+}
+
+function noteMutationErrorMessage(reason: unknown) {
+  if (!(reason instanceof ApiError)) return "Не удалось сохранить заметку. Повторите попытку.";
+  if (reason.status === 404) return "Сделка не найдена или больше вам недоступна.";
+  if (reason.status === 413) return "Один из файлов превышает лимит 20 МБ.";
+  if (reason.status === 503) return "Хранилище файлов временно недоступно. Попробуйте позже.";
+  const detail = reason.details && typeof reason.details === "object" && "detail" in reason.details
+    ? (reason.details as { detail?: unknown }).detail
+    : undefined;
+  if (detail === "archives and executable files are not allowed") return "Архивы и исполняемые файлы прикреплять нельзя.";
+  if (detail === "file extension and content type are not allowed") return "Этот тип файла нельзя прикрепить к заметке.";
+  if (detail === "attachment must not be empty") return "Нельзя прикрепить пустой файл.";
+  return "Не удалось сохранить заметку. Проверьте файлы и повторите попытку.";
 }
 
 function useMediaQuery(query: string) {
@@ -400,7 +534,10 @@ function ContactPicker({ deal, disabled, onSave }: { deal: Deal; disabled: boole
   const deferredSearch = useDeferredValue(search.trim());
   const results = useQuery({
     queryKey: ["contact-picker", deferredSearch],
-    queryFn: () => api.get<CursorPage<ApiContact>>(`/contacts?limit=20&search=${encodeURIComponent(deferredSearch)}`),
+    queryFn: ({ signal }) => api.get<CursorPage<ApiContact>>(
+      `/contacts?limit=20&search=${encodeURIComponent(deferredSearch)}`,
+      { signal },
+    ),
     enabled: remoteEnabled && editing && deferredSearch.length >= 2,
   });
 
@@ -444,7 +581,10 @@ function CompanyPicker({ deal, disabled, onSave }: { deal: Deal; disabled: boole
   const deferredSearch = useDeferredValue(search.trim());
   const results = useQuery({
     queryKey: ["company-picker", deferredSearch],
-    queryFn: () => api.get<CursorPage<ApiCompany>>(`/companies?limit=20&search=${encodeURIComponent(deferredSearch)}`),
+    queryFn: ({ signal }) => api.get<CursorPage<ApiCompany>>(
+      `/companies?limit=20&search=${encodeURIComponent(deferredSearch)}`,
+      { signal },
+    ),
     enabled: remoteEnabled && editing && deferredSearch.length >= 2,
   });
 
@@ -524,7 +664,7 @@ function EditFieldButton({ label, disabled = false, onClick }: { label: string; 
 function CustomFieldsEditor({ deal, disabled, onSave }: { deal: Deal; disabled: boolean; onSave: DealDrawerProps["onSetCustomFields"] }) {
   const definitions = useQuery({
     queryKey: ["deal-custom-fields"],
-    queryFn: () => api.get<ApiCustomField[]>("/custom-fields?entity_type=deal"),
+    queryFn: ({ signal }) => api.get<ApiCustomField[]>("/custom-fields?entity_type=deal", { signal }),
     enabled: remoteEnabled,
   });
   const [draft, setDraft] = useState<Record<string, unknown>>(() => ({ ...(deal.customFields ?? {}) }));

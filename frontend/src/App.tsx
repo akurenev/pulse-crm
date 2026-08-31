@@ -56,6 +56,6 @@ function AuthGate() {
 
 function AdminOnly({ children }: { children: ReactNode }) {
   const { session } = useAuth();
-  if (session?.user.role === "manager") return <Navigate to="/deals" replace />;
+  if (session?.user.role !== "owner" && session?.user.role !== "admin") return <Navigate to="/deals" replace />;
   return children;
 }

@@ -10,7 +10,8 @@ export interface ApiUser {
   id: string;
   email: string;
   full_name: string;
-  role: "owner" | "admin" | "manager" | null;
+  role: "owner" | "admin" | "manager" | "employee" | null;
+  version: number;
 }
 
 export interface AuthResponse {
@@ -22,7 +23,7 @@ export interface AuthResponse {
 export interface InvitationCreated {
   id: string;
   email: string;
-  role: "admin" | "manager";
+  role: "admin" | "manager" | "employee";
   expires_at: string;
   token: string;
 }
@@ -115,6 +116,7 @@ export interface ApiContact {
   first_name: string;
   last_name: string;
   company_id: string | null;
+  assignee_id: string | null;
   primary_email: string | null;
   primary_phone: string | null;
   emails: string[];
@@ -147,6 +149,23 @@ export interface ApiActivity {
   actor_id: string | null;
   payload: Record<string, unknown>;
   occurred_at: string;
+  attachments: ApiNoteAttachment[];
+}
+
+export interface ApiNoteAttachment {
+  id: string;
+  activity_event_id: string;
+  position: number;
+  original_filename: string;
+  content_type: string;
+  size_bytes: number;
+  sha256: string;
+  created_at: string;
+}
+
+export interface ApiAttachmentDownload {
+  url: string;
+  expires_in: number;
 }
 
 export interface ApiMessage {

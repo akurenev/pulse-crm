@@ -9,14 +9,14 @@ import {
 } from "@dnd-kit/core";
 import { sortableKeyboardCoordinates } from "@dnd-kit/sortable";
 import { Columns3, Filter, List, Plus, Search } from "lucide-react";
-import { useDeferredValue, useEffect, useId, useMemo, useState } from "react";
+import { useCallback, useDeferredValue, useEffect, useId, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 
 import { Avatar } from "../../components/Avatar";
 import { Button } from "../../components/Button";
 import { SourceBadge } from "../../components/SourceBadge";
 import { formatMoney, formatShortDate } from "../../lib/format";
-import { ApiError } from "../../lib/api";
+import { ApiError, remoteEnabled } from "../../lib/api";
 import { deepLinkEntityId } from "../../lib/deep-links";
 import { DealMutationInProgressError, useCrm, useDeferredSelection } from "../../state/crm-store";
 import { DealDrawer } from "./DealDrawer";
@@ -25,6 +25,8 @@ import { StageColumn } from "./StageColumn";
 
 export function DealsPage() {
   const {
+    currentUser,
+    isEmployee,
     deals,
     pipeline,
     pipelines,
@@ -66,6 +68,8 @@ export function DealsPage() {
   const [notice, setNotice] = useState<string | null>(null);
   const [searchParams, setSearchParams] = useSearchParams();
   const routedDealId = deepLinkEntityId(searchParams, "deal");
+  const accessGenerationRef = useRef(0);
+  const mountedRef = useRef(false);
   const kanbanScrollHintId = useId();
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 8 } }),
@@ -77,6 +81,28 @@ export function DealsPage() {
   }, [deferredSearch, setDealSearch]);
 
   useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      accessGenerationRef.current += 1;
+    };
+  }, []);
+
+  const clearDealSelection = useCallback((reason: unknown, accessChanged = false) => {
+    setNotice(reason instanceof ApiError && reason.status === 404
+      ? "Сделка не найдена или больше вам недоступна."
+      : accessChanged
+        ? "Не удалось подтвердить доступ к сделке. Откройте её снова."
+        : "Не удалось открыть сделку из уведомления.");
+    setSearchParams((current) => {
+      const next = new URLSearchParams(current);
+      next.delete("deal");
+      return next;
+    }, { replace: true });
+    selectDeal(null);
+  }, [selectDeal, setSearchParams]);
+
+  useEffect(() => {
     if (!routedDealId) {
       if (selectedDealId) selectDeal(null);
       return;
@@ -86,25 +112,30 @@ export function DealsPage() {
     const controller = new AbortController();
     void openDeal(routedDealId, controller.signal).catch((reason: unknown) => {
       if (!active || controller.signal.aborted) return;
-      setNotice(reason instanceof ApiError && reason.status === 404
-        ? "Сделка не найдена или уже удалена."
-        : "Не удалось открыть сделку из уведомления.");
-      const next = new URLSearchParams(searchParams);
-      next.delete("deal");
-      setSearchParams(next, { replace: true });
-      selectDeal(null);
+      clearDealSelection(reason);
     });
     return () => {
       active = false;
       controller.abort();
     };
-  }, [loading, openDeal, routedDealId, searchParams, selectDeal, selectedDeal, selectedDealId, setSearchParams]);
+  }, [clearDealSelection, loading, openDeal, routedDealId, selectDeal, selectedDeal, selectedDealId]);
+
+  useEffect(() => {
+    if (!remoteEnabled) return;
+    const purgeSelectedDeal = () => {
+      accessGenerationRef.current += 1;
+      if (!selectedDealId && !routedDealId) return;
+      clearDealSelection(new Error("access changed"), true);
+    };
+    window.addEventListener("pulse:access-changed", purgeSelectedDeal);
+    return () => window.removeEventListener("pulse:access-changed", purgeSelectedDeal);
+  }, [clearDealSelection, routedDealId, selectedDealId]);
 
   function handleSelectDeal(dealId: string) {
     const next = new URLSearchParams(searchParams);
     next.set("deal", dealId);
     setSearchParams(next);
-    selectDeal(dealId);
+    if (!remoteEnabled || !isEmployee) selectDeal(dealId);
   }
 
   function handleCloseDeal() {
@@ -239,52 +270,66 @@ export function DealsPage() {
         </div>
       </DndContext> : null}
 
-      {!loading && !error && layout === "list" ? <section className="data-table deals-list" role="region" aria-label="Список сделок">
-        <div className="data-table__header"><span>Сделка</span><span>Этап</span><span>Сумма</span><span>Источник и срок</span><span>Ответственный</span></div>
-        {visibleDeals.map((deal) => (
-          <button
-            className="data-row deals-list__row"
-            type="button"
-            key={deal.id}
-            aria-label={`Открыть сделку ${deal.title}. Этап ${pipeline.stages.find((stage) => stage.id === deal.stageId)?.name ?? "Без этапа"}. Сумма ${formatMoney(deal.amount)}. Источник ${deal.sourceLabel}. Срок ${formatShortDate(deal.dueDate)}. Ответственный ${deal.assignee.name}`}
-            onClick={() => handleSelectDeal(deal.id)}
-          >
-            <span className="data-row__primary deals-list__deal" data-label="Сделка">
-              <span className="company-avatar" aria-hidden="true">{deal.title.slice(0, 1)}</span>
-              <span className="deals-list__identity">
-                <strong title={deal.title}>{deal.title}</strong>
-                <small title={deal.tags.length ? `${deal.subtitle} · ${deal.tags.join(" · ")}` : deal.subtitle}>{deal.tags.length ? `${deal.subtitle} · ${deal.tags.join(" · ")}` : deal.subtitle}</small>
-              </span>
-            </span>
-            <span className="deals-list__stage" data-label="Этап">
-              <strong>{pipeline.stages.find((stage) => stage.id === deal.stageId)?.name ?? "Без этапа"}</strong>
-              <small>{pipeline.name}</small>
-            </span>
-            <span className="deals-list__amount" data-label="Сумма">
-              <strong>{formatMoney(deal.amount)}</strong>
-              <small>{deal.currency}</small>
-            </span>
-            <span className="deals-list__source" data-label="Источник и срок">
-              <SourceBadge source={deal.source} label={deal.sourceLabel} />
-              <small className="deals-list__due-date">до <time dateTime={deal.dueDate}>{formatShortDate(deal.dueDate)}</time></small>
-            </span>
-            <span className="owner-line deals-list__owner" data-label="Ответственный"><Avatar user={deal.assignee} size="sm" /><span>{deal.assignee.name}</span></span>
-          </button>
-        ))}
+      {!loading && !error && layout === "list" ? <section className="deals-list" role="region" aria-label="Список сделок">
+        <ul className="deals-list__cards">
+          {visibleDeals.map((deal) => (
+            <li key={deal.id}>
+              <button
+                className="deals-list__row"
+                type="button"
+                aria-label={`Открыть сделку ${deal.title}. Этап ${pipeline.stages.find((stage) => stage.id === deal.stageId)?.name ?? "Без этапа"}. Сумма ${formatMoney(deal.amount)}. Источник ${deal.sourceLabel}. Срок ${formatShortDate(deal.dueDate)}. Ответственный ${deal.assignee.name}`}
+                onClick={() => handleSelectDeal(deal.id)}
+              >
+                <span className="deals-list__deal" data-label="Сделка">
+                  <span className="company-avatar" aria-hidden="true">{deal.title.slice(0, 1)}</span>
+                  <span className="deals-list__identity">
+                    <strong title={deal.title}>{deal.title}</strong>
+                    <small title={deal.tags.length ? `${deal.subtitle} · ${deal.tags.join(" · ")}` : deal.subtitle}>{deal.tags.length ? `${deal.subtitle} · ${deal.tags.join(" · ")}` : deal.subtitle}</small>
+                  </span>
+                </span>
+                <span className="deals-list__stage" data-label="Этап">
+                  <small>Этап</small>
+                  <strong>{pipeline.stages.find((stage) => stage.id === deal.stageId)?.name ?? "Без этапа"}</strong>
+                  <small>{pipeline.name}</small>
+                </span>
+                <span className="deals-list__amount" data-label="Сумма">
+                  <small>Сумма</small>
+                  <strong>{formatMoney(deal.amount)}</strong>
+                  <small>{deal.currency}</small>
+                </span>
+                <span className="deals-list__source" data-label="Источник и срок">
+                  <small>Источник и срок</small>
+                  <SourceBadge source={deal.source} label={deal.sourceLabel} />
+                  <small className="deals-list__due-date">до <time dateTime={deal.dueDate}>{formatShortDate(deal.dueDate)}</time></small>
+                </span>
+                <span className="owner-line deals-list__owner" data-label="Ответственный">
+                  <Avatar user={deal.assignee} size="sm" />
+                  <span><small>Ответственный</small><strong>{deal.assignee.name}</strong></span>
+                </span>
+              </button>
+            </li>
+          ))}
+        </ul>
+        {!visibleDeals.length ? <p className="empty-copy">Сделки не найдены</p> : null}
       </section> : null}
 
       <NewDealDialog
         open={createOpen}
         onOpenChange={setCreateOpen}
         onSubmit={async (input) => {
+          const accessGeneration = accessGenerationRef.current;
           const created = await addDeal(input);
+          if (!mountedRef.current || accessGeneration !== accessGenerationRef.current) return;
           handleSelectDeal(created.id);
         }}
       />
       <DealDrawer
         deal={selectedDeal}
         pipeline={pipeline}
-        assignees={dealAssignees}
+        assignees={isEmployee ? [currentUser] : dealAssignees}
+        canAccessCompanies={!isEmployee}
+        canDelete={!isEmployee}
+        canManageAssignee={!isEmployee}
         mutationPending={selectedDealMutationPending}
         onClose={handleCloseDeal}
         onMove={moveDeal}

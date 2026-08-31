@@ -1,9 +1,18 @@
 from __future__ import annotations
 
+import uuid
+
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.integrations.messaging import list_deal_messages, queue_outbound_message
+from app.integrations import messaging
+from app.integrations.messaging import (
+    ConversationRoute,
+    MessagingNotFoundError,
+    OriginConversationError,
+    list_deal_messages,
+    queue_outbound_message,
+)
 from app.integrations.models import (
     ChannelConnection,
     ChannelKind,
@@ -49,6 +58,7 @@ async def test_deal_reply_uses_its_origin_channel_and_is_queued(
         deal_id=deal.id,  # type: ignore[attr-defined]
         actor_id=user.id,  # type: ignore[attr-defined]
         body="  Добрый день!  ",
+        required_deal_assignee_id=user.id,  # type: ignore[attr-defined]
     )
     assert message.body == "Добрый день!"
     assert message.status.value == "queued"
@@ -60,3 +70,52 @@ async def test_deal_reply_uses_its_origin_channel_and_is_queued(
         limit=50,
     )
     assert [(row[0].id, row[1].kind.value) for row in rows] == [(message.id, "telegram")]
+
+    deal.assignee_id = None  # type: ignore[attr-defined]
+    await db.flush()
+    with pytest.raises(MessagingNotFoundError, match="deal not found"):
+        await queue_outbound_message(
+            db,
+            workspace_id=workspace.id,  # type: ignore[attr-defined]
+            deal_id=deal.id,  # type: ignore[attr-defined]
+            actor_id=user.id,  # type: ignore[attr-defined]
+            body="Уже не моя сделка",
+            required_deal_assignee_id=user.id,  # type: ignore[attr-defined]
+        )
+
+
+@pytest.mark.asyncio
+async def test_outbound_queue_rejects_conversation_moved_after_authorization(
+    db: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace_id = uuid.uuid4()
+    requested_deal_id = uuid.uuid4()
+    connection = ChannelConnection(
+        id=uuid.uuid4(),
+        workspace_id=workspace_id,
+        kind=ChannelKind.telegram,
+        name="Moved route",
+        status=ConnectionStatus.active,
+    )
+    conversation = Conversation(
+        id=uuid.uuid4(),
+        workspace_id=workspace_id,
+        channel_connection_id=connection.id,
+        deal_id=uuid.uuid4(),
+        external_thread_id="moved-route-thread",
+    )
+
+    async def moved_route(*_args: object, **_kwargs: object) -> ConversationRoute:
+        return ConversationRoute(conversation=conversation, connection=connection)
+
+    monkeypatch.setattr(messaging, "resolve_origin_conversation", moved_route)
+
+    with pytest.raises(OriginConversationError, match="moved to another deal"):
+        await queue_outbound_message(
+            db,
+            workspace_id=workspace_id,
+            deal_id=requested_deal_id,
+            actor_id=uuid.uuid4(),
+            body="Не должно попасть в чужую сделку",
+        )

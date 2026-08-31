@@ -37,15 +37,23 @@ class ConversationRoute:
 
 
 async def ensure_deal(
-    session: AsyncSession, *, workspace_id: uuid.UUID, deal_id: uuid.UUID
+    session: AsyncSession,
+    *,
+    workspace_id: uuid.UUID,
+    deal_id: uuid.UUID,
+    required_assignee_id: uuid.UUID | None = None,
+    for_update: bool = False,
 ) -> Deal:
-    deal = await session.scalar(
-        sa.select(Deal).where(
-            Deal.id == deal_id,
-            Deal.workspace_id == workspace_id,
-            Deal.deleted_at.is_(None),
-        )
+    query = sa.select(Deal).where(
+        Deal.id == deal_id,
+        Deal.workspace_id == workspace_id,
+        Deal.deleted_at.is_(None),
     )
+    if required_assignee_id is not None:
+        query = query.where(Deal.assignee_id == required_assignee_id)
+    if for_update:
+        query = query.with_for_update()
+    deal = await session.scalar(query)
     if deal is None:
         raise MessagingNotFoundError("deal not found")
     return deal
@@ -71,9 +79,13 @@ async def resolve_origin_conversation(
     )
     if conversation_id is not None:
         query = query.where(Conversation.id == conversation_id)
-    query = query.order_by(
-        Conversation.last_message_at.desc().nullslast(), Conversation.updated_at.desc()
-    ).limit(1)
+    query = (
+        query.order_by(
+            Conversation.last_message_at.desc().nullslast(), Conversation.updated_at.desc()
+        )
+        .limit(1)
+        .with_for_update(of=Conversation)
+    )
     row = (await session.execute(query)).one_or_none()
     if row is None:
         raise OriginConversationError("deal has no active origin-channel conversation")
@@ -89,18 +101,27 @@ async def queue_outbound_message(
     actor_id: uuid.UUID,
     body: str,
     conversation_id: uuid.UUID | None = None,
+    required_deal_assignee_id: uuid.UUID | None = None,
 ) -> tuple[Message, ChannelConnection]:
     """Queue a reply through the deal's original active channel."""
 
     normalized_body = body.strip()
     if not normalized_body or len(normalized_body) > 10_000:
         raise ValueError("message body must contain between 1 and 10000 characters")
-    await ensure_deal(session, workspace_id=workspace_id, deal_id=deal_id)
     route = await resolve_origin_conversation(
         session,
         workspace_id=workspace_id,
         deal_id=deal_id,
         conversation_id=conversation_id,
+    )
+    if route.conversation.deal_id != deal_id:
+        raise OriginConversationError("origin-channel conversation moved to another deal")
+    await ensure_deal(
+        session,
+        workspace_id=workspace_id,
+        deal_id=deal_id,
+        required_assignee_id=required_deal_assignee_id,
+        for_update=True,
     )
     created_at = datetime.now(UTC)
     message = Message(
@@ -142,19 +163,30 @@ async def list_deal_messages(
     limit: int,
     before_created_at: datetime | None = None,
     before_id: uuid.UUID | None = None,
+    required_deal_assignee_id: uuid.UUID | None = None,
 ) -> list[tuple[Message, ChannelConnection]]:
-    await ensure_deal(session, workspace_id=workspace_id, deal_id=deal_id)
+    await ensure_deal(
+        session,
+        workspace_id=workspace_id,
+        deal_id=deal_id,
+        required_assignee_id=required_deal_assignee_id,
+    )
     query = (
         sa.select(Message, ChannelConnection)
         .join(Conversation, Conversation.id == Message.conversation_id)
         .join(ChannelConnection, ChannelConnection.id == Conversation.channel_connection_id)
+        .join(Deal, Deal.id == Conversation.deal_id)
         .where(
             Message.workspace_id == workspace_id,
             Conversation.workspace_id == workspace_id,
             Conversation.deal_id == deal_id,
             ChannelConnection.workspace_id == workspace_id,
+            Deal.workspace_id == workspace_id,
+            Deal.deleted_at.is_(None),
         )
     )
+    if required_deal_assignee_id is not None:
+        query = query.where(Deal.assignee_id == required_deal_assignee_id)
     if before_created_at is not None and before_id is not None:
         query = query.where(
             sa.or_(

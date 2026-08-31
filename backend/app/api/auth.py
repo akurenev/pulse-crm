@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import secrets
+import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Annotated
 
@@ -32,6 +33,7 @@ from app.schemas import (
     InvitationCreated,
     LoginRequest,
     UserRead,
+    UserUpdate,
     WorkspaceRead,
 )
 from app.security import (
@@ -47,15 +49,28 @@ from app.security import (
     set_session_cookie,
     verify_password,
 )
-from app.services.events import record_domain_event
+from app.services.events import record_access_change, record_audit_event, record_domain_event
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 users_router = APIRouter(tags=["users"])
 
 
-def _auth_response(user: User, workspace: Workspace, role: Role, csrf_token: str) -> AuthResponse:
+def _auth_response(
+    user: User,
+    workspace: Workspace,
+    role: Role,
+    csrf_token: str,
+    *,
+    version: int = 1,
+) -> AuthResponse:
     return AuthResponse(
-        user=UserRead(id=user.id, email=user.email, full_name=user.full_name, role=role),
+        user=UserRead(
+            id=user.id,
+            email=user.email,
+            full_name=user.full_name,
+            role=role,
+            version=version,
+        ),
         workspace=WorkspaceRead.model_validate(workspace),
         csrf_token=csrf_token,
     )
@@ -159,7 +174,7 @@ async def bootstrap(
         ) from exc
 
     set_session_cookie(response, token, settings)
-    return _auth_response(user, workspace, Role.owner, csrf_token)
+    return _auth_response(user, workspace, Role.owner, csrf_token, version=membership.version)
 
 
 @router.post("/login", response_model=AuthResponse)
@@ -194,7 +209,13 @@ async def login(
     )
     await db.commit()
     set_session_cookie(response, token, settings)
-    return _auth_response(user, workspace, membership.role, csrf_token)
+    return _auth_response(
+        user,
+        workspace,
+        membership.role,
+        csrf_token,
+        version=membership.version,
+    )
 
 
 @router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
@@ -234,7 +255,13 @@ async def me(
         .values(csrf_token_hash=digest_token(csrf_token))
     )
     await db.commit()
-    return _auth_response(context.user, context.workspace, context.role, csrf_token=csrf_token)
+    return _auth_response(
+        context.user,
+        context.workspace,
+        context.role,
+        csrf_token=csrf_token,
+        version=context.membership.version,
+    )
 
 
 @router.post("/accept-invitation", response_model=AuthResponse, status_code=status.HTTP_201_CREATED)
@@ -297,25 +324,170 @@ async def accept_invitation(
     )
     await db.commit()
     set_session_cookie(response, token, settings)
-    return _auth_response(user, workspace, membership.role, csrf_token)
+    return _auth_response(
+        user,
+        workspace,
+        membership.role,
+        csrf_token,
+        version=membership.version,
+    )
 
 
 @users_router.get("/users", response_model=list[UserRead])
 async def list_users(
     context: CurrentUser, db: AsyncSession = Depends(get_session)
 ) -> list[UserRead]:
-    rows = (
-        await db.execute(
-            sa.select(User, Membership.role)
-            .join(Membership, Membership.user_id == User.id)
-            .where(Membership.workspace_id == context.workspace_id, User.is_active.is_(True))
-            .order_by(User.full_name)
-        )
-    ).all()
+    query = (
+        sa.select(User, Membership.role, Membership.version)
+        .join(Membership, Membership.user_id == User.id)
+        .where(Membership.workspace_id == context.workspace_id, User.is_active.is_(True))
+        .order_by(User.full_name)
+    )
+    if context.role is Role.employee:
+        query = query.where(User.id == context.user_id)
+    rows = (await db.execute(query)).all()
     return [
-        UserRead(id=user.id, email=user.email, full_name=user.full_name, role=role)
-        for user, role in rows
+        UserRead(
+            id=user.id,
+            email=user.email,
+            full_name=user.full_name,
+            role=role,
+            version=version,
+        )
+        for user, role, version in rows
     ]
+
+
+def _user_version_conflict() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={"code": "version_conflict", "message": "record was modified"},
+    )
+
+
+async def _active_owner_count(db: AsyncSession, workspace_id: uuid.UUID) -> int:
+    count = await db.scalar(
+        sa.select(sa.func.count())
+        .select_from(Membership)
+        .join(User, User.id == Membership.user_id)
+        .where(
+            Membership.workspace_id == workspace_id,
+            Membership.role == Role.owner,
+            User.is_active.is_(True),
+        )
+    )
+    return int(count or 0)
+
+
+@users_router.patch("/users/{user_id}", response_model=UserRead)
+async def update_user(
+    user_id: uuid.UUID,
+    payload: UserUpdate,
+    context: CurrentAdmin,
+    db: AsyncSession = Depends(get_session),
+) -> UserRead:
+    row = (
+        await db.execute(
+            sa.select(User, Membership)
+            .join(Membership, Membership.user_id == User.id)
+            .where(
+                Membership.workspace_id == context.workspace_id,
+                Membership.user_id == user_id,
+                User.is_active.is_(True),
+            )
+        )
+    ).one_or_none()
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="user not found")
+    user, membership = row
+
+    requested_role = payload.role if "role" in payload.model_fields_set else membership.role
+    if requested_role is None:  # Defensive: request validation rejects explicit null.
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="role cannot be null",
+        )
+    if context.role is Role.admin:
+        if membership.role in {Role.owner, Role.admin}:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="administrators cannot edit owners or other administrators",
+            )
+        if requested_role in {Role.owner, Role.admin}:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="only the workspace owner can assign elevated roles",
+            )
+    if user_id == context.user_id and requested_role != membership.role:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "self_role_change_forbidden",
+                "message": "you cannot change your own role",
+            },
+        )
+    if membership.role == Role.owner and requested_role != Role.owner:
+        if await _active_owner_count(db, context.workspace_id) <= 1:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": "last_owner_required",
+                    "message": "the workspace must retain an owner",
+                },
+            )
+
+    normalized_name = payload.full_name
+    role_changed = requested_role != membership.role
+    values: dict[str, object] = {
+        "version": payload.expected_version + 1,
+        "updated_at": datetime.now(UTC),
+    }
+    if "role" in payload.model_fields_set:
+        values["role"] = requested_role
+    updated_membership = (
+        await db.execute(
+            sa.update(Membership)
+            .where(
+                Membership.id == membership.id,
+                Membership.workspace_id == context.workspace_id,
+                Membership.version == payload.expected_version,
+            )
+            .values(**values)
+            .returning(Membership)
+        )
+    ).scalar_one_or_none()
+    if updated_membership is None:
+        raise _user_version_conflict()
+    if normalized_name is not None:
+        user.full_name = normalized_name
+
+    record_audit_event(
+        db,
+        workspace_id=context.workspace_id,
+        event_type="user.updated",
+        entity_type="user",
+        entity_id=user.id,
+        actor_id=context.user_id,
+        payload={
+            "full_name_changed": normalized_name is not None,
+            "role_changed": role_changed,
+            "role": requested_role.value,
+        },
+    )
+    record_access_change(
+        db,
+        workspace_id=context.workspace_id,
+        recipient_ids={user.id},
+        resource="all",
+    )
+    await db.commit()
+    return UserRead(
+        id=user.id,
+        email=user.email,
+        full_name=user.full_name,
+        role=updated_membership.role,
+        version=updated_membership.version,
+    )
 
 
 @users_router.post(

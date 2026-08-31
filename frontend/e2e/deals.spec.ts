@@ -19,6 +19,7 @@ test("kanban opens a deal and sends a message", async ({ page }, testInfo) => {
   await expect(drawer.getByRole("combobox", { name: "Этап сделки" })).toHaveValue("contacted");
 
   const message = "Коммерческое предложение отправим сегодня до 17:00.";
+  await drawer.getByRole("tab", { name: "Переписка" }).click();
   await drawer.getByPlaceholder("Написать сообщение").fill(message);
   await drawer.getByRole("button", { name: "Отправить", exact: true }).click();
   await expect(drawer.getByText(message, { exact: true })).toBeVisible();

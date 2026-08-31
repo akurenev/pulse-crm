@@ -48,9 +48,11 @@ from app.models import (
     Deal,
     DealContact,
     DealStageHistory,
+    Membership,
     Source,
     Stage,
     StageType,
+    User,
 )
 from app.services.events import record_domain_event
 
@@ -205,7 +207,7 @@ async def _route_channel_message(
             Conversation.workspace_id == event.workspace_id,
             Conversation.channel_connection_id == connection.id,
             Conversation.external_thread_id == normalized.thread_id,
-        )
+        ).with_for_update()
     )
     if conversation is not None:
         duplicate = await session.scalar(
@@ -244,7 +246,11 @@ async def _route_channel_message(
             contact = fallback.contact
             ambiguous = fallback.ambiguous
             if contact is None and not ambiguous:
-                contact = _new_provider_contact(event.workspace_id, normalized)
+                contact = _new_provider_contact(
+                    event.workspace_id,
+                    normalized,
+                    assignee_id=route.assignee_id,
+                )
                 session.add(contact)
                 await session.flush()
                 created_contact = True
@@ -382,6 +388,7 @@ async def _open_conversation_deal(
             Deal.deleted_at.is_(None),
             Stage.stage_type == StageType.open,
         )
+        .with_for_update(of=Deal)
     )
     if deal is not None:
         return deal
@@ -403,15 +410,13 @@ async def _open_conversation_deal(
 async def _connection_route(session: AsyncSession, connection: ChannelConnection) -> LeadRoute:
     if connection.default_pipeline_id is None or connection.default_stage_id is None:
         raise InboundRoutingError("channel connection has no default pipeline and stage")
-    stage_id = await session.scalar(
-        sa.select(Stage.id).where(
-            Stage.id == connection.default_stage_id,
-            Stage.pipeline_id == connection.default_pipeline_id,
-            Stage.workspace_id == connection.workspace_id,
-        )
+    route = LeadRoute(
+        pipeline_id=connection.default_pipeline_id,
+        stage_id=connection.default_stage_id,
+        assignee_id=connection.default_assignee_id,
+        source_id=None,
     )
-    if stage_id is None:
-        raise InboundRoutingError("channel default stage does not belong to its pipeline")
+    await _validate_route(session, connection.workspace_id, route)
     source_id = await _ensure_source(
         session,
         workspace_id=connection.workspace_id,
@@ -424,18 +429,24 @@ async def _connection_route(session: AsyncSession, connection: ChannelConnection
         }[connection.kind],
     )
     return LeadRoute(
-        pipeline_id=connection.default_pipeline_id,
-        stage_id=connection.default_stage_id,
-        assignee_id=connection.default_assignee_id,
+        pipeline_id=route.pipeline_id,
+        stage_id=route.stage_id,
+        assignee_id=route.assignee_id,
         source_id=source_id,
     )
 
 
-def _new_provider_contact(workspace_id: uuid.UUID, normalized: NormalizedInboundMessage) -> Contact:
+def _new_provider_contact(
+    workspace_id: uuid.UUID,
+    normalized: NormalizedInboundMessage,
+    *,
+    assignee_id: uuid.UUID | None,
+) -> Contact:
     display_name = (normalized.sender_display_name or normalized.sender_id).strip()
     first_name, _, last_name = display_name.partition(" ")
     return Contact(
         workspace_id=workspace_id,
+        assignee_id=assignee_id,
         first_name=first_name[:120] or "Новый клиент",
         last_name=last_name[:120],
         primary_email=(normalized.sender_id if normalized.provider == "email" else None),
@@ -514,7 +525,12 @@ async def _route_structured_lead(
     contact_payload = _mapping(payload.get("contact"))
     deal_payload = _mapping(payload.get("deal"))
     message_payload = _mapping(payload.get("message"))
-    resolution = await _resolve_structured_contact(session, workspace_id, contact_payload)
+    resolution = await _resolve_structured_contact(
+        session,
+        workspace_id,
+        contact_payload,
+        assignee_id=route.assignee_id,
+    )
     deal = await _find_open_deal(
         session,
         workspace_id=workspace_id,
@@ -749,6 +765,16 @@ async def _validate_route(session: AsyncSession, workspace_id: uuid.UUID, route:
     )
     if valid is None:
         raise InboundRoutingError("lead target stage does not belong to its pipeline")
+    if route.assignee_id is not None and not await session.scalar(
+        sa.select(Membership.id)
+        .join(User, User.id == Membership.user_id)
+        .where(
+            Membership.workspace_id == workspace_id,
+            Membership.user_id == route.assignee_id,
+            User.is_active.is_(True),
+        )
+    ):
+        raise InboundRoutingError("lead assignee is not an active workspace member")
 
 
 async def _ensure_source(
@@ -808,6 +834,8 @@ async def _resolve_structured_contact(
     session: AsyncSession,
     workspace_id: uuid.UUID,
     payload: Mapping[str, Any],
+    *,
+    assignee_id: uuid.UUID | None,
 ) -> ContactResolution:
     email = str(payload.get("email") or payload.get("primary_email") or "").strip()
     phone = str(payload.get("phone") or payload.get("primary_phone") or "").strip()
@@ -857,6 +885,7 @@ async def _resolve_structured_contact(
     first_name, last_name = _structured_name(payload)
     contact = Contact(
         workspace_id=workspace_id,
+        assignee_id=assignee_id,
         first_name=first_name,
         last_name=last_name,
         primary_email=email or None,

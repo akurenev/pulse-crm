@@ -29,6 +29,7 @@ from app.models import (
     TaskStatus,
 )
 from app.security import CurrentAdmin, CurrentUser
+from app.services.access import deal_access_condition, is_employee, task_access_condition
 
 router = APIRouter(tags=["operations"])
 
@@ -93,8 +94,8 @@ async def dashboard(
     db: AsyncSession = Depends(get_session),
 ) -> DashboardRead:
     now = datetime.now(UTC)
-    new_leads = await db.scalar(
-        sa.select(sa.func.count())
+    new_leads_query = (
+        sa.select(sa.func.count(ActivityEvent.id))
         .select_from(ActivityEvent)
         .where(
             ActivityEvent.workspace_id == context.workspace_id,
@@ -102,13 +103,25 @@ async def dashboard(
             ActivityEvent.occurred_at >= now - timedelta(hours=24),
         )
     )
+    if is_employee(context):
+        new_leads_query = new_leads_query.join(
+            Deal,
+            sa.and_(
+                Deal.id == ActivityEvent.entity_id,
+                Deal.workspace_id == context.workspace_id,
+                Deal.deleted_at.is_(None),
+                deal_access_condition(context),
+            ),
+        )
+    new_leads = await db.scalar(new_leads_query)
     overdue = await db.scalar(
-        sa.select(sa.func.count())
+        sa.select(sa.func.count(Task.id))
         .select_from(Task)
         .where(
             Task.workspace_id == context.workspace_id,
             Task.status == TaskStatus.open,
             Task.due_at < now,
+            task_access_condition(context),
         )
     )
     inactive = await db.scalar(
@@ -118,6 +131,7 @@ async def dashboard(
         .where(
             Deal.workspace_id == context.workspace_id,
             Deal.deleted_at.is_(None),
+            deal_access_condition(context),
             Deal.last_activity_at < now - timedelta(days=7),
             Stage.workspace_id == context.workspace_id,
             Stage.stage_type == StageType.open,
@@ -131,6 +145,11 @@ async def dashboard(
             PurchaseSchedule.status == PurchaseScheduleStatus.active,
             PurchaseSchedule.scheduled_for >= now,
             PurchaseSchedule.scheduled_for <= now + timedelta(days=30),
+            *(
+                (PurchaseSchedule.assignee_id == context.user_id,)
+                if is_employee(context)
+                else ()
+            ),
         )
     )
     pipeline_rows = (
@@ -147,6 +166,7 @@ async def dashboard(
                     Deal.pipeline_id == Pipeline.id,
                     Deal.workspace_id == context.workspace_id,
                     Deal.deleted_at.is_(None),
+                    deal_access_condition(context),
                 ),
             )
             .outerjoin(Stage, Stage.id == Deal.stage_id)
@@ -205,19 +225,39 @@ async def list_in_app_notifications(
     db: AsyncSession = Depends(get_session),
     limit: int = Query(default=20, ge=1, le=100),
 ) -> list[InAppNotificationRead]:
+    query = sa.select(NotificationDelivery).where(
+        NotificationDelivery.workspace_id == context.workspace_id,
+        NotificationDelivery.channel == "in_app",
+        NotificationDelivery.recipient_id == context.user_id,
+        NotificationDelivery.status == DeliveryStatus.delivered,
+        NotificationDelivery.delivered_at.is_not(None),
+    )
+    if is_employee(context):
+        owned_deal = sa.exists(
+            sa.select(Deal.id).where(
+                Deal.id == NotificationDelivery.target_entity_id,
+                Deal.workspace_id == context.workspace_id,
+                Deal.deleted_at.is_(None),
+                deal_access_condition(context),
+            )
+        )
+        owned_task = sa.exists(
+            sa.select(Task.id).where(
+                Task.id == NotificationDelivery.target_entity_id,
+                Task.workspace_id == context.workspace_id,
+                task_access_condition(context),
+            )
+        )
+        query = query.where(
+            sa.or_(
+                sa.and_(NotificationDelivery.target_entity_type == "deal", owned_deal),
+                sa.and_(NotificationDelivery.target_entity_type == "task", owned_task),
+            )
+        )
     deliveries = list(
         (
             await db.scalars(
-                sa.select(NotificationDelivery)
-                .where(
-                    NotificationDelivery.workspace_id == context.workspace_id,
-                    NotificationDelivery.channel == "in_app",
-                    NotificationDelivery.recipient_id == context.user_id,
-                    NotificationDelivery.status == DeliveryStatus.delivered,
-                    NotificationDelivery.delivered_at.is_not(None),
-                )
-                .order_by(NotificationDelivery.delivered_at.desc())
-                .limit(limit)
+                query.order_by(NotificationDelivery.delivered_at.desc()).limit(limit)
             )
         ).all()
     )

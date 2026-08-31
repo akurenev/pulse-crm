@@ -13,6 +13,7 @@ import sqlalchemy as sa
 from app.db import SessionLocal
 from app.integrations.amo import AmoEntity, AmoImportError, AmoPage, apply_import_page
 from app.integrations.amocrm_live import (
+    AmoImportDependencyError,
     AmoV4Client,
     PulseAmoWriter,
     _tags,
@@ -28,9 +29,13 @@ from app.integrations.models import (
     ExternalEntityMap,
     ImportJob,
     ImportStatus,
+    PurchaseSchedule,
+    PurchaseScheduleStatus,
 )
+from app.integrations.purchases import ensure_purchase_task
 from app.integrations.s3 import AttachmentStorage
 from app.integrations.secrets import SecretCipher
+from app.main import app
 from app.models import (
     ActivityEvent,
     BackgroundJob,
@@ -43,6 +48,7 @@ from app.models import (
     FieldType,
     Membership,
     Pipeline,
+    RealtimeEvent,
     Role,
     Stage,
     StageType,
@@ -50,6 +56,7 @@ from app.models import (
     User,
     Workspace,
 )
+from app.services.access import notification_target_access_allowed
 from app.services.jobs import ClaimedJob
 
 
@@ -71,6 +78,39 @@ class FlakyReportS3:
         self, client_method: str, *, Params: dict[str, Any], ExpiresIn: int
     ) -> str:
         return f"https://s3.test/{client_method}/{Params['Key']}?expires={ExpiresIn}"
+
+
+def _csrf(auth: dict[str, Any]) -> dict[str, str]:
+    return {"X-CSRF-Token": str(auth["csrf_token"])}
+
+
+async def _invite_employee(
+    owner_client: httpx.AsyncClient,
+    owner_auth: dict[str, Any],
+    *,
+    email: str,
+    full_name: str,
+) -> tuple[httpx.AsyncClient, dict[str, Any]]:
+    invitation = await owner_client.post(
+        "/api/v1/invitations",
+        headers=_csrf(owner_auth),
+        json={"email": email, "role": "employee"},
+    )
+    assert invitation.status_code == 201, invitation.text
+    employee_client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://testserver",
+    )
+    accepted = await employee_client.post(
+        "/api/v1/auth/accept-invitation",
+        json={
+            "token": invitation.json()["token"],
+            "full_name": full_name,
+            "password": "employee import test password",
+        },
+    )
+    assert accepted.status_code == 201, accepted.text
+    return employee_client, accepted.json()
 
 
 @pytest.mark.asyncio
@@ -242,9 +282,23 @@ async def test_workspace_writer_imports_full_domain_and_reruns_without_duplicate
     async with SessionLocal() as db:
         workspace = Workspace(name="Writer", slug="amocrm-writer")
         owner = User(email="writer@example.com", full_name="Writer", password_hash="unused")
-        db.add_all([workspace, owner])
+        employee = User(
+            email="writer-employee@example.com",
+            full_name="Writer Employee",
+            password_hash="unused",
+        )
+        db.add_all([workspace, owner, employee])
         await db.flush()
-        db.add(Membership(workspace_id=workspace.id, user_id=owner.id, role=Role.owner))
+        db.add_all(
+            [
+                Membership(workspace_id=workspace.id, user_id=owner.id, role=Role.owner),
+                Membership(
+                    workspace_id=workspace.id,
+                    user_id=employee.id,
+                    role=Role.employee,
+                ),
+            ]
+        )
         await db.flush()
         writer = PulseAmoWriter()
 
@@ -255,7 +309,7 @@ async def test_workspace_writer_imports_full_domain_and_reruns_without_duplicate
                 status=ImportStatus.running,
                 dry_run=False,
                 entity_type=entity_type,
-                user_mapping={"7": str(owner.id)},
+                user_mapping={"7": str(owner.id), "8": str(employee.id)},
             )
             db.add(job)
             await db.flush()
@@ -327,6 +381,7 @@ async def test_workspace_writer_imports_full_domain_and_reruns_without_duplicate
                     "30",
                     {
                         "id": 30,
+                        "responsible_user_id": 7,
                         "first_name": "Анна",
                         "last_name": "Иванова",
                         "custom_fields_values": [
@@ -412,6 +467,7 @@ async def test_workspace_writer_imports_full_domain_and_reruns_without_duplicate
         assert company.tags == ["Партнёр"]
         assert contact.company_id == company.id
         assert contact.primary_email == "anna@example.com"
+        assert contact.assignee_id == owner.id
         assert contact.tags == ["VIP"]
         assert await db.scalar(sa.select(sa.func.count()).select_from(ContactPoint)) == 1
         assert deal.company_id == company.id
@@ -463,6 +519,559 @@ async def test_workspace_writer_imports_full_domain_and_reruns_without_duplicate
         backfilled = await db.get(Deal, deal.id)
         assert backfilled is not None
         assert backfilled.tags == ["Повторная"]
+
+        access_cursor = int(
+            await db.scalar(sa.select(sa.func.max(RealtimeEvent.id))) or 0
+        )
+        await writer.upsert(
+            db,
+            workspace_id=workspace.id,
+            entity=AmoEntity(
+                "contacts",
+                "30",
+                {
+                    "id": 30,
+                    "responsible_user_id": 8,
+                    "first_name": "Анна",
+                    "last_name": "Иванова",
+                },
+            ),
+            existing_internal_id=contact.id,
+            user_mapping={"7": str(owner.id), "8": str(employee.id)},
+        )
+        await writer.upsert(
+            db,
+            workspace_id=workspace.id,
+            entity=AmoEntity(
+                "deals",
+                "40",
+                {**updated_data, "responsible_user_id": 8},
+            ),
+            existing_internal_id=deal.id,
+            user_mapping={"7": str(owner.id), "8": str(employee.id)},
+        )
+        await writer.upsert(
+            db,
+            workspace_id=workspace.id,
+            entity=AmoEntity(
+                "tasks",
+                "50",
+                {
+                    "id": 50,
+                    "text": "Позвонить",
+                    "responsible_user_id": 8,
+                    "complete_till": 1_800_000_000,
+                    "entity_type": "leads",
+                    "entity_id": 40,
+                },
+            ),
+            existing_internal_id=task.id,
+            user_mapping={"7": str(owner.id), "8": str(employee.id)},
+        )
+        await db.flush()
+        assert contact.assignee_id == employee.id
+        assert deal.assignee_id == employee.id
+        assert task.assignee_id == employee.id
+        access_events = list(
+            (
+                await db.scalars(
+                    sa.select(RealtimeEvent).where(
+                        RealtimeEvent.workspace_id == workspace.id,
+                        RealtimeEvent.event_type == "access.changed",
+                        RealtimeEvent.id > access_cursor,
+                    )
+                )
+            ).all()
+        )
+        assert {
+            (event.payload["resource"], event.payload["recipient_id"])
+            for event in access_events
+        } == {
+            (resource, str(recipient_id))
+            for resource in ("contact", "deal", "task")
+            for recipient_id in (owner.id, employee.id)
+        }
+
+
+@pytest.mark.asyncio
+async def test_deal_import_keeps_purchase_schedule_and_task_ownership_in_sync(
+    client: httpx.AsyncClient,
+    owner_auth: dict[str, Any],
+) -> None:
+    employee_a, employee_a_auth = await _invite_employee(
+        client,
+        owner_auth,
+        email="amo-schedule-a@example.com",
+        full_name="Amo Schedule A",
+    )
+    employee_b, employee_b_auth = await _invite_employee(
+        client,
+        owner_auth,
+        email="amo-schedule-b@example.com",
+        full_name="Amo Schedule B",
+    )
+    try:
+        owner_headers = _csrf(owner_auth)
+        workspace_id = uuid.UUID(str(owner_auth["workspace"]["id"]))
+        owner_id = uuid.UUID(str(owner_auth["user"]["id"]))
+        employee_a_id = uuid.UUID(str(employee_a_auth["user"]["id"]))
+        employee_b_id = uuid.UUID(str(employee_b_auth["user"]["id"]))
+
+        pipeline = (await client.get("/api/v1/pipelines")).json()[0]
+        open_stage = next(
+            stage for stage in pipeline["stages"] if stage["stage_type"] == "open"
+        )
+        old_contact = (
+            await client.post(
+                "/api/v1/contacts",
+                headers=owner_headers,
+                json={"first_name": "Old", "assignee_id": str(employee_a_id)},
+            )
+        ).json()
+        new_contact = (
+            await client.post(
+                "/api/v1/contacts",
+                headers=owner_headers,
+                json={"first_name": "New", "assignee_id": str(employee_b_id)},
+            )
+        ).json()
+        next_purchase_at = (datetime.now(UTC) + timedelta(days=10)).isoformat()
+
+        async def create_scheduled_deal(title: str) -> dict[str, Any]:
+            response = await client.post(
+                "/api/v1/deals",
+                headers=owner_headers,
+                json={
+                    "title": title,
+                    "pipeline_id": pipeline["id"],
+                    "stage_id": open_stage["id"],
+                    "assignee_id": str(employee_a_id),
+                    "contact_ids": [old_contact["id"]],
+                    "next_purchase_at": next_purchase_at,
+                },
+            )
+            assert response.status_code == 201, response.text
+            return response.json()
+
+        materialized_deal = await create_scheduled_deal("Mapped materialized")
+        unmaterialized_deal = await create_scheduled_deal("Mapped unmaterialized")
+        fallback_deal = await create_scheduled_deal("Unmapped materialized")
+        repair_deal = await create_scheduled_deal("Repair stale schedule")
+
+        async with SessionLocal() as db:
+            db.add_all(
+                [
+                    ExternalEntityMap(
+                        workspace_id=workspace_id,
+                        provider="amocrm",
+                        entity_type=entity_type,
+                        external_id=external_id,
+                        internal_id=uuid.UUID(internal_id),
+                        fingerprint=fingerprint * 64,
+                    )
+                    for entity_type, external_id, internal_id, fingerprint in (
+                        ("pipelines", "10", pipeline["id"], "a"),
+                        ("stages", "10:100", open_stage["id"], "b"),
+                        ("contacts", "30", old_contact["id"], "c"),
+                        ("contacts", "31", new_contact["id"], "d"),
+                    )
+                ]
+            )
+            await db.flush()
+            schedules = {
+                schedule.deal_id: schedule
+                for schedule in (
+                    await db.scalars(
+                        sa.select(PurchaseSchedule).where(
+                            PurchaseSchedule.workspace_id == workspace_id,
+                            PurchaseSchedule.status == PurchaseScheduleStatus.active,
+                        )
+                    )
+                ).all()
+            }
+            materialized_result = await ensure_purchase_task(
+                db,
+                workspace_id=workspace_id,
+                schedule_id=schedules[
+                    uuid.UUID(materialized_deal["id"])
+                ].id,
+            )
+            fallback_result = await ensure_purchase_task(
+                db,
+                workspace_id=workspace_id,
+                schedule_id=schedules[uuid.UUID(fallback_deal["id"])].id,
+            )
+            repair_stored_deal = await db.get(
+                Deal, uuid.UUID(repair_deal["id"])
+            )
+            assert repair_stored_deal is not None
+            repair_stored_deal.assignee_id = employee_b_id
+            materialized_task_id = materialized_result.task.id
+            materialized_task_version = materialized_result.task.version
+            fallback_task_id = fallback_result.task.id
+            access_cursor = int(
+                await db.scalar(sa.select(sa.func.max(RealtimeEvent.id))) or 0
+            )
+            await db.commit()
+
+        writer = PulseAmoWriter()
+
+        def imported_deal(
+            external_id: str, title: str, responsible_user_id: int
+        ) -> AmoEntity:
+            return AmoEntity(
+                "deals",
+                external_id,
+                {
+                    "id": int(external_id),
+                    "name": title,
+                    "pipeline_id": 10,
+                    "status_id": 100,
+                    "responsible_user_id": responsible_user_id,
+                    "_embedded": {
+                        "contacts": [{"id": 31, "is_main": True}],
+                    },
+                },
+            )
+
+        async with SessionLocal() as db:
+            await writer.upsert(
+                db,
+                workspace_id=workspace_id,
+                entity=imported_deal("40", "Mapped materialized", 8),
+                existing_internal_id=uuid.UUID(materialized_deal["id"]),
+                user_mapping={"8": str(employee_b_id)},
+            )
+            await writer.upsert(
+                db,
+                workspace_id=workspace_id,
+                entity=imported_deal("41", "Mapped unmaterialized", 8),
+                existing_internal_id=uuid.UUID(unmaterialized_deal["id"]),
+                user_mapping={"8": str(employee_b_id)},
+            )
+            await writer.upsert(
+                db,
+                workspace_id=workspace_id,
+                entity=imported_deal("42", "Unmapped materialized", 999),
+                existing_internal_id=uuid.UUID(fallback_deal["id"]),
+                user_mapping={"8": str(employee_b_id)},
+            )
+            await writer.upsert(
+                db,
+                workspace_id=workspace_id,
+                entity=imported_deal("43", "Repair stale schedule", 8),
+                existing_internal_id=uuid.UUID(repair_deal["id"]),
+                user_mapping={"8": str(employee_b_id)},
+            )
+            await db.commit()
+
+        async with SessionLocal() as db:
+            schedules = {
+                schedule.deal_id: schedule
+                for schedule in (
+                    await db.scalars(
+                        sa.select(PurchaseSchedule).where(
+                            PurchaseSchedule.workspace_id == workspace_id,
+                            PurchaseSchedule.status == PurchaseScheduleStatus.active,
+                        )
+                    )
+                ).all()
+            }
+            mapped_schedule = schedules[uuid.UUID(materialized_deal["id"])]
+            unmaterialized_schedule = schedules[
+                uuid.UUID(unmaterialized_deal["id"])
+            ]
+            fallback_schedule = schedules[uuid.UUID(fallback_deal["id"])]
+            repair_schedule = schedules[uuid.UUID(repair_deal["id"])]
+            mapped_task = await db.get(Task, materialized_task_id)
+            fallback_task = await db.get(Task, fallback_task_id)
+            fallback_stored_deal = await db.get(
+                Deal, uuid.UUID(fallback_deal["id"])
+            )
+            assert mapped_task is not None
+            assert fallback_task is not None
+            assert fallback_stored_deal is not None
+
+            assert mapped_schedule.assignee_id == employee_b_id
+            assert mapped_schedule.contact_id == uuid.UUID(new_contact["id"])
+            assert mapped_task.assignee_id == employee_b_id
+            assert mapped_task.contact_id == uuid.UUID(new_contact["id"])
+            assert mapped_task.version == materialized_task_version + 1
+            assert await db.scalar(
+                sa.select(DealContact.contact_id).where(
+                    DealContact.workspace_id == workspace_id,
+                    DealContact.deal_id == uuid.UUID(materialized_deal["id"]),
+                    DealContact.is_primary.is_(True),
+                )
+            ) == uuid.UUID(new_contact["id"])
+
+            assert unmaterialized_schedule.assignee_id == employee_b_id
+            assert unmaterialized_schedule.contact_id == uuid.UUID(new_contact["id"])
+            assert unmaterialized_schedule.task_id is None
+
+            assert fallback_stored_deal.assignee_id is None
+            assert fallback_schedule.assignee_id == owner_id
+            assert fallback_schedule.contact_id == uuid.UUID(new_contact["id"])
+            assert fallback_task.assignee_id == owner_id
+            assert fallback_task.contact_id == uuid.UUID(new_contact["id"])
+
+            assert repair_schedule.assignee_id == employee_b_id
+            assert repair_schedule.contact_id == uuid.UUID(new_contact["id"])
+            assert repair_schedule.task_id is None
+
+            mapped_task_event = await db.scalar(
+                sa.select(ActivityEvent).where(
+                    ActivityEvent.workspace_id == workspace_id,
+                    ActivityEvent.event_type == "task.updated",
+                    ActivityEvent.entity_id == materialized_task_id,
+                )
+            )
+            assert mapped_task_event is not None
+            assert mapped_task_event.payload == {
+                "fields": ["assignee_id", "contact_id"],
+                "deal_id": materialized_deal["id"],
+            }
+            access_events = list(
+                (
+                    await db.scalars(
+                        sa.select(RealtimeEvent).where(
+                            RealtimeEvent.workspace_id == workspace_id,
+                            RealtimeEvent.event_type == "access.changed",
+                            RealtimeEvent.id > access_cursor,
+                        )
+                    )
+                ).all()
+            )
+            access_pairs = {
+                (event.payload["resource"], event.payload["recipient_id"])
+                for event in access_events
+            }
+            assert {
+                ("task", str(employee_a_id)),
+                ("task", str(employee_b_id)),
+                ("task", str(owner_id)),
+                ("purchase", str(employee_a_id)),
+                ("purchase", str(employee_b_id)),
+            } <= access_pairs
+
+            assert not await notification_target_access_allowed(
+                db,
+                workspace_id=workspace_id,
+                recipient_id=employee_a_id,
+                target_entity_type="deal",
+                target_entity_id=uuid.UUID(materialized_deal["id"]),
+            )
+            assert await notification_target_access_allowed(
+                db,
+                workspace_id=workspace_id,
+                recipient_id=employee_b_id,
+                target_entity_type="deal",
+                target_entity_id=uuid.UUID(materialized_deal["id"]),
+            )
+            assert not await notification_target_access_allowed(
+                db,
+                workspace_id=workspace_id,
+                recipient_id=employee_a_id,
+                target_entity_type="task",
+                target_entity_id=materialized_task_id,
+            )
+            assert await notification_target_access_allowed(
+                db,
+                workspace_id=workspace_id,
+                recipient_id=employee_b_id,
+                target_entity_type="task",
+                target_entity_id=materialized_task_id,
+            )
+            assert not await notification_target_access_allowed(
+                db,
+                workspace_id=workspace_id,
+                recipient_id=employee_a_id,
+                target_entity_type="task",
+                target_entity_id=fallback_task_id,
+            )
+            assert await notification_target_access_allowed(
+                db,
+                workspace_id=workspace_id,
+                recipient_id=owner_id,
+                target_entity_type="task",
+                target_entity_id=fallback_task_id,
+            )
+
+        employee_a_deals = await employee_a.get("/api/v1/deals")
+        employee_b_deals = await employee_b.get("/api/v1/deals")
+        assert employee_a_deals.status_code == 200, employee_a_deals.text
+        assert employee_b_deals.status_code == 200, employee_b_deals.text
+        assert not {
+            materialized_deal["id"],
+            unmaterialized_deal["id"],
+            fallback_deal["id"],
+            repair_deal["id"],
+        } & {item["id"] for item in employee_a_deals.json()["items"]}
+        assert {
+            materialized_deal["id"],
+            unmaterialized_deal["id"],
+            repair_deal["id"],
+        } <= {item["id"] for item in employee_b_deals.json()["items"]}
+
+        employee_a_tasks = await employee_a.get(
+            "/api/v1/tasks", params={"include_completed": True}
+        )
+        employee_b_tasks = await employee_b.get(
+            "/api/v1/tasks", params={"include_completed": True}
+        )
+        assert employee_a_tasks.status_code == 200, employee_a_tasks.text
+        assert employee_b_tasks.status_code == 200, employee_b_tasks.text
+        assert str(materialized_task_id) not in {
+            item["id"] for item in employee_a_tasks.json()["items"]
+        }
+        assert str(fallback_task_id) not in {
+            item["id"] for item in employee_a_tasks.json()["items"]
+        }
+        assert str(materialized_task_id) in {
+            item["id"] for item in employee_b_tasks.json()["items"]
+        }
+
+        employee_a_dashboard = await employee_a.get("/api/v1/dashboard")
+        employee_b_dashboard = await employee_b.get("/api/v1/dashboard")
+        assert employee_a_dashboard.status_code == 200, employee_a_dashboard.text
+        assert employee_b_dashboard.status_code == 200, employee_b_dashboard.text
+        assert employee_a_dashboard.json()["upcoming_purchases_30d"] == 0
+        assert employee_b_dashboard.json()["upcoming_purchases_30d"] == 3
+    finally:
+        await employee_a.aclose()
+        await employee_b.aclose()
+
+
+@pytest.mark.asyncio
+async def test_unmapped_deal_schedule_fallback_rejects_non_privileged_employee() -> None:
+    async with SessionLocal() as db:
+        workspace = Workspace(name="Fallback", slug="amo-schedule-fallback")
+        inactive_owner = User(
+            email="inactive-owner@example.com",
+            full_name="Inactive Owner",
+            password_hash="unused",
+            is_active=False,
+        )
+        inactive_admin = User(
+            email="inactive-admin@example.com",
+            full_name="Inactive Admin",
+            password_hash="unused",
+            is_active=False,
+        )
+        employee = User(
+            email="active-employee@example.com",
+            full_name="Active Employee",
+            password_hash="unused",
+        )
+        db.add_all([workspace, inactive_owner, inactive_admin, employee])
+        await db.flush()
+        db.add_all(
+            [
+                Membership(
+                    workspace_id=workspace.id,
+                    user_id=inactive_owner.id,
+                    role=Role.owner,
+                ),
+                Membership(
+                    workspace_id=workspace.id,
+                    user_id=inactive_admin.id,
+                    role=Role.admin,
+                ),
+                Membership(
+                    workspace_id=workspace.id,
+                    user_id=employee.id,
+                    role=Role.employee,
+                ),
+            ]
+        )
+        pipeline = Pipeline(workspace_id=workspace.id, name="Import", position=0)
+        db.add(pipeline)
+        await db.flush()
+        stage = Stage(
+            workspace_id=workspace.id,
+            pipeline_id=pipeline.id,
+            name="Open",
+            position=0,
+            stage_type=StageType.open,
+        )
+        db.add(stage)
+        await db.flush()
+        deal = Deal(
+            workspace_id=workspace.id,
+            pipeline_id=pipeline.id,
+            stage_id=stage.id,
+            title="Assigned before import",
+            assignee_id=employee.id,
+        )
+        db.add(deal)
+        await db.flush()
+        schedule = PurchaseSchedule(
+            workspace_id=workspace.id,
+            deal_id=deal.id,
+            assignee_id=employee.id,
+            scheduled_for=datetime.now(UTC) + timedelta(days=10),
+            remind_at=datetime.now(UTC) + timedelta(days=7),
+        )
+        db.add_all(
+            [
+                schedule,
+                ExternalEntityMap(
+                    workspace_id=workspace.id,
+                    provider="amocrm",
+                    entity_type="pipelines",
+                    external_id="10",
+                    internal_id=pipeline.id,
+                    fingerprint="a" * 64,
+                ),
+                ExternalEntityMap(
+                    workspace_id=workspace.id,
+                    provider="amocrm",
+                    entity_type="stages",
+                    external_id="10:100",
+                    internal_id=stage.id,
+                    fingerprint="b" * 64,
+                ),
+            ]
+        )
+        await db.commit()
+        workspace_id = workspace.id
+        deal_id = deal.id
+        schedule_id = schedule.id
+        employee_id = employee.id
+
+    async with SessionLocal() as db:
+        with pytest.raises(
+            AmoImportDependencyError,
+            match="no active fallback assignee",
+        ):
+            await PulseAmoWriter().upsert(
+                db,
+                workspace_id=workspace_id,
+                entity=AmoEntity(
+                    "deals",
+                    "40",
+                    {
+                        "id": 40,
+                        "name": "Unmapped after import",
+                        "pipeline_id": 10,
+                        "status_id": 100,
+                        "responsible_user_id": 999,
+                    },
+                ),
+                existing_internal_id=deal_id,
+                user_mapping={},
+            )
+        await db.rollback()
+
+    async with SessionLocal() as db:
+        stored_deal = await db.get(Deal, deal_id)
+        stored_schedule = await db.get(PurchaseSchedule, schedule_id)
+        assert stored_deal is not None
+        assert stored_schedule is not None
+        assert stored_deal.assignee_id == employee_id
+        assert stored_deal.title == "Assigned before import"
+        assert stored_schedule.assignee_id == employee_id
+        assert stored_schedule.status == PurchaseScheduleStatus.active
 
 
 @pytest.mark.asyncio

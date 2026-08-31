@@ -43,6 +43,8 @@ from app.integrations.models import (
     ExternalEntityMap,
     ImportJob,
     ImportStatus,
+    PurchaseSchedule,
+    PurchaseScheduleStatus,
 )
 from app.integrations.s3 import AttachmentStorage
 from app.integrations.secrets import SecretCipher
@@ -66,6 +68,7 @@ from app.models import (
     TaskStatus,
     User,
 )
+from app.services.events import record_access_change, record_domain_event
 from app.services.jobs import ClaimedJob, JobHandler, SessionFactory
 
 AMO_PROVIDER = "amocrm"
@@ -837,8 +840,15 @@ class PulseAmoWriter(ImportEntityWriter):
         existing_internal_id: uuid.UUID | None,
         user_mapping: Mapping[str, str],
     ) -> uuid.UUID:
-        del user_mapping
         model = await _scoped_existing(session, Contact, workspace_id, existing_internal_id)
+        previous_assignee_id = model.assignee_id if model is not None else None
+        assignee_id = await _assignee_id(
+            session,
+            workspace_id=workspace_id,
+            external_user_id=entity.data.get("responsible_user_id"),
+            user_mapping=user_mapping,
+            required=False,
+        )
         if model is None:
             model = Contact(workspace_id=workspace_id, first_name="")
             session.add(model)
@@ -861,6 +871,7 @@ class PulseAmoWriter(ImportEntityWriter):
         emails = _all_amo_field_values(entity.data, "EMAIL", max_length=320)
         phones = _all_amo_field_values(entity.data, "PHONE", max_length=64)
         model.company_id = company_id
+        model.assignee_id = assignee_id
         model.first_name = first[:120]
         model.last_name = last[:120]
         model.primary_email = emails[0] if emails else None
@@ -875,6 +886,13 @@ class PulseAmoWriter(ImportEntityWriter):
             model.version += 1
         await session.flush()
         await _sync_imported_contact_points(session, model)
+        if model.assignee_id != previous_assignee_id:
+            record_access_change(
+                session,
+                workspace_id=workspace_id,
+                recipient_ids={previous_assignee_id, model.assignee_id},
+                resource="contact",
+            )
         return model.id
 
     async def _deal(
@@ -909,7 +927,17 @@ class PulseAmoWriter(ImportEntityWriter):
             )
         if pipeline_id is None or stage_id is None:
             raise AmoImportDependencyError("amoCRM deal references an unimported pipeline or stage")
-        model = await _scoped_existing(session, Deal, workspace_id, existing_internal_id)
+        # Deal is the root of the next-purchase aggregate.  Keep its lock
+        # until schedules and materialized tasks have been synchronized below
+        # so every writer follows Deal -> PurchaseSchedule -> Task.
+        model = await _scoped_existing(
+            session,
+            Deal,
+            workspace_id,
+            existing_internal_id,
+            for_update=True,
+        )
+        previous_assignee_id = model.assignee_id if model is not None else None
         if model is None:
             model = Deal(
                 workspace_id=workspace_id,
@@ -961,7 +989,23 @@ class PulseAmoWriter(ImportEntityWriter):
         if existing_internal_id is not None:
             model.version += 1
         await session.flush()
-        await self._sync_deal_contacts(session, workspace_id, model.id, entity.data)
+        primary_contact_id = await self._sync_deal_contacts(
+            session, workspace_id, model.id, entity.data
+        )
+        await self._sync_deal_purchase_schedules(
+            session,
+            workspace_id=workspace_id,
+            deal_id=model.id,
+            assignee_id=model.assignee_id,
+            contact_id=primary_contact_id,
+        )
+        if model.assignee_id != previous_assignee_id:
+            record_access_change(
+                session,
+                workspace_id=workspace_id,
+                recipient_ids={previous_assignee_id, model.assignee_id},
+                resource="deal",
+            )
         return model.id
 
     async def _sync_deal_contacts(
@@ -970,12 +1014,14 @@ class PulseAmoWriter(ImportEntityWriter):
         workspace_id: uuid.UUID,
         deal_id: uuid.UUID,
         data: Mapping[str, Any],
-    ) -> None:
+    ) -> uuid.UUID | None:
         embedded = data.get("_embedded", {})
         contacts = embedded.get("contacts", []) if isinstance(embedded, Mapping) else []
         if not isinstance(contacts, list):
-            return
-        for index, item in enumerate(contacts):
+            contacts = []
+        mapped_contacts: list[tuple[uuid.UUID, bool]] = []
+        seen_contact_ids: set[uuid.UUID] = set()
+        for item in contacts:
             if not isinstance(item, Mapping):
                 continue
             contact_id = await _mapped_internal_id(
@@ -984,8 +1030,10 @@ class PulseAmoWriter(ImportEntityWriter):
                 entity_type="contacts",
                 external_id=str(item.get("id")),
             )
-            if contact_id is None:
+            if contact_id is None or contact_id in seen_contact_ids:
                 continue
+            seen_contact_ids.add(contact_id)
+            mapped_contacts.append((contact_id, bool(item.get("is_main"))))
             exists = await session.scalar(
                 sa.select(DealContact.id).where(
                     DealContact.workspace_id == workspace_id,
@@ -999,8 +1047,169 @@ class PulseAmoWriter(ImportEntityWriter):
                         workspace_id=workspace_id,
                         deal_id=deal_id,
                         contact_id=contact_id,
-                        is_primary=bool(item.get("is_main")) or index == 0,
+                        is_primary=False,
                     )
+                )
+        if mapped_contacts:
+            await session.flush()
+            primary_contact_id = next(
+                (
+                    contact_id
+                    for contact_id, is_main in mapped_contacts
+                    if is_main
+                ),
+                mapped_contacts[0][0],
+            )
+            await session.execute(
+                sa.update(DealContact)
+                .where(
+                    DealContact.workspace_id == workspace_id,
+                    DealContact.deal_id == deal_id,
+                )
+                .values(is_primary=DealContact.contact_id == primary_contact_id)
+            )
+            return primary_contact_id
+        return cast(
+            uuid.UUID | None,
+            await session.scalar(
+                sa.select(DealContact.contact_id)
+                .where(
+                    DealContact.workspace_id == workspace_id,
+                    DealContact.deal_id == deal_id,
+                )
+                .order_by(DealContact.is_primary.desc(), DealContact.created_at)
+                .limit(1)
+            ),
+        )
+
+    async def _sync_deal_purchase_schedules(
+        self,
+        session: AsyncSession,
+        *,
+        workspace_id: uuid.UUID,
+        deal_id: uuid.UUID,
+        assignee_id: uuid.UUID | None,
+        contact_id: uuid.UUID | None,
+    ) -> None:
+        schedules = list(
+            (
+                await session.scalars(
+                    sa.select(PurchaseSchedule)
+                    .where(
+                        PurchaseSchedule.workspace_id == workspace_id,
+                        PurchaseSchedule.deal_id == deal_id,
+                        PurchaseSchedule.status == PurchaseScheduleStatus.active,
+                    )
+                    .order_by(PurchaseSchedule.id)
+                    .with_for_update()
+                )
+            ).all()
+        )
+        if not schedules:
+            return
+
+        if assignee_id is None:
+            assignee_id = cast(
+                uuid.UUID | None,
+                await session.scalar(
+                    sa.select(User.id)
+                    .join(Membership, Membership.user_id == User.id)
+                    .where(
+                        Membership.workspace_id == workspace_id,
+                        Membership.role.in_((Role.owner, Role.admin)),
+                        User.is_active.is_(True),
+                    )
+                    .order_by(
+                        sa.case((Membership.role == Role.owner, 0), else_=1),
+                        User.created_at,
+                    )
+                    .limit(1)
+                ),
+            )
+        if assignee_id is None:
+            raise AmoImportDependencyError(
+                "workspace has no active fallback assignee for amoCRM deals"
+            )
+
+        task_ids = sorted(
+            {
+                schedule.task_id
+                for schedule in schedules
+                if schedule.task_id is not None
+            },
+            key=str,
+        )
+        tasks_by_id: dict[uuid.UUID, Task] = {}
+        if task_ids:
+            tasks = list(
+                (
+                    await session.scalars(
+                        sa.select(Task)
+                        .where(
+                            Task.id.in_(task_ids),
+                            Task.workspace_id == workspace_id,
+                            Task.status == TaskStatus.open,
+                        )
+                        .order_by(Task.id)
+                        .with_for_update()
+                    )
+                ).all()
+            )
+            tasks_by_id = {task.id: task for task in tasks}
+
+        changed_at = datetime.now(UTC)
+        for schedule in schedules:
+            previous_schedule_assignee_id = schedule.assignee_id
+            schedule_fields_changed = (
+                schedule.assignee_id != assignee_id
+                or schedule.contact_id != contact_id
+            )
+            if schedule_fields_changed:
+                schedule.assignee_id = assignee_id
+                schedule.contact_id = contact_id
+                schedule.updated_at = changed_at
+                schedule.version += 1
+            if previous_schedule_assignee_id != schedule.assignee_id:
+                record_access_change(
+                    session,
+                    workspace_id=workspace_id,
+                    recipient_ids={
+                        previous_schedule_assignee_id,
+                        schedule.assignee_id,
+                    },
+                    resource="purchase",
+                )
+
+            task = tasks_by_id.get(schedule.task_id) if schedule.task_id else None
+            if task is None:
+                continue
+            changed_fields: list[str] = []
+            previous_task_assignee_id = task.assignee_id
+            if task.assignee_id != assignee_id:
+                task.assignee_id = assignee_id
+                changed_fields.append("assignee_id")
+            if task.contact_id != contact_id:
+                task.contact_id = contact_id
+                changed_fields.append("contact_id")
+            if not changed_fields:
+                continue
+            task.updated_at = changed_at
+            task.version += 1
+            record_domain_event(
+                session,
+                workspace_id=workspace_id,
+                event_type="task.updated",
+                entity_type="task",
+                entity_id=task.id,
+                actor_id=None,
+                payload={"fields": changed_fields, "deal_id": str(deal_id)},
+            )
+            if task.assignee_id != previous_task_assignee_id:
+                record_access_change(
+                    session,
+                    workspace_id=workspace_id,
+                    recipient_ids={previous_task_assignee_id, task.assignee_id},
+                    resource="task",
                 )
 
     async def _task(
@@ -1013,6 +1222,7 @@ class PulseAmoWriter(ImportEntityWriter):
         user_mapping: Mapping[str, str],
     ) -> uuid.UUID:
         model = await _scoped_existing(session, Task, workspace_id, existing_internal_id)
+        previous_assignee_id = model.assignee_id if model is not None else None
         assignee_id = await _assignee_id(
             session,
             workspace_id=workspace_id,
@@ -1067,6 +1277,13 @@ class PulseAmoWriter(ImportEntityWriter):
         if existing_internal_id is not None:
             model.version += 1
         await session.flush()
+        if model.assignee_id != previous_assignee_id:
+            record_access_change(
+                session,
+                workspace_id=workspace_id,
+                recipient_ids={previous_assignee_id, model.assignee_id},
+                resource="task",
+            )
         return model.id
 
     async def _note(
@@ -1126,15 +1343,18 @@ async def _scoped_existing(
     model_type: type[Any],
     workspace_id: uuid.UUID,
     internal_id: uuid.UUID | None,
+    *,
+    for_update: bool = False,
 ) -> Any | None:
     if internal_id is None:
         return None
-    return await session.scalar(
-        sa.select(model_type).where(
-            model_type.id == internal_id,
-            model_type.workspace_id == workspace_id,
-        )
+    query = sa.select(model_type).where(
+        model_type.id == internal_id,
+        model_type.workspace_id == workspace_id,
     )
+    if for_update:
+        query = query.with_for_update()
+    return await session.scalar(query)
 
 
 async def _mapped_internal_id(

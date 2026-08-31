@@ -31,6 +31,32 @@ class UserRead(ORMModel):
     email: EmailStr
     full_name: str
     role: Role | None = None
+    version: int = 1
+
+
+class UserUpdate(VersionedUpdate):
+    full_name: str | None = Field(default=None, min_length=2, max_length=160)
+    role: Role | None = None
+
+    @field_validator("full_name")
+    @classmethod
+    def normalize_full_name(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if len(normalized) < 2:
+            raise ValueError("full_name must contain at least two visible characters")
+        return normalized
+
+    @model_validator(mode="after")
+    def require_change(self) -> Self:
+        if not ({"full_name", "role"} & self.model_fields_set):
+            raise ValueError("provide full_name or role")
+        if "full_name" in self.model_fields_set and self.full_name is None:
+            raise ValueError("full_name cannot be null")
+        if "role" in self.model_fields_set and self.role is None:
+            raise ValueError("role cannot be null")
+        return self
 
 
 class BootstrapRequest(BaseModel):
@@ -113,6 +139,7 @@ class ContactCreate(BaseModel):
     first_name: str = Field(min_length=1, max_length=120)
     last_name: str = Field(default="", max_length=120)
     company_id: uuid.UUID | None = None
+    assignee_id: uuid.UUID | None = None
     primary_email: EmailStr | None = None
     primary_phone: str | None = Field(default=None, max_length=64)
     emails: list[EmailStr] = Field(default_factory=list, max_length=20)
@@ -125,6 +152,7 @@ class ContactUpdate(VersionedUpdate):
     first_name: str | None = Field(default=None, min_length=1, max_length=120)
     last_name: str | None = Field(default=None, max_length=120)
     company_id: uuid.UUID | None = None
+    assignee_id: uuid.UUID | None = None
     primary_email: EmailStr | None = None
     primary_phone: str | None = Field(default=None, max_length=64)
     emails: list[EmailStr] | None = Field(default=None, max_length=20)
@@ -138,6 +166,7 @@ class ContactRead(ORMModel):
     first_name: str
     last_name: str
     company_id: uuid.UUID | None
+    assignee_id: uuid.UUID | None
     primary_email: str | None
     primary_phone: str | None
     emails: list[str]
@@ -353,6 +382,17 @@ class TaskRead(ORMModel):
     updated_at: datetime
 
 
+class NoteAttachmentRead(ORMModel):
+    id: uuid.UUID
+    activity_event_id: uuid.UUID
+    position: int
+    original_filename: str
+    content_type: str
+    size_bytes: int
+    sha256: str
+    created_at: datetime
+
+
 class ActivityRead(ORMModel):
     id: uuid.UUID
     event_type: str
@@ -361,6 +401,7 @@ class ActivityRead(ORMModel):
     actor_id: uuid.UUID | None
     payload: dict[str, Any]
     occurred_at: datetime
+    attachments: list[NoteAttachmentRead] = Field(default_factory=list)
 
 
 class NoteCreate(BaseModel):

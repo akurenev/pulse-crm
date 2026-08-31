@@ -715,19 +715,33 @@ async def test_deal_assignee_update_is_versioned_and_workspace_scoped(
         full_name="Deal Outsider",
         password_hash="not-used",
     )
+    inactive = User(
+        email="deal-inactive@example.com",
+        full_name="Inactive Deal Assignee",
+        password_hash="not-used",
+        is_active=False,
+    )
     async with SessionLocal() as db:
-        db.add_all([assignee, outsider])
+        db.add_all([assignee, outsider, inactive])
         await db.flush()
-        db.add(
-            Membership(
-                workspace_id=workspace_id,
-                user_id=assignee.id,
-                role=Role.manager,
-            )
+        db.add_all(
+            [
+                Membership(
+                    workspace_id=workspace_id,
+                    user_id=assignee.id,
+                    role=Role.manager,
+                ),
+                Membership(
+                    workspace_id=workspace_id,
+                    user_id=inactive.id,
+                    role=Role.manager,
+                ),
+            ]
         )
         await db.commit()
         assignee_id = assignee.id
         outsider_id = outsider.id
+        inactive_id = inactive.id
 
     pipeline = (await client.get("/api/v1/pipelines")).json()[0]
     created = await client.post(
@@ -781,6 +795,15 @@ async def test_deal_assignee_update_is_versioned_and_workspace_scoped(
         },
     )
     assert rejected.status_code == 404
+    inactive_rejected = await client.patch(
+        f"/api/v1/deals/{deal['id']}",
+        headers=headers,
+        json={
+            "expected_version": assigned.json()["version"],
+            "assignee_id": str(inactive_id),
+        },
+    )
+    assert inactive_rejected.status_code == 404
 
     async with SessionLocal() as db:
         stored = await db.get(Deal, deal_id)
@@ -812,6 +835,19 @@ async def test_deal_assignee_update_is_versioned_and_workspace_scoped(
         )
         assert assigned_event is not None
         assert assigned_event.payload["assignee_id"] == str(assignee_id)
+        access_event = await db.scalar(
+            sa.select(RealtimeEvent).where(
+                RealtimeEvent.workspace_id == workspace_id,
+                RealtimeEvent.event_type == "access.changed",
+                RealtimeEvent.payload["recipient_id"].as_string() == str(assignee_id),
+                RealtimeEvent.payload["resource"].as_string() == "deal",
+            )
+        )
+        assert access_event is not None
+        assert access_event.payload == {
+            "recipient_id": str(assignee_id),
+            "resource": "deal",
+        }
         task_event = await db.scalar(
             sa.select(ActivityEvent).where(
                 ActivityEvent.workspace_id == workspace_id,

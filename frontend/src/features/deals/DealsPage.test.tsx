@@ -27,12 +27,12 @@ function LocationProbe() {
   </>;
 }
 
-function renderPage(initialEntry = "/deals") {
+function renderPage(initialEntry = "/deals", providerProps: Partial<ComponentProps<typeof CrmProvider>> = {}) {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={queryClient}>
       <MemoryRouter initialEntries={[initialEntry]}>
-        <CrmProvider>
+        <CrmProvider {...providerProps}>
           <DealsPage />
           <LocationProbe />
         </CrmProvider>
@@ -111,6 +111,24 @@ describe("DealsPage", () => {
 
     expect(await screen.findByRole("dialog", { name: "Тестовая сделка" })).toBeInTheDocument();
     expect(screen.getByRole("status", { name: "Текущий адрес" })).toHaveTextContent(/\/deals\?deal=deal-/);
+  });
+
+  it("assigns a new employee deal to the current user and keeps protected controls hidden", async () => {
+    const user = userEvent.setup();
+    const employee = { id: "user-employee", name: "Текущий Сотрудник", initials: "ТС", tone: "violet" as const };
+    renderPage("/deals", { currentUser: employee, userRole: "employee" });
+
+    await user.click(screen.getAllByRole("button", { name: "Новая сделка" })[0]);
+    const createDialog = await screen.findByRole("dialog", { name: "Новая сделка" });
+    await user.type(within(createDialog).getByRole("textbox", { name: "Название" }), "Сделка сотрудника");
+    await user.type(within(createDialog).getByRole("textbox", { name: "Потребность" }), "Продление");
+    await user.type(within(createDialog).getByRole("spinbutton", { name: "Сумма, ₽" }), "1500");
+    await user.click(within(createDialog).getByRole("button", { name: "Создать сделку" }));
+
+    const dealDialog = await screen.findByRole("dialog", { name: "Сделка сотрудника" });
+    expect(dealDialog.querySelector(".deal-details__row--owner")).toHaveTextContent(employee.name);
+    expect(within(dealDialog).queryByRole("button", { name: "Удалить сделку" })).not.toBeInTheDocument();
+    expect(within(dealDialog).queryByRole("button", { name: "Изменить ответственного сделки" })).not.toBeInTheDocument();
   });
 
   it("exposes the kanban as a horizontally scrollable region with accessible stages", async () => {
@@ -221,11 +239,33 @@ describe("DealsPage", () => {
     const dialog = await screen.findByRole("dialog");
     expect(within(dialog).getByText("84 000 ₽")).toBeInTheDocument();
 
+    await user.click(within(dialog).getByRole("tab", { name: /Переписка/ }));
     const input = within(dialog).getByPlaceholderText("Написать сообщение");
     await user.type(input, "Предложение готово");
     fireEvent.submit(input.closest("form")!);
 
     expect(within(dialog).getByText("Предложение готово")).toBeInTheDocument();
+  });
+
+  it("separates deal details, custom fields, tasks, messages and history", async () => {
+    const user = userEvent.setup();
+    renderPage();
+
+    await user.click(screen.getByText("Кофейня «Слой»"));
+    const dialog = await screen.findByRole("dialog", { name: "Кофейня «Слой»" });
+    expect(within(dialog).getAllByRole("tab").map((tab) => tab.textContent)).toEqual(expect.arrayContaining([
+      "Детали",
+      "Поля",
+      "Задачи",
+      expect.stringMatching(/^Переписка/),
+      "История",
+    ]));
+    expect(within(dialog).getByRole("textbox", { name: "Заметка о сделке" })).toBeInTheDocument();
+    expect(within(dialog).queryByPlaceholderText("Написать сообщение")).not.toBeInTheDocument();
+
+    await user.click(within(dialog).getByRole("tab", { name: "История" }));
+    expect(within(dialog).queryByRole("textbox", { name: "Заметка о сделке" })).not.toBeInTheDocument();
+    expect(within(dialog).getByText("Сделка создана")).toBeInTheDocument();
   });
 
   it("shows and edits deal tags", async () => {
@@ -269,6 +309,16 @@ describe("DealsPage", () => {
 
     expect(within(ownerRow as HTMLElement).getByText("Елена Крылова")).toBeInTheDocument();
     expect(within(ownerRow as HTMLElement).queryByText("Алексей Кузнецов")).not.toBeInTheDocument();
+  });
+
+  it("hides destructive, company and assignee mutation controls from employees", async () => {
+    renderDrawer({ canAccessCompanies: false, canDelete: false, canManageAssignee: false });
+
+    const dialog = await screen.findByRole("dialog", { name: initialDeals[0].title });
+    expect(within(dialog).queryByRole("button", { name: "Удалить сделку" })).not.toBeInTheDocument();
+    expect(within(dialog).queryByRole("button", { name: "Изменить ответственного сделки" })).not.toBeInTheDocument();
+    expect(dialog.querySelector(".deal-details__row--company")).not.toBeInTheDocument();
+    expect(dialog.querySelector(".deal-details__row--owner")).toHaveTextContent(initialDeals[0].assignee.name);
   });
 
   it("requires confirmation before deleting a deal", async () => {
@@ -342,20 +392,22 @@ describe("DealsPage", () => {
     expect(screen.getByRole("dialog", { name: "Удалить сделку?" })).toBeInTheDocument();
   });
 
-  it("makes the full-screen mobile drawer modal while desktop remains non-modal", async () => {
+  it("makes the mobile and tablet overlay drawer modal while desktop remains non-modal", async () => {
     const user = userEvent.setup();
     const mediaListeners = new Set<() => void>();
-    vi.stubGlobal("matchMedia", vi.fn().mockReturnValue({
+    const tabletMatchMedia = vi.fn().mockReturnValue({
       matches: true,
-      media: "(max-width: 720px)",
+      media: "(max-width: 1100px)",
       onchange: null,
       addEventListener: (_type: string, listener: () => void) => mediaListeners.add(listener),
       removeEventListener: (_type: string, listener: () => void) => mediaListeners.delete(listener),
       dispatchEvent: vi.fn(),
-    }));
+    });
+    vi.stubGlobal("matchMedia", tabletMatchMedia);
 
     const mobile = renderDrawer();
     const mobileDrawer = await screen.findByRole("dialog", { name: initialDeals[0].title });
+    expect(tabletMatchMedia).toHaveBeenCalledWith("(max-width: 1100px)");
     expect(mobile.container).toHaveAttribute("aria-hidden", "true");
     await user.click(within(mobileDrawer).getByRole("button", { name: "Удалить сделку" }));
     const confirmation = await screen.findByRole("dialog", { name: "Удалить сделку?" });
@@ -367,7 +419,7 @@ describe("DealsPage", () => {
 
     vi.stubGlobal("matchMedia", vi.fn().mockReturnValue({
       matches: false,
-      media: "(max-width: 720px)",
+      media: "(max-width: 1100px)",
       onchange: null,
       addEventListener: vi.fn(),
       removeEventListener: vi.fn(),

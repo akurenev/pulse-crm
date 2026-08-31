@@ -25,6 +25,7 @@ class Role(StrEnum):
     owner = "owner"
     admin = "admin"
     manager = "manager"
+    employee = "employee"
 
 
 class StageType(StrEnum):
@@ -118,6 +119,7 @@ class Membership(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         UUID_TYPE, sa.ForeignKey("users.id", ondelete="CASCADE"), nullable=False
     )
     role: Mapped[Role] = mapped_column(sa.Enum(Role, native_enum=False), nullable=False)
+    version: Mapped[int] = mapped_column(sa.Integer, default=1, nullable=False)
 
 
 class Session(UUIDPrimaryKeyMixin, TimestampMixin, Base):
@@ -195,6 +197,14 @@ class Contact(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "contacts"
     __table_args__ = (
         sa.Index("ix_contacts_company_id", "company_id"),
+        sa.Index(
+            "ix_contacts_workspace_assignee_deleted_created_id",
+            "workspace_id",
+            "assignee_id",
+            "deleted_at",
+            "created_at",
+            "id",
+        ),
         sa.Index("ix_contacts_workspace_email", "workspace_id", "primary_email"),
         sa.Index("ix_contacts_workspace_phone", "workspace_id", "primary_phone"),
         sa.Index(
@@ -211,6 +221,9 @@ class Contact(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
     company_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID_TYPE, sa.ForeignKey("companies.id", ondelete="SET NULL")
+    )
+    assignee_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID_TYPE, sa.ForeignKey("users.id", ondelete="SET NULL")
     )
     first_name: Mapped[str] = mapped_column(sa.String(120), nullable=False)
     last_name: Mapped[str] = mapped_column(sa.String(120), default="", nullable=False)
@@ -487,6 +500,40 @@ class ActivityEvent(UUIDPrimaryKeyMixin, Base):
     occurred_at: Mapped[datetime] = mapped_column(
         sa.DateTime(timezone=True), default=utcnow, server_default=sa.func.now(), nullable=False
     )
+
+
+class NoteAttachment(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """Private file attached to a CRM note, never to a conversation message."""
+
+    __tablename__ = "note_attachments"
+    __table_args__ = (
+        sa.UniqueConstraint("object_key", name="uq_note_attachment_object_key"),
+        sa.UniqueConstraint(
+            "activity_event_id",
+            "position",
+            name="uq_note_attachment_activity_position",
+        ),
+        sa.Index(
+            "ix_note_attachments_workspace_activity",
+            "workspace_id",
+            "activity_event_id",
+            "position",
+            "id",
+        ),
+    )
+
+    workspace_id: Mapped[uuid.UUID] = mapped_column(
+        UUID_TYPE, sa.ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False
+    )
+    activity_event_id: Mapped[uuid.UUID] = mapped_column(
+        UUID_TYPE, sa.ForeignKey("activity_events.id", ondelete="CASCADE"), nullable=False
+    )
+    position: Mapped[int] = mapped_column(sa.Integer, nullable=False)
+    object_key: Mapped[str] = mapped_column(sa.String(1024), nullable=False)
+    original_filename: Mapped[str] = mapped_column(sa.String(512), nullable=False)
+    content_type: Mapped[str] = mapped_column(sa.String(255), nullable=False)
+    size_bytes: Mapped[int] = mapped_column(sa.BigInteger, nullable=False)
+    sha256: Mapped[str] = mapped_column(sa.String(64), nullable=False)
 
 
 class OutboxEvent(UUIDPrimaryKeyMixin, TimestampMixin, Base):

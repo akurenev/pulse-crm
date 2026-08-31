@@ -97,8 +97,8 @@ const builtInRequiredFields = [
 
 const demoRules: ApiNotificationRule[] = [
   demoRule("Новый лид → ответственному в приложении", "lead.created", "in_app", true),
-  demoRule("Входящее сообщение → ответственному в Telegram", "message.inbound.received", "telegram", true),
-  demoRule("Задача просрочена → ответственному по email", "task.overdue", "email", true),
+  demoRule("Входящее сообщение → ответственному в приложении", "message.inbound.received", "in_app", true),
+  demoRule("Задача просрочена → ответственному в приложении", "task.overdue", "in_app", true),
   demoRule("Следующая покупка через 7 дней → клиенту по email", "purchase.due_soon", "email", false, "client"),
 ];
 
@@ -555,10 +555,12 @@ function RequiredFieldsForm({ pipelineName, stage, customFields, initialFields, 
 
 export function ChannelsPanel({ pipelines, currentPipelineId, routingLoading, requireLoadedRouting = remoteEnabled }: { pipelines: Pipeline[]; currentPipelineId: string; routingLoading: boolean; requireLoadedRouting?: boolean }) {
   const [editor, setEditor] = useState<"channel" | "webhook" | "form" | null>(null);
+  const [editingChannel, setEditingChannel] = useState<ApiChannelConnection | null>(null);
   const [localChannels, setLocalChannels] = useState(demoChannels);
   const [localWebhooks, setLocalWebhooks] = useState(demoWebhooks);
   const [localForms, setLocalForms] = useState(demoForms);
   const [webhookSecret, setWebhookSecret] = useState<ApiWebhookEndpointCreated | null>(null);
+  const [actionError, setActionError] = useState("");
   const channelsQuery = useQuery({ queryKey: ["settings", "channels"], queryFn: () => api.get<ApiChannelConnection[]>("/admin/integrations/channels"), enabled: remoteEnabled });
   const formsQuery = useQuery({ queryKey: ["settings", "forms"], queryFn: () => api.get<ApiHtmlForm[]>("/admin/integrations/forms"), enabled: remoteEnabled });
   const webhooksQuery = useQuery({ queryKey: ["settings", "webhooks"], queryFn: () => api.get<ApiWebhookEndpoint[]>("/admin/integrations/webhooks"), enabled: remoteEnabled });
@@ -576,22 +578,41 @@ export function ChannelsPanel({ pipelines, currentPipelineId, routingLoading, re
 
   function closeEditor() {
     setEditor(null);
+    setEditingChannel(null);
+    setActionError("");
     restoreTriggerFocus();
   }
 
   function toggleEditor(kind: "channel" | "webhook" | "form", event: ReactMouseEvent<HTMLButtonElement>) {
     if (routingDisabled) return;
+    setActionError("");
     returnFocusRef.current = event.currentTarget;
     if (editor === kind) {
       closeEditor();
       return;
     }
+    setEditingChannel(null);
     setEditor(kind);
   }
 
-  async function createdChannel(created: ApiChannelConnection) {
-    if (remoteEnabled) await channelsQuery.refetch(); else setLocalChannels((items) => [created, ...items]);
+  function editChannel(channel: ApiChannelConnection, event: ReactMouseEvent<HTMLButtonElement>) {
+    returnFocusRef.current = event.currentTarget;
+    setEditor(null);
+    setActionError("");
+    setEditingChannel(channel);
+  }
+
+  async function savedChannel(saved: ApiChannelConnection) {
+    if (remoteEnabled) await channelsQuery.refetch();
+    else setLocalChannels((items) => items.some((item) => item.id === saved.id) ? items.map((item) => item.id === saved.id ? saved : item) : [saved, ...items]);
     closeEditor();
+  }
+  async function refreshChannelAfterConflict(channelId: string) {
+    if (!remoteEnabled) return;
+    const result = await channelsQuery.refetch();
+    const refreshed = result.data?.find((item) => item.id === channelId);
+    if (refreshed) setEditingChannel(refreshed);
+    setActionError("Канал уже изменён другим пользователем. Загружены актуальные данные — проверьте их и повторите сохранение.");
   }
   async function createdWebhook(created: ApiWebhookEndpointCreated) {
     if (remoteEnabled) await webhooksQuery.refetch(); else setLocalWebhooks((items) => [created, ...items]);
@@ -606,7 +627,7 @@ export function ChannelsPanel({ pipelines, currentPipelineId, routingLoading, re
   return (
     <>
       <SettingsHeading title="Общие каналы компании" action="Подключить канал" actionControls="channel-editor" actionExpanded={editor === "channel"} actionDisabled={routingDisabled} mobileFab onAction={(event) => toggleEditor("channel", event)} />
-      <button type="button" className="mobile-fab settings-panel__mobile-add" aria-label="Добавить канал" aria-controls="channel-editor" aria-expanded={editor === "channel"} hidden={editor !== null} disabled={routingDisabled} onClick={(event) => toggleEditor("channel", event)}><Plus size={26} aria-hidden="true" /></button>
+      <button type="button" className="mobile-fab settings-panel__mobile-add" aria-label="Добавить канал" aria-controls="channel-editor" aria-expanded={editor === "channel"} hidden={editor !== null || editingChannel !== null} disabled={routingDisabled} onClick={(event) => toggleEditor("channel", event)}><Plus size={26} aria-hidden="true" /></button>
       <div className="settings-quick-actions" aria-label="Добавить источник">
         <Button compact disabled={routingDisabled} aria-controls="webhook-editor" aria-expanded={editor === "webhook"} onClick={(event) => toggleEditor("webhook", event)}><Webhook size={16} /> Webhook</Button>
         <Button compact disabled={routingDisabled} aria-controls="html-form-editor" aria-expanded={editor === "form"} onClick={(event) => toggleEditor("form", event)}><Code2 size={16} /> HTML-форма</Button>
@@ -614,12 +635,13 @@ export function ChannelsPanel({ pipelines, currentPipelineId, routingLoading, re
       {routingState === "loading" ? <SettingsNotice tone="neutral">Загружаем доступные воронки и этапы. Добавление источника станет доступно после загрузки.</SettingsNotice> : null}
       {routingState === "empty" ? <SettingsNotice tone="error">Нет доступных воронок. Создайте активную воронку с рабочим этапом и повторите попытку.</SettingsNotice> : null}
       {loadFailed ? <SettingsNotice tone="error">Не удалось загрузить часть подключений. Обновите страницу или проверьте доступ администратора.</SettingsNotice> : null}
-      {editor === "channel" ? <ChannelEditor pipelines={pipelines} defaultPipelineId={currentPipelineId} routingDisabled={routingDisabled} onCancel={closeEditor} onCreated={createdChannel} /> : null}
+      {actionError ? <SettingsNotice tone="error">{actionError}</SettingsNotice> : null}
+      {editor === "channel" || editingChannel ? <ChannelEditor key={editingChannel ? `${editingChannel.id}:${editingChannel.version}` : "new"} channel={editingChannel ?? undefined} pipelines={pipelines} defaultPipelineId={currentPipelineId} routingDisabled={routingDisabled} onCancel={closeEditor} onCreated={savedChannel} onConflict={refreshChannelAfterConflict} /> : null}
       {editor === "webhook" ? <WebhookEditor pipelines={pipelines} defaultPipelineId={currentPipelineId} routingDisabled={routingDisabled} onCancel={closeEditor} onCreated={createdWebhook} /> : null}
       {editor === "form" ? <HtmlFormEditor pipelines={pipelines} defaultPipelineId={currentPipelineId} routingDisabled={routingDisabled} onCancel={closeEditor} onCreated={createdForm} /> : null}
       {webhookSecret ? <WebhookSecret result={webhookSecret} onClose={() => setWebhookSecret(null)} /> : null}
       <section className="channel-list" aria-label="Подключённые источники">
-        {channels.map((channel) => <div className="channel-row" key={channel.id}><span className="channel-icon">{channel.kind === "email" ? <Mail size={20} /> : <Bot size={20} />}</span><span><strong>{channel.name}</strong><small>{channelLabel(channel.kind)} · {routeLabel(channel.default_pipeline_id, channel.default_stage_id, pipelines)}</small>{channel.last_error ? <small className="settings-inline-error">{channel.last_error}</small> : null}</span><StatusPill status={channel.status} /><ChevronRight size={18} aria-hidden="true" /></div>)}
+        {channels.map((channel) => <button type="button" className="channel-row" key={channel.id} aria-label={`Изменить канал ${channel.name}`} onClick={(event) => editChannel(channel, event)}><span className="channel-icon">{channel.kind === "email" ? <Mail size={20} /> : <Bot size={20} />}</span><span><strong>{channel.name}</strong><small>{channelLabel(channel.kind)} · {routeLabel(channel.default_pipeline_id, channel.default_stage_id, pipelines)}</small>{channel.last_error ? <small className="settings-inline-error">{channel.last_error}</small> : null}</span><StatusPill status={channel.status} /><ChevronRight size={18} aria-hidden="true" /></button>)}
         {webhooks.map((endpoint) => <div className="channel-row" key={endpoint.id}><span className="channel-icon"><Braces size={20} /></span><span><strong>{endpoint.name}</strong><small>POST /hooks/v1/generic/{endpoint.slug}</small></span><StatusPill status={endpoint.is_active ? "active" : "disabled"} /><ChevronRight size={18} aria-hidden="true" /></div>)}
         {forms.map((form) => <div className="channel-row" key={form.id}><span className="channel-icon"><FileText size={20} /></span><span><strong>{form.title}</strong><small>/forms/{form.slug} · {form.allowed_origins.length || "только Pulse"} домен(а)</small></span><StatusPill status={form.is_active ? "active" : "disabled"} /><ChevronRight size={18} aria-hidden="true" /></div>)}
         {!channels.length && !webhooks.length && !forms.length && !channelsQuery.isLoading ? <SettingsEmpty icon={<MessageCircle size={22} />} title="Источники пока не подключены" text="Добавьте корпоративную почту, бота, webhook или форму." /> : null}
@@ -632,10 +654,35 @@ function routableStages(pipeline: Pipeline | undefined): Pipeline["stages"] {
   return pipeline?.stages.filter((stage) => stage.stageType !== "won" && stage.stageType !== "lost") ?? [];
 }
 
-function usePipelineStageSelection(pipelines: Pipeline[], defaultPipelineId: string) {
+function useAssignableUsers(availableUsers?: ApiUser[]) {
+  const usersQuery = useQuery({
+    queryKey: ["users"],
+    queryFn: ({ signal }) => api.get<ApiUser[]>("/users", { signal }),
+    enabled: remoteEnabled && availableUsers === undefined,
+  });
+  return {
+    users: availableUsers ?? (remoteEnabled ? usersQuery.data ?? [] : []),
+    isError: availableUsers === undefined && usersQuery.isError,
+  };
+}
+
+function AssigneeField({ users, name, defaultValue = "" }: { users: ApiUser[]; name: "assignee_id" | "default_assignee_id"; defaultValue?: string }) {
+  return (
+    <label className="field">
+      <span>Ответственный</span>
+      <select name={name} defaultValue={defaultValue}>
+        <option value="">Не назначен</option>
+        {users.map((user) => <option key={user.id} value={user.id}>{user.full_name || user.email}</option>)}
+      </select>
+    </label>
+  );
+}
+
+function usePipelineStageSelection(pipelines: Pipeline[], defaultPipelineId: string, defaultStageId?: string | null) {
   const initialPipeline = pipelines.find((pipeline) => pipeline.id === defaultPipelineId) ?? pipelines[0];
   const [pipelineId, setPipelineId] = useState(initialPipeline?.id ?? "");
-  const [stageId, setStageId] = useState(routableStages(initialPipeline)[0]?.id ?? "");
+  const initialStages = routableStages(initialPipeline);
+  const [stageId, setStageId] = useState(initialStages.some((stage) => stage.id === defaultStageId) ? defaultStageId ?? "" : initialStages[0]?.id ?? "");
   const selectedPipeline = pipelines.find((pipeline) => pipeline.id === pipelineId);
   const stages = useMemo(() => routableStages(selectedPipeline), [selectedPipeline]);
 
@@ -660,12 +707,15 @@ function usePipelineStageSelection(pipelines: Pipeline[], defaultPipelineId: str
   return { pipelineId, stageId, selectedPipeline, stages, selectPipeline, setStageId };
 }
 
-export function ChannelEditor({ pipelines, defaultPipelineId, routingDisabled = false, onCancel, onCreated }: { pipelines: Pipeline[]; defaultPipelineId: string; routingDisabled?: boolean; onCancel: () => void; onCreated: (created: ApiChannelConnection) => void | Promise<void> }) {
-  const [kind, setKind] = useState<ApiChannelKind>("email");
-  const [credentials, setCredentials] = useState(credentialsExample("email"));
+export function ChannelEditor({ channel, pipelines, defaultPipelineId, routingDisabled = false, availableUsers, onCancel, onCreated, onConflict }: { channel?: ApiChannelConnection; pipelines: Pipeline[]; defaultPipelineId: string; routingDisabled?: boolean; availableUsers?: ApiUser[]; onCancel: () => void; onCreated: (saved: ApiChannelConnection) => void | Promise<void>; onConflict?: (channelId: string) => void | Promise<void> }) {
+  const editing = Boolean(channel);
+  const [kind, setKind] = useState<ApiChannelKind>(channel?.kind ?? "email");
+  const [credentials, setCredentials] = useState(channel ? "" : credentialsExample("email"));
+  const [connectionStatus, setConnectionStatus] = useState(channel?.status ?? "active");
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
-  const route = usePipelineStageSelection(pipelines, defaultPipelineId);
+  const assignees = useAssignableUsers(availableUsers);
+  const route = usePipelineStageSelection(pipelines, channel?.default_pipeline_id ?? defaultPipelineId, channel?.default_stage_id);
   const selectedStage = route.stages.find((stage) => stage.id === route.stageId);
   const routeReady = !routingDisabled && Boolean(route.selectedPipeline && selectedStage);
   async function submit(event: FormEvent<HTMLFormElement>) {
@@ -675,39 +725,54 @@ export function ChannelEditor({ pipelines, defaultPipelineId, routingDisabled = 
     setError("");
     try {
       if (!routeReady || !route.selectedPipeline || !selectedStage) throw new Error("Дождитесь загрузки воронок и выберите начальный этап.");
-      const parsed = JSON.parse(credentials) as unknown;
-      if (!parsed || Array.isArray(parsed) || typeof parsed !== "object") throw new Error("JSON должен быть объектом");
-      const payload = { kind, name: String(data.get("name")).trim(), status: "active", credentials: parsed, settings: {}, default_pipeline_id: route.selectedPipeline.id, default_stage_id: selectedStage.id, default_assignee_id: null };
-      const created = remoteEnabled ? await api.post<ApiChannelConnection>("/admin/integrations/channels", payload) : demoChannel(payload.kind, payload.name, payload.default_pipeline_id, payload.default_stage_id);
-      await onCreated(created);
+      let parsedCredentials: Record<string, unknown> | undefined;
+      if (credentials.trim()) {
+        const parsed = JSON.parse(credentials) as unknown;
+        if (!parsed || Array.isArray(parsed) || typeof parsed !== "object") throw new Error("JSON должен быть объектом");
+        parsedCredentials = parsed as Record<string, unknown>;
+      }
+      const sharedPayload = { name: String(data.get("name")).trim(), status: connectionStatus, default_pipeline_id: route.selectedPipeline.id, default_stage_id: selectedStage.id, default_assignee_id: String(data.get("default_assignee_id") ?? "").trim() || null };
+      const saved = remoteEnabled
+        ? channel
+          ? await api.patch<ApiChannelConnection>(`/admin/integrations/channels/${channel.id}`, { expected_version: channel.version, ...sharedPayload, ...(parsedCredentials ? { credentials: parsedCredentials } : {}) })
+          : await api.post<ApiChannelConnection>("/admin/integrations/channels", { kind, ...sharedPayload, credentials: parsedCredentials ?? {}, settings: {} })
+        : channel
+          ? { ...channel, ...sharedPayload, has_credentials: parsedCredentials ? true : channel.has_credentials, version: channel.version + 1, updated_at: new Date().toISOString() }
+          : demoChannel(kind, sharedPayload.name, sharedPayload.default_pipeline_id, sharedPayload.default_stage_id, sharedPayload.default_assignee_id);
+      await onCreated(saved);
     } catch (reason) {
-      setError(errorMessage(reason, "Не удалось подключить канал. Проверьте JSON и реквизиты."));
+      if (channel && reason instanceof ApiError && reason.status === 409) await onConflict?.(channel.id);
+      setError(errorMessage(reason, editing ? "Не удалось изменить канал." : "Не удалось подключить канал. Проверьте JSON и реквизиты."));
     } finally {
       setSaving(false);
     }
   }
   return (
-    <SettingsEditor id="channel-editor" title="Подключение корпоративного канала" icon={<Bot size={19} />} onCancel={onCancel}>
+    <SettingsEditor id="channel-editor" title={editing ? `Изменение канала · ${channel?.name}` : "Подключение корпоративного канала"} icon={<Bot size={19} />} onCancel={onCancel}>
       <form onSubmit={(event) => void submit(event)}>
         <div className="settings-form-grid">
-          <label className="field"><span>Тип канала</span><select name="kind" value={kind} onChange={(event) => { const next = event.target.value as ApiChannelKind; setKind(next); setCredentials(credentialsExample(next)); }}><option value="email">Email (IMAP/SMTP)</option><option value="telegram">Telegram-бот</option><option value="max">MAX-бот</option></select></label>
-          <label className="field"><span>Название</span><input name="name" required maxLength={160} placeholder="Например, Общая почта" /></label>
+          <label className="field"><span>Тип канала</span><select name="kind" value={kind} disabled={editing} onChange={(event) => { const next = event.target.value as ApiChannelKind; setKind(next); setCredentials(credentialsExample(next)); }}><option value="email">Email (IMAP/SMTP)</option><option value="telegram">Telegram-бот</option><option value="max">MAX-бот</option></select></label>
+          <label className="field"><span>Название</span><input name="name" required maxLength={160} placeholder="Например, Общая почта" defaultValue={channel?.name ?? ""} /></label>
+          {editing ? <label className="field"><span>Состояние</span><select name="status" value={connectionStatus} onChange={(event) => setConnectionStatus(event.target.value as ApiChannelConnection["status"])}><option value="active">Активен</option><option value="disabled">Выключен</option><option value="degraded">Требует настройки</option></select></label> : null}
           <label className="field"><span>Воронка</span><select name="pipeline_id" value={route.selectedPipeline?.id ?? ""} required disabled={routingDisabled || !pipelines.length} onChange={(event) => route.selectPipeline(event.target.value)}>{!pipelines.length ? <option value="">Воронки недоступны</option> : null}{pipelines.map((pipeline) => <option key={pipeline.id} value={pipeline.id}>{pipeline.name}</option>)}</select></label>
           <label className="field"><span>Начальный этап</span><select name="stage_id" value={selectedStage?.id ?? ""} required disabled={routingDisabled || !route.stages.length} onChange={(event) => route.setStageId(event.target.value)}>{!route.stages.length ? <option value="">Рабочие этапы недоступны</option> : null}{route.stages.map((stage) => <option key={stage.id} value={stage.id}>{stage.name}</option>)}</select></label>
+          <AssigneeField users={assignees.users} name="default_assignee_id" defaultValue={channel?.default_assignee_id ?? ""} />
         </div>
-        <label className="field settings-json"><span>Реквизиты (сохраняются зашифрованными)</span><textarea value={credentials} onChange={(event) => setCredentials(event.target.value)} rows={kind === "email" ? 12 : 6} spellCheck={false} /></label>
-        <p className="settings-form-help">Для ботов webhook_secret должен совпадать с секретом, заданным у провайдера. Секреты после сохранения больше не отображаются.</p>
+        <label className="field settings-json"><span>{editing ? "Новые реквизиты (необязательно)" : "Реквизиты (сохраняются зашифрованными)"}</span><textarea value={credentials} onChange={(event) => setCredentials(event.target.value)} rows={kind === "email" ? 12 : 6} spellCheck={false} placeholder={editing ? "Оставьте пустым, чтобы сохранить текущие реквизиты" : undefined} /></label>
+        <p className="settings-form-help">{editing ? "Сохранённые секреты не показываются. Пустое поле оставит их без изменений; заполненное полностью заменит текущие реквизиты." : "Для ботов webhook_secret должен совпадать с секретом, заданным у провайдера. Секреты после сохранения больше не отображаются."}</p>
         {!routeReady ? <p className="form-error" role="status">Добавление канала недоступно, пока не загружена активная воронка с рабочим этапом.</p> : null}
+        {assignees.isError ? <p className="form-error" role="alert">Не удалось загрузить список ответственных. Канал можно сохранить без назначения.</p> : null}
         {error ? <p className="form-error" role="alert">{error}</p> : null}
-        <EditorActions saving={saving} disabled={!routeReady} onCancel={onCancel} submitLabel="Подключить" />
+        <EditorActions saving={saving} disabled={!routeReady} onCancel={onCancel} submitLabel={editing ? "Сохранить канал" : "Подключить"} />
       </form>
     </SettingsEditor>
   );
 }
 
-export function WebhookEditor({ pipelines, defaultPipelineId, routingDisabled = false, onCancel, onCreated }: { pipelines: Pipeline[]; defaultPipelineId: string; routingDisabled?: boolean; onCancel: () => void; onCreated: (created: ApiWebhookEndpointCreated) => void | Promise<void> }) {
+export function WebhookEditor({ pipelines, defaultPipelineId, routingDisabled = false, availableUsers, onCancel, onCreated }: { pipelines: Pipeline[]; defaultPipelineId: string; routingDisabled?: boolean; availableUsers?: ApiUser[]; onCancel: () => void; onCreated: (created: ApiWebhookEndpointCreated) => void | Promise<void> }) {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
+  const assignees = useAssignableUsers(availableUsers);
   const defaultSlug = useMemo(() => `incoming-${Date.now().toString(36)}`, []);
   const route = usePipelineStageSelection(pipelines, defaultPipelineId);
   const selectedStage = route.stages.find((stage) => stage.id === route.stageId);
@@ -719,8 +784,8 @@ export function WebhookEditor({ pipelines, defaultPipelineId, routingDisabled = 
     setError("");
     try {
       if (!routeReady || !route.selectedPipeline || !selectedStage) throw new Error("Дождитесь загрузки воронок и выберите начальный этап.");
-      const payload = { name: String(data.get("name")).trim(), slug: String(data.get("slug")).trim().toLocaleLowerCase(), pipeline_id: route.selectedPipeline.id, stage_id: selectedStage.id, assignee_id: null, source_id: null, is_active: true };
-      const created = remoteEnabled ? await api.post<ApiWebhookEndpointCreated>("/admin/integrations/webhooks", payload) : { ...demoWebhook(payload.name, payload.slug, payload.pipeline_id, payload.stage_id), secret: `demo_${crypto.randomUUID().replaceAll("-", "")}` };
+      const payload = { name: String(data.get("name")).trim(), slug: String(data.get("slug")).trim().toLocaleLowerCase(), pipeline_id: route.selectedPipeline.id, stage_id: selectedStage.id, assignee_id: String(data.get("assignee_id") ?? "").trim() || null, source_id: null, is_active: true };
+      const created = remoteEnabled ? await api.post<ApiWebhookEndpointCreated>("/admin/integrations/webhooks", payload) : { ...demoWebhook(payload.name, payload.slug, payload.pipeline_id, payload.stage_id, payload.assignee_id), secret: `demo_${crypto.randomUUID().replaceAll("-", "")}` };
       await onCreated(created);
     } catch (reason) {
       setError(errorMessage(reason, "Не удалось создать webhook. Проверьте уникальность slug."));
@@ -736,9 +801,11 @@ export function WebhookEditor({ pipelines, defaultPipelineId, routingDisabled = 
           <label className="field"><span>Slug endpoint</span><input name="slug" required minLength={12} maxLength={100} pattern="[a-z0-9]+(?:-[a-z0-9]+)*" defaultValue={defaultSlug} /></label>
           <label className="field"><span>Воронка</span><select name="pipeline_id" value={route.selectedPipeline?.id ?? ""} required disabled={routingDisabled || !pipelines.length} onChange={(event) => route.selectPipeline(event.target.value)}>{!pipelines.length ? <option value="">Воронки недоступны</option> : null}{pipelines.map((pipeline) => <option key={pipeline.id} value={pipeline.id}>{pipeline.name}</option>)}</select></label>
           <label className="field"><span>Начальный этап</span><select name="stage_id" value={selectedStage?.id ?? ""} required disabled={routingDisabled || !route.stages.length} onChange={(event) => route.setStageId(event.target.value)}>{!route.stages.length ? <option value="">Рабочие этапы недоступны</option> : null}{route.stages.map((stage) => <option key={stage.id} value={stage.id}>{stage.name}</option>)}</select></label>
+          <AssigneeField users={assignees.users} name="assignee_id" />
         </div>
         <p className="settings-form-help">Pulse создаст HMAC-SHA256 секрет и покажет его один раз. Входящие запросы должны передавать timestamp и Idempotency-Key.</p>
         {!routeReady ? <p className="form-error" role="status">Создание webhook недоступно, пока не загружена активная воронка с рабочим этапом.</p> : null}
+        {assignees.isError ? <p className="form-error" role="alert">Не удалось загрузить список ответственных. Webhook можно сохранить без назначения.</p> : null}
         {error ? <p className="form-error" role="alert">{error}</p> : null}
         <EditorActions saving={saving} disabled={!routeReady} onCancel={onCancel} submitLabel="Создать endpoint" />
       </form>
@@ -746,9 +813,10 @@ export function WebhookEditor({ pipelines, defaultPipelineId, routingDisabled = 
   );
 }
 
-export function HtmlFormEditor({ pipelines, defaultPipelineId, routingDisabled = false, onCancel, onCreated }: { pipelines: Pipeline[]; defaultPipelineId: string; routingDisabled?: boolean; onCancel: () => void; onCreated: (created: ApiHtmlForm) => void | Promise<void> }) {
+export function HtmlFormEditor({ pipelines, defaultPipelineId, routingDisabled = false, availableUsers, onCancel, onCreated }: { pipelines: Pipeline[]; defaultPipelineId: string; routingDisabled?: boolean; availableUsers?: ApiUser[]; onCancel: () => void; onCreated: (created: ApiHtmlForm) => void | Promise<void> }) {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
+  const assignees = useAssignableUsers(availableUsers);
   const route = usePipelineStageSelection(pipelines, defaultPipelineId);
   const selectedStage = route.stages.find((stage) => stage.id === route.stageId);
   const routeReady = !routingDisabled && Boolean(route.selectedPipeline && selectedStage);
@@ -760,8 +828,8 @@ export function HtmlFormEditor({ pipelines, defaultPipelineId, routingDisabled =
     setError("");
     try {
       if (!routeReady || !route.selectedPipeline || !selectedStage) throw new Error("Дождитесь загрузки воронок и выберите начальный этап.");
-      const payload = { title: String(data.get("title")).trim(), slug: String(data.get("slug")).trim().toLocaleLowerCase(), pipeline_id: route.selectedPipeline.id, stage_id: selectedStage.id, assignee_id: null, source_id: null, fields_schema: [{ key: "name", type: "text", label: "Имя", required: true, max_length: 200 }, { key: "email", type: "email", label: "Email", required: false, max_length: 320 }, { key: "phone", type: "phone", label: "Телефон", required: false, max_length: 80 }, { key: "message", type: "textarea", label: "Сообщение", required: false, max_length: 2_000 }], allowed_origins: origins, honeypot_field: "company_website", success_message: "Спасибо! Мы свяжемся с вами.", is_active: true };
-      const created = remoteEnabled ? await api.post<ApiHtmlForm>("/admin/integrations/forms", payload) : demoForm(payload.title, payload.slug, payload.pipeline_id, payload.stage_id, origins);
+      const payload = { title: String(data.get("title")).trim(), slug: String(data.get("slug")).trim().toLocaleLowerCase(), pipeline_id: route.selectedPipeline.id, stage_id: selectedStage.id, assignee_id: String(data.get("assignee_id") ?? "").trim() || null, source_id: null, fields_schema: [{ key: "name", type: "text", label: "Имя", required: true, max_length: 200 }, { key: "email", type: "email", label: "Email", required: false, max_length: 320 }, { key: "phone", type: "phone", label: "Телефон", required: false, max_length: 80 }, { key: "message", type: "textarea", label: "Сообщение", required: false, max_length: 2_000 }], allowed_origins: origins, honeypot_field: "company_website", success_message: "Спасибо! Мы свяжемся с вами.", is_active: true };
+      const created = remoteEnabled ? await api.post<ApiHtmlForm>("/admin/integrations/forms", payload) : demoForm(payload.title, payload.slug, payload.pipeline_id, payload.stage_id, origins, payload.assignee_id);
       await onCreated(created);
     } catch (reason) {
       setError(errorMessage(reason, "Не удалось создать HTML-форму. Проверьте slug и домены."));
@@ -777,10 +845,12 @@ export function HtmlFormEditor({ pipelines, defaultPipelineId, routingDisabled =
           <label className="field"><span>Slug</span><input name="slug" required minLength={4} maxLength={100} pattern="[a-z0-9]+(?:-[a-z0-9]+)*" placeholder="request-offer" /></label>
           <label className="field"><span>Воронка</span><select name="pipeline_id" value={route.selectedPipeline?.id ?? ""} required disabled={routingDisabled || !pipelines.length} onChange={(event) => route.selectPipeline(event.target.value)}>{!pipelines.length ? <option value="">Воронки недоступны</option> : null}{pipelines.map((pipeline) => <option key={pipeline.id} value={pipeline.id}>{pipeline.name}</option>)}</select></label>
           <label className="field"><span>Начальный этап</span><select name="stage_id" value={selectedStage?.id ?? ""} required disabled={routingDisabled || !route.stages.length} onChange={(event) => route.setStageId(event.target.value)}>{!route.stages.length ? <option value="">Рабочие этапы недоступны</option> : null}{route.stages.map((stage) => <option key={stage.id} value={stage.id}>{stage.name}</option>)}</select></label>
+          <AssigneeField users={assignees.users} name="assignee_id" />
         </div>
         <label className="field"><span>Разрешённые origin, через запятую</span><input name="allowed_origins" placeholder="https://example.com, https://promo.example.com" /></label>
         <p className="settings-form-help">Будут созданы поля «Имя», email, телефон и сообщение, а также honeypot-защита. Готовая форма откроется по /forms/slug.</p>
         {!routeReady ? <p className="form-error" role="status">Создание HTML-формы недоступно, пока не загружена активная воронка с рабочим этапом.</p> : null}
+        {assignees.isError ? <p className="form-error" role="alert">Не удалось загрузить список ответственных. Форму можно сохранить без назначения.</p> : null}
         {error ? <p className="form-error" role="alert">{error}</p> : null}
         <EditorActions saving={saving} disabled={!routeReady} onCancel={onCancel} submitLabel="Создать форму" />
       </form>
@@ -797,31 +867,56 @@ function WebhookSecret({ result, onClose }: { result: ApiWebhookEndpointCreated;
 function NotificationsPanel({ pipelines }: { pipelines: Pipeline[] }) {
   const { session } = useAuth();
   const [showEditor, setShowEditor] = useState(false);
+  const [editingRule, setEditingRule] = useState<ApiNotificationRule | null>(null);
   const [localRules, setLocalRules] = useState(demoRules);
+  const [localTemplates, setLocalTemplates] = useState<ApiNotificationTemplate[]>(() => Array.from(new Map(demoRules.map((rule) => [rule.template_id, { ...demoTemplate(`${rule.name} — шаблон`, rule.channel, "В Pulse CRM произошло новое событие. Откройте карточку, чтобы увидеть детали."), id: rule.template_id }])).values()));
   const [savingRuleId, setSavingRuleId] = useState<string | null>(null);
   const [error, setError] = useState("");
   const rulesQuery = useQuery({ queryKey: ["settings", "notification-rules"], queryFn: () => api.get<ApiNotificationRule[]>("/admin/integrations/notification-rules"), enabled: remoteEnabled });
   const templatesQuery = useQuery({ queryKey: ["settings", "notification-templates"], queryFn: () => api.get<ApiNotificationTemplate[]>("/admin/integrations/notification-templates"), enabled: remoteEnabled });
   const rules = remoteEnabled ? rulesQuery.data ?? [] : localRules;
+  const templates = remoteEnabled ? templatesQuery.data ?? [] : localTemplates;
   const returnFocusRef = useRef<HTMLButtonElement | null>(null);
 
   function closeEditor() {
     setShowEditor(false);
+    setEditingRule(null);
+    setError("");
     window.setTimeout(() => returnFocusRef.current?.focus(), 0);
   }
 
   function toggleEditor(event: ReactMouseEvent<HTMLButtonElement>) {
     returnFocusRef.current = event.currentTarget;
+    setError("");
     if (showEditor) {
       closeEditor();
       return;
     }
+    setEditingRule(null);
     setShowEditor(true);
   }
 
-  async function createdRule(created: ApiNotificationRule) {
-    if (remoteEnabled) await Promise.all([rulesQuery.refetch(), templatesQuery.refetch()]); else setLocalRules((items) => [created, ...items]);
+  function editRule(rule: ApiNotificationRule, trigger: HTMLButtonElement) {
+    returnFocusRef.current = trigger;
+    setShowEditor(false);
+    setError("");
+    setEditingRule(rule);
+  }
+
+  async function savedRule(saved: ApiNotificationRule, savedTemplate: ApiNotificationTemplate) {
+    if (remoteEnabled) await Promise.all([rulesQuery.refetch(), templatesQuery.refetch()]);
+    else {
+      setLocalRules((items) => items.some((item) => item.id === saved.id) ? items.map((item) => item.id === saved.id ? saved : item) : [saved, ...items]);
+      setLocalTemplates((items) => items.some((item) => item.id === savedTemplate.id) ? items.map((item) => item.id === savedTemplate.id ? savedTemplate : item) : [savedTemplate, ...items]);
+    }
     closeEditor();
+  }
+  async function refreshRuleAfterConflict(ruleId: string) {
+    if (!remoteEnabled) return;
+    const [rulesResult] = await Promise.all([rulesQuery.refetch(), templatesQuery.refetch()]);
+    const refreshed = rulesResult.data?.find((item) => item.id === ruleId);
+    if (refreshed) setEditingRule(refreshed);
+    setError("Правило уже изменено другим пользователем. Загружены актуальные данные — проверьте их и повторите сохранение.");
   }
   async function toggleRule(rule: ApiNotificationRule) {
     setSavingRuleId(rule.id);
@@ -830,6 +925,7 @@ function NotificationsPanel({ pipelines }: { pipelines: Pipeline[] }) {
       if (remoteEnabled) { await api.patch<ApiNotificationRule>(`/admin/integrations/notification-rules/${rule.id}`, { expected_version: rule.version, is_enabled: !rule.is_enabled }); await rulesQuery.refetch(); }
       else setLocalRules((items) => items.map((item) => item.id === rule.id ? { ...item, is_enabled: !item.is_enabled, version: item.version + 1 } : item));
     } catch (reason) {
+      if (reason instanceof ApiError && reason.status === 409) await rulesQuery.refetch();
       setError(errorMessage(reason, "Не удалось изменить правило."));
     } finally {
       setSavingRuleId(null);
@@ -838,33 +934,44 @@ function NotificationsPanel({ pipelines }: { pipelines: Pipeline[] }) {
   return (
     <>
       <SettingsHeading title="Правила оповещений" action="Новое правило" actionControls="notification-rule-editor" actionExpanded={showEditor} mobileFab onAction={toggleEditor} />
-      <button type="button" className="mobile-fab settings-panel__mobile-add" aria-label="Добавить правило оповещения" aria-controls="notification-rule-editor" aria-expanded={showEditor} hidden={showEditor} onClick={toggleEditor}><Plus size={26} aria-hidden="true" /></button>
+      <button type="button" className="mobile-fab settings-panel__mobile-add" aria-label="Добавить правило оповещения" aria-controls="notification-rule-editor" aria-expanded={showEditor} hidden={showEditor || editingRule !== null} onClick={toggleEditor}><Plus size={26} aria-hidden="true" /></button>
       {rulesQuery.isError || templatesQuery.isError ? <SettingsNotice tone="error">Не удалось загрузить правила оповещений.</SettingsNotice> : null}
-      {showEditor ? <NotificationEditor pipelines={pipelines} currentUserId={session?.user.id ?? "demo-user"} onCancel={closeEditor} onCreated={createdRule} /> : null}
+      {showEditor || editingRule ? <NotificationEditor key={editingRule ? `${editingRule.id}:${editingRule.version}:${templates.find((item) => item.id === editingRule.template_id)?.version ?? 0}` : "new"} rule={editingRule ?? undefined} template={editingRule ? templates.find((item) => item.id === editingRule.template_id) : undefined} pipelines={pipelines} currentUserId={session?.user.id ?? "demo-user"} currentUser={session?.user ?? undefined} onCancel={closeEditor} onCreated={savedRule} onConflict={refreshRuleAfterConflict} /> : null}
       {error ? <SettingsNotice tone="error">{error}</SettingsNotice> : null}
       <section className="rules-list" aria-label="Правила оповещений">
-        {rules.map((rule) => <div key={rule.id}><button type="button" className={`rule-toggle${rule.is_enabled ? " is-on" : ""}`} aria-label={`${rule.is_enabled ? "Выключить" : "Включить"} правило ${rule.name}`} aria-pressed={rule.is_enabled} disabled={savingRuleId === rule.id} onClick={() => void toggleRule(rule)}><i /></button><strong>{rule.name}</strong><small>{rule.is_enabled ? "Включено" : "Выключено"} · {notificationChannelLabel(rule.channel)}</small><ChevronRight size={18} aria-hidden="true" /></div>)}
+        {rules.map((rule) => <div key={rule.id}><button type="button" className={`rule-toggle${rule.is_enabled ? " is-on" : ""}`} aria-label={`${rule.is_enabled ? "Выключить" : "Включить"} правило ${rule.name}`} aria-pressed={rule.is_enabled} disabled={savingRuleId === rule.id} onClick={() => void toggleRule(rule)}><i /></button><button type="button" aria-label={`Изменить правило ${rule.name}`} onClick={(event) => editRule(rule, event.currentTarget)} style={{ display: "flex", minWidth: 0, flexDirection: "column", background: "transparent", padding: 0, textAlign: "left" }}><strong>{rule.name}</strong><small>{rule.is_enabled ? "Включено" : "Выключено"} · {notificationChannelLabel(rule.channel)}</small></button><ChevronRight size={18} aria-hidden="true" /></div>)}
         {!rules.length && !rulesQuery.isLoading ? <SettingsEmpty icon={<ShieldCheck size={22} />} title="Правил пока нет" text="Создайте шаблон и правило из каталога событий." /> : null}
       </section>
     </>
   );
 }
 
-export function NotificationEditor({ pipelines, currentUserId, onCancel, onCreated }: { pipelines: Pipeline[]; currentUserId: string; onCancel: () => void; onCreated: (created: ApiNotificationRule) => void | Promise<void> }) {
-  const [audience, setAudience] = useState<"employee" | "client">("employee");
-  const [channel, setChannel] = useState<ApiNotificationChannel>("in_app");
-  const [recipientAddress, setRecipientAddress] = useState("");
-  const [contactId, setContactId] = useState("");
-  const [pipelineId, setPipelineId] = useState("");
-  const [stageId, setStageId] = useState("");
-  const [enabled, setEnabled] = useState(true);
+export function NotificationEditor({ rule, template, pipelines, currentUserId, currentUser, availableUsers, onCancel, onCreated, onConflict }: { rule?: ApiNotificationRule; template?: ApiNotificationTemplate; pipelines: Pipeline[]; currentUserId: string; currentUser?: ApiUser; availableUsers?: ApiUser[]; onCancel: () => void; onCreated: (saved: ApiNotificationRule, savedTemplate: ApiNotificationTemplate) => void | Promise<void>; onConflict?: (ruleId: string) => void | Promise<void> }) {
+  const editing = Boolean(rule);
+  const initialRecipient = rule?.recipients[0] ?? {};
+  const initialRecipientId = typeof initialRecipient.recipient_id === "string" ? initialRecipient.recipient_id : "";
+  const initialAddress = typeof initialRecipient.address === "string" ? initialRecipient.address : "";
+  const initialContactId = typeof initialRecipient.contact_id === "string" ? initialRecipient.contact_id : "";
+  const [audience, setAudience] = useState<"employee" | "client">(rule?.audience ?? "employee");
+  const [channel, setChannel] = useState<ApiNotificationChannel>(rule?.channel ?? "in_app");
+  const [employeeRecipientId, setEmployeeRecipientId] = useState(initialRecipientId || currentUserId);
+  const [recipientAddress, setRecipientAddress] = useState(initialAddress);
+  const [contactId, setContactId] = useState(initialContactId);
+  const [pipelineId, setPipelineId] = useState(rule?.pipeline_id ?? "");
+  const [stageId, setStageId] = useState(rule?.stage_id ?? "");
+  const [enabled, setEnabled] = useState(rule?.is_enabled ?? true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
+  const assignees = useAssignableUsers(availableUsers);
   const contactsQuery = useQuery({ queryKey: ["settings", "notification-contacts"], queryFn: () => api.get<CursorPage<ApiContact>>("/contacts?limit=100"), enabled: remoteEnabled && audience === "client" });
   const clientContacts = remoteEnabled
     ? (contactsQuery.data?.items ?? []).map((contact) => ({ id: contact.id, name: `${contact.first_name} ${contact.last_name}`.trim(), email: contact.primary_email ?? "" }))
     : demoContacts.map((contact) => ({ id: contact.id, name: contact.name, email: contact.email === "—" ? "" : contact.email }));
+  const employeeRecipients = useMemo(() => assignees.users.some((user) => user.id === currentUserId)
+    ? assignees.users
+    : [{ id: currentUserId, email: currentUser?.email ?? "", full_name: currentUser?.full_name ?? "Сотрудник", role: currentUser?.role ?? "admin" as const, version: currentUser?.version ?? 1 }, ...assignees.users], [assignees.users, currentUser, currentUserId]);
   const selectedPipeline = pipelines.find((pipeline) => pipeline.id === pipelineId);
+  const clientRequiresReapproval = audience === "client" && (!rule || rule.audience !== "client" || rule.channel !== channel || initialContactId !== contactId || initialAddress !== recipientAddress.trim());
 
   useEffect(() => {
     if (!pipelineId || selectedPipeline) return;
@@ -880,7 +987,8 @@ export function NotificationEditor({ pipelines, currentUserId, onCancel, onCreat
   function changeAudience(value: "employee" | "client") {
     setAudience(value);
     setEnabled(value === "employee");
-    if (value === "client" && channel === "in_app") setChannel("email");
+    if (value === "employee") setChannel("in_app");
+    else if (channel === "in_app") setChannel("email");
   }
 
   function changeContact(value: string) {
@@ -901,53 +1009,84 @@ export function NotificationEditor({ pipelines, currentUserId, onCancel, onCreat
     setSaving(true);
     setError("");
     try {
-      const address = channel === "in_app" ? currentUserId : recipientAddress.trim();
-      let recipient: Record<string, string> = channel === "in_app"
-        ? { address, recipient_id: currentUserId }
+      const address = audience === "employee" ? employeeRecipientId : recipientAddress.trim();
+      if (audience === "employee" && !address) throw new Error("Выберите сотрудника для оповещения.");
+      let recipient: Record<string, string> = audience === "employee"
+        ? { address, recipient_id: address }
         : { address };
+      const recipientChanged = audience === "client" && (!rule || rule.audience !== "client" || rule.channel !== channel || initialContactId !== contactId || initialAddress !== address);
       if (audience === "client") {
-        if (!contactId || !address || data.get("consent_confirmed") !== "on") {
-          throw new Error("Выберите клиента, адрес и подтвердите основание согласия.");
+        if (!contactId || !address) throw new Error("Выберите клиента и адрес получателя.");
+        if (recipientChanged) {
+          if (data.get("consent_confirmed") !== "on") throw new Error("Подтвердите основание согласия клиента.");
+          const evidenceText = String(data.get("consent_evidence") ?? "").trim();
+          if (!evidenceText) throw new Error("Опишите, где и когда клиент дал согласие.");
+          const normalizedAddress = remoteEnabled
+            ? (await api.post<ApiContactConsent>(`/contacts/${contactId}/consents`, { channel, address, purpose: "notifications", source: "manual", evidence: { confirmation: evidenceText, captured_by: currentUserId } })).normalized_address
+            : channel === "email" ? address.toLocaleLowerCase() : address;
+          recipient = { address, contact_id: contactId, normalized_address: normalizedAddress };
+        } else {
+          recipient = { ...initialRecipient, address, contact_id: contactId } as Record<string, string>;
         }
-        const evidenceText = String(data.get("consent_evidence") ?? "").trim();
-        if (!evidenceText) throw new Error("Опишите, где и когда клиент дал согласие.");
-        const normalizedAddress = remoteEnabled
-          ? (await api.post<ApiContactConsent>(`/contacts/${contactId}/consents`, { channel, address, purpose: "notifications", source: "manual", evidence: { confirmation: evidenceText, captured_by: currentUserId } })).normalized_address
-          : channel === "email" ? address.toLocaleLowerCase() : address;
-        recipient = { address, contact_id: contactId, normalized_address: normalizedAddress };
       }
       const body = String(data.get("body")).trim();
-      const template = remoteEnabled ? await api.post<ApiNotificationTemplate>("/admin/integrations/notification-templates", { name: `${name} — шаблон`, channel, subject_template: channel === "email" ? "Событие в Pulse CRM" : null, body_template: body, is_active: true }) : demoTemplate(`${name} — шаблон`, channel, body);
-      const payload = { template_id: template.id, name, event_type: String(data.get("event_type")), audience, channel, pipeline_id: pipelineId || null, stage_id: pipelineId && stageId ? stageId : null, source_id: null, filters: {}, recipients: [recipient], delay_seconds: Math.max(0, Number(data.get("delay_minutes")) || 0) * 60, require_client_consent: true, is_enabled: audience === "client" ? false : enabled };
-      const created = remoteEnabled ? await api.post<ApiNotificationRule>("/admin/integrations/notification-rules", payload) : { ...demoRule(payload.name, payload.event_type, channel, payload.is_enabled, audience), template_id: template.id, pipeline_id: payload.pipeline_id, stage_id: payload.stage_id, recipients: payload.recipients, delay_seconds: payload.delay_seconds };
-      await onCreated(created);
+      if (rule && !template) throw new Error("Шаблон правила ещё не загружен. Обновите страницу и повторите.");
+      const templateName = `${name} — шаблон`;
+      const subjectTemplate = channel === "email" ? "Событие в Pulse CRM" : null;
+      let savedTemplate: ApiNotificationTemplate;
+      if (remoteEnabled) {
+        if (rule && template && template.channel === channel) {
+          const templateChanged = template.name !== templateName || template.body_template !== body || template.subject_template !== subjectTemplate;
+          savedTemplate = templateChanged
+            ? await api.patch<ApiNotificationTemplate>(`/admin/integrations/notification-templates/${template.id}`, { expected_version: template.version, name: templateName, body_template: body, subject_template: subjectTemplate })
+            : template;
+        } else {
+          savedTemplate = await api.post<ApiNotificationTemplate>("/admin/integrations/notification-templates", { name: templateName, channel, subject_template: subjectTemplate, body_template: body, is_active: true });
+        }
+      } else if (rule && template && template.channel === channel) {
+        savedTemplate = { ...template, name: templateName, body_template: body, subject_template: subjectTemplate, version: template.version + 1, updated_at: new Date().toISOString() };
+      } else {
+        savedTemplate = demoTemplate(templateName, channel, body);
+      }
+      const nextEnabled = audience === "client" ? (rule?.audience === "client" && !recipientChanged ? rule.is_enabled : false) : enabled;
+      const payload = { template_id: savedTemplate.id, name, event_type: String(data.get("event_type")), audience, channel, pipeline_id: pipelineId || null, stage_id: pipelineId && stageId ? stageId : null, source_id: null, filters: rule?.filters ?? {}, recipients: [recipient], delay_seconds: Math.max(0, Number(data.get("delay_minutes")) || 0) * 60, require_client_consent: true, is_enabled: nextEnabled };
+      const saved = remoteEnabled
+        ? rule
+          ? await api.patch<ApiNotificationRule>(`/admin/integrations/notification-rules/${rule.id}`, { expected_version: rule.version, ...payload })
+          : await api.post<ApiNotificationRule>("/admin/integrations/notification-rules", payload)
+        : rule
+          ? { ...rule, ...payload, version: rule.version + 1, updated_at: new Date().toISOString() }
+          : { ...demoRule(payload.name, payload.event_type, channel, payload.is_enabled, audience), template_id: savedTemplate.id, pipeline_id: payload.pipeline_id, stage_id: payload.stage_id, recipients: payload.recipients, delay_seconds: payload.delay_seconds };
+      await onCreated(saved, savedTemplate);
     } catch (reason) {
-      setError(errorMessage(reason, "Не удалось создать шаблон и правило."));
+      if (rule && reason instanceof ApiError && reason.status === 409) await onConflict?.(rule.id);
+      setError(errorMessage(reason, editing ? "Не удалось изменить правило." : "Не удалось создать шаблон и правило."));
     } finally {
       setSaving(false);
     }
   }
   return (
-    <SettingsEditor id="notification-rule-editor" title="Новое правило и шаблон" icon={<ShieldCheck size={19} />} onCancel={onCancel}>
+    <SettingsEditor id="notification-rule-editor" title={editing ? `Изменение правила · ${rule?.name}` : "Новое правило и шаблон"} icon={<ShieldCheck size={19} />} onCancel={onCancel}>
       <form onSubmit={(event) => void submit(event)}>
         <div className="settings-form-grid">
-          <label className="field"><span>Название правила</span><input name="name" required maxLength={160} placeholder="Новый лид — владельцу" /></label>
-          <label className="field"><span>Событие</span><select name="event_type" defaultValue="lead.created">{notificationEvents.map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select></label>
+          <label className="field"><span>Название правила</span><input name="name" required maxLength={160} placeholder="Новый лид — владельцу" defaultValue={rule?.name ?? ""} /></label>
+          <label className="field"><span>Событие</span><select name="event_type" defaultValue={rule?.event_type ?? "lead.created"}>{notificationEvents.map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select></label>
           <label className="field"><span>Получатель</span><select name="audience" value={audience} onChange={(event) => changeAudience(event.target.value as "employee" | "client")}><option value="employee">Сотрудник</option><option value="client">Клиент с согласием</option></select></label>
-          <label className="field"><span>Канал</span><select name="channel" value={channel} onChange={(event) => { const next = event.target.value as ApiNotificationChannel; setChannel(next); if (audience === "client" && next === "email") { const contact = clientContacts.find((item) => item.id === contactId); if (contact?.email) setRecipientAddress(contact.email); } }}><option value="in_app" disabled={audience === "client"}>В приложении</option><option value="email">Email</option><option value="telegram">Telegram</option><option value="max">MAX</option></select></label>
+          <label className="field"><span>Канал</span><select name="channel" value={channel} onChange={(event) => { const next = event.target.value as ApiNotificationChannel; setChannel(next); if (audience === "client" && next === "email") { const contact = clientContacts.find((item) => item.id === contactId); if (contact?.email) setRecipientAddress(contact.email); } }}><option value="in_app" disabled={audience === "client"}>В приложении</option>{audience === "client" ? <><option value="email">Email</option><option value="telegram">Telegram</option><option value="max">MAX</option></> : null}</select></label>
           {audience === "client" ? <label className="field"><span>Клиент</span><select aria-label="Клиент" name="contact_id" value={contactId} onChange={(event) => changeContact(event.target.value)} required><option value="">Выберите контакт</option>{clientContacts.map((contact) => <option key={contact.id} value={contact.id}>{contact.name}</option>)}</select></label> : null}
-          {channel === "in_app" ? <label className="field"><span>Адрес</span><input value="Текущий администратор" readOnly /></label> : <label className="field"><span>{channel === "email" ? "Email" : "ID чата получателя"}</span><input name="recipient" value={recipientAddress} onChange={(event) => setRecipientAddress(event.target.value)} required placeholder={channel === "email" ? "client@example.com" : "ID чата получателя"} /></label>}
-          <label className="field"><span>Задержка, минут</span><input name="delay_minutes" type="number" min="0" max="525600" defaultValue="0" /></label>
+          {audience === "employee" ? <label className="field"><span>Сотрудник</span><select name="employee_recipient_id" value={employeeRecipientId} onChange={(event) => setEmployeeRecipientId(event.target.value)} required>{employeeRecipients.map((user) => <option key={user.id} value={user.id}>{user.full_name || user.email}</option>)}</select></label> : <label className="field"><span>{channel === "email" ? "Email" : "ID чата получателя"}</span><input name="recipient" value={recipientAddress} onChange={(event) => setRecipientAddress(event.target.value)} required placeholder={channel === "email" ? "client@example.com" : "ID чата получателя"} /></label>}
+          <label className="field"><span>Задержка, минут</span><input name="delay_minutes" type="number" min="0" max="525600" defaultValue={Math.floor((rule?.delay_seconds ?? 0) / 60)} /></label>
           <label className="field"><span>Воронка</span><select name="pipeline_id" value={pipelineId} onChange={(event) => changePipelineFilter(event.target.value)}><option value="">Все воронки</option>{pipelines.map((pipeline) => <option key={pipeline.id} value={pipeline.id}>{pipeline.name}</option>)}</select></label>
           <label className="field"><span>Этап</span><select name="stage_id" value={stageId} disabled={!selectedPipeline} onChange={(event) => setStageId(event.target.value)}><option value="">Все этапы</option>{selectedPipeline?.stages.map((stage) => <option key={stage.id} value={stage.id}>{stage.name}</option>)}</select></label>
         </div>
-        {audience === "client" ? <><label className="field"><span>Основание согласия</span><textarea name="consent_evidence" required rows={2} placeholder="Например: checkbox формы заказа, 28.08.2026" /></label><div className="settings-checks"><label><input name="consent_confirmed" type="checkbox" required /> Подтверждаю, что согласие клиента получено и зафиксировано</label></div></> : null}
-        <label className="field"><span>Текст шаблона</span><textarea name="body" required rows={3} defaultValue="В Pulse CRM произошло новое событие. Откройте карточку, чтобы увидеть детали." /></label>
+        {clientRequiresReapproval ? <><label className="field"><span>Основание согласия</span><textarea name="consent_evidence" required rows={2} placeholder="Например: checkbox формы заказа, 28.08.2026" /></label><div className="settings-checks"><label><input name="consent_confirmed" type="checkbox" required /> Подтверждаю, что согласие клиента получено и зафиксировано</label></div></> : null}
+        <label className="field"><span>Текст шаблона</span><textarea name="body" required rows={3} defaultValue={template?.body_template ?? "В Pulse CRM произошло новое событие. Откройте карточку, чтобы увидеть детали."} /></label>
         <div className="settings-checks"><label><input name="is_enabled" type="checkbox" checked={enabled} disabled={audience === "client"} onChange={(event) => setEnabled(event.target.checked)} /> Включить сразу</label></div>
-        <p className="settings-form-help">Клиентское правило всегда создаётся выключенным. После проверки адреса и сохранённого согласия включите его в списке правил.</p>
+        <p className="settings-form-help">{audience === "employee" ? "Выбранный сотрудник получит внутреннее уведомление в Pulse CRM. Значение — конкретный пользователь, а не технический адрес." : clientRequiresReapproval ? "После изменения канала или получателя правило сохранится выключенным. Проверьте адрес и согласие, затем включите его в списке." : "Имя, текст и фильтры можно менять без отключения уже проверенного клиентского правила."}</p>
         {contactsQuery.isError ? <p className="form-error" role="alert">Не удалось загрузить контакты для согласия.</p> : null}
+        {assignees.isError ? <p className="form-error" role="alert">Не удалось загрузить полный список сотрудников. Доступен только текущий пользователь.</p> : null}
         {error ? <p className="form-error" role="alert">{error}</p> : null}
-        <EditorActions saving={saving} onCancel={onCancel} submitLabel="Создать правило" />
+        <EditorActions saving={saving} onCancel={onCancel} submitLabel={editing ? "Сохранить правило" : "Создать правило"} />
       </form>
     </SettingsEditor>
   );
@@ -1142,24 +1281,82 @@ function ImportPanel() {
 }
 
 function InviteUsersPanel() {
-  const { session } = useAuth();
+  const { session, refreshSession } = useAuth();
   const [invite, setInvite] = useState<InvitationCreated | null>(null);
+  const [editingUser, setEditingUser] = useState<ApiUser | null>(null);
+  const [localMembers, setLocalMembers] = useState<ApiUser[]>(() => session ? [session.user] : []);
+  const [editError, setEditError] = useState("");
   const [error, setError] = useState("");
   const [saving, setSaving] = useState(false);
   const usersQuery = useQuery({ queryKey: ["users"], queryFn: () => api.get<ApiUser[]>("/users"), enabled: remoteEnabled });
-  const members = usersQuery.data ?? (session ? [session.user] : []);
+  const members = remoteEnabled ? usersQuery.data ?? [] : localMembers;
+  function canEdit(member: ApiUser): boolean {
+    if (session?.user.role === "owner") return true;
+    return session?.user.role === "admin" && member.role !== "owner" && member.role !== "admin";
+  }
+  async function savedUser(saved: ApiUser) {
+    if (remoteEnabled) {
+      await usersQuery.refetch();
+      if (saved.id === session?.user.id) await refreshSession();
+    } else {
+      setLocalMembers((items) => items.map((item) => item.id === saved.id ? saved : item));
+    }
+    setEditError("");
+    setEditingUser(null);
+  }
+  async function refreshUserAfterConflict(userId: string) {
+    if (!remoteEnabled) return;
+    const result = await usersQuery.refetch();
+    const refreshed = result.data?.find((item) => item.id === userId);
+    if (refreshed) setEditingUser(refreshed);
+    setEditError("Пользователь уже изменён другим администратором. Загружены актуальные данные — проверьте их и повторите сохранение.");
+  }
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const data = new FormData(event.currentTarget);
     setSaving(true);
     setError("");
     try {
-      if (!remoteEnabled) { setInvite({ id: crypto.randomUUID(), email: String(data.get("email")), role: String(data.get("role")) as "admin" | "manager", expires_at: new Date(Date.now() + 72 * 3_600_000).toISOString(), token: "demo-invitation-token" }); return; }
+      if (!remoteEnabled) { setInvite({ id: crypto.randomUUID(), email: String(data.get("email")), role: String(data.get("role")) as InvitationCreated["role"], expires_at: new Date(Date.now() + 72 * 3_600_000).toISOString(), token: "demo-invitation-token" }); return; }
       setInvite(await api.post<InvitationCreated>("/invitations", { email: String(data.get("email")), role: String(data.get("role")) }));
     } catch { setError("Не удалось создать приглашение"); }
     finally { setSaving(false); }
   }
-  return <><SettingsHeading title="Пользователи и роли" /><section className="members-panel"><div className="members-list">{members.map((member) => <div key={member.id}><span className="company-avatar">{member.full_name.slice(0, 1)}</span><span><strong>{member.full_name}</strong><small>{member.email}</small></span><em>{member.role === "owner" ? "Владелец" : member.role === "admin" ? "Администратор" : "Менеджер"}</em></div>)}</div><form className="invite-form" onSubmit={(event) => void submit(event)}><header><UserPlus size={19} /><div><strong>Пригласить сотрудника</strong><small>Ссылка действует 72 часа</small></div></header><label className="field"><span>Email</span><input name="email" type="email" required placeholder="manager@example.com" /></label><label className="field"><span>Роль</span><select name="role" defaultValue="manager"><option value="manager">Менеджер</option>{session?.user.role === "owner" ? <option value="admin">Администратор</option> : null}</select></label>{error ? <p className="form-error" role="alert">{error}</p> : null}<Button type="submit" variant="primary" disabled={saving}>{saving ? "Создаём…" : "Создать приглашение"}</Button>{invite ? <div className="invite-result" role="status"><strong>Приглашение готово</strong><code>{`${window.location.origin}/accept-invitation?token=${invite.token}`}</code></div> : null}</form></section></>;
+  return <><SettingsHeading title="Пользователи и роли" />{editError ? <SettingsNotice tone="error">{editError}</SettingsNotice> : null}{editingUser && session ? <UserEditor key={`${editingUser.id}:${editingUser.version}`} user={editingUser} actor={session.user} onCancel={() => { setEditingUser(null); setEditError(""); }} onSaved={savedUser} onConflict={refreshUserAfterConflict} /> : null}<section className="members-panel"><div className="members-list">{members.map((member) => <div key={member.id} role={canEdit(member) ? "button" : undefined} tabIndex={canEdit(member) ? 0 : undefined} aria-label={canEdit(member) ? `Изменить пользователя ${member.full_name}` : undefined} onClick={() => { if (canEdit(member)) { setEditError(""); setEditingUser(member); } }} onKeyDown={(event) => { if (canEdit(member) && (event.key === "Enter" || event.key === " ")) { event.preventDefault(); setEditError(""); setEditingUser(member); } }}><span className="company-avatar">{member.full_name.slice(0, 1)}</span><span><strong>{member.full_name}</strong><small>{member.email}</small></span><em>{userRoleLabel(member.role)}</em></div>)}</div><form className="invite-form" onSubmit={(event) => void submit(event)}><header><UserPlus size={19} /><div><strong>Пригласить сотрудника</strong><small>Ссылка действует 72 часа</small></div></header><label className="field"><span>Email</span><input name="email" type="email" required placeholder="employee@example.com" /></label><label className="field"><span>Роль</span><select name="role" defaultValue="employee"><option value="employee">Сотрудник</option><option value="manager">Менеджер</option>{session?.user.role === "owner" ? <option value="admin">Администратор</option> : null}</select></label>{error ? <p className="form-error" role="alert">{error}</p> : null}<Button type="submit" variant="primary" disabled={saving}>{saving ? "Создаём…" : "Создать приглашение"}</Button>{invite ? <div className="invite-result" role="status"><strong>Приглашение готово</strong><code>{`${window.location.origin}/accept-invitation?token=${invite.token}`}</code></div> : null}</form></section></>;
+}
+
+export function UserEditor({ user, actor, onCancel, onSaved, onConflict }: { user: ApiUser; actor: ApiUser; onCancel: () => void; onSaved: (saved: ApiUser) => void | Promise<void>; onConflict?: (userId: string) => void | Promise<void> }) {
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  const roleLocked = user.id === actor.id || (actor.role === "admin" && (user.role === "owner" || user.role === "admin"));
+  const roles: Array<NonNullable<ApiUser["role"]>> = actor.role === "owner" ? ["employee", "manager", "admin", "owner"] : ["employee", "manager"];
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const data = new FormData(event.currentTarget);
+    setSaving(true);
+    setError("");
+    try {
+      const payload = { expected_version: user.version, full_name: String(data.get("full_name")).trim(), ...(roleLocked ? {} : { role: String(data.get("role")) }) };
+      const saved = remoteEnabled
+        ? await api.patch<ApiUser>(`/users/${user.id}`, payload)
+        : { ...user, full_name: payload.full_name, ...("role" in payload ? { role: payload.role as ApiUser["role"] } : {}), version: user.version + 1 };
+      await onSaved(saved);
+    } catch (reason) {
+      if (reason instanceof ApiError && reason.status === 409) await onConflict?.(user.id);
+      setError(errorMessage(reason, "Не удалось изменить пользователя."));
+    } finally {
+      setSaving(false);
+    }
+  }
+  return <SettingsEditor id="user-editor" title={`Изменение пользователя · ${user.full_name}`} icon={<Pencil size={19} />} onCancel={onCancel}><form onSubmit={(event) => void submit(event)}><div className="settings-form-grid"><label className="field"><span>Имя</span><input name="full_name" required minLength={2} maxLength={160} defaultValue={user.full_name} /></label><label className="field"><span>Email для входа</span><input type="email" value={user.email} readOnly aria-describedby="user-email-help" /></label><label className="field"><span>Роль</span><select name="role" defaultValue={user.role ?? "employee"} disabled={roleLocked}>{roles.map((role) => <option key={role} value={role}>{userRoleLabel(role)}</option>)}</select></label></div><p className="settings-form-help" id="user-email-help">Email — логин учётной записи и здесь не изменяется. {user.id === actor.id ? "Свою роль нельзя изменить, чтобы случайно не потерять доступ." : "Новая роль применяется к открытым сессиям сразу после сохранения."}</p>{error ? <p className="form-error" role="alert">{error}</p> : null}<EditorActions saving={saving} onCancel={onCancel} submitLabel="Сохранить пользователя" /></form></SettingsEditor>;
+}
+
+function userRoleLabel(role: ApiUser["role"]): string {
+  if (role === "owner") return "Владелец";
+  if (role === "admin") return "Администратор";
+  if (role === "manager") return "Менеджер";
+  if (role === "employee") return "Сотрудник";
+  return "Без роли";
 }
 
 function SettingsHeading({ title, action, actionControls, actionExpanded, actionDisabled = false, mobileFab = false, onAction }: { title: string; action?: string; actionControls?: string; actionExpanded?: boolean; actionDisabled?: boolean; mobileFab?: boolean; onAction?: (event: ReactMouseEvent<HTMLButtonElement>) => void }) {
@@ -1211,6 +1408,8 @@ function errorMessage(reason: unknown, fallback: string): string {
         last_open_stage: "В воронке должен остаться хотя бы один рабочий этап.",
         last_active_pipeline: "Нельзя удалить последнюю активную воронку.",
         pipeline_in_use: "Воронка используется сделками или интеграциями. Сначала перенесите связанные данные.",
+        self_role_change_forbidden: "Свою роль нельзя изменить, чтобы не потерять доступ.",
+        last_owner_required: "В компании должен остаться хотя бы один владелец.",
       };
       if (friendlyMessages[code]) return friendlyMessages[code];
       if ("message" in detail && typeof (detail as { message?: unknown }).message === "string") return (detail as { message: string }).message;
@@ -1222,9 +1421,9 @@ function credentialsExample(kind: ApiChannelKind): string {
   const value = kind === "email" ? { smtp: { host: "smtp.example.com", port: 587, security: "starttls", username: "sales@example.com", password: "", from_address: "sales@example.com" }, imap: { host: "imap.example.com", port: 993, security: "ssl", username: "sales@example.com", password: "", mailbox: "INBOX" } } : kind === "telegram" ? { bot_token: "", webhook_secret: "" } : { access_token: "", webhook_secret: "" };
   return JSON.stringify(value, null, 2);
 }
-function demoChannel(kind: ApiChannelKind, name: string, pipelineId: string, stageId: string): ApiChannelConnection { const now = new Date().toISOString(); return { id: crypto.randomUUID(), kind, name, status: "active", settings: {}, default_pipeline_id: pipelineId, default_stage_id: stageId, default_assignee_id: null, has_credentials: true, last_healthcheck_at: null, last_error: null, version: 1, created_at: now, updated_at: now }; }
-function demoWebhook(name: string, slug: string, pipelineId: string, stageId: string): ApiWebhookEndpoint { const now = new Date().toISOString(); return { id: crypto.randomUUID(), name, slug, pipeline_id: pipelineId, stage_id: stageId, assignee_id: null, source_id: null, is_active: true, version: 1, created_at: now, updated_at: now }; }
-function demoForm(title: string, slug: string, pipelineId: string, stageId: string, origins: string[]): ApiHtmlForm { const now = new Date().toISOString(); return { id: crypto.randomUUID(), title, slug, pipeline_id: pipelineId, stage_id: stageId, assignee_id: null, source_id: null, fields_schema: [], allowed_origins: origins, honeypot_field: "company_website", success_message: "Спасибо! Мы свяжемся с вами.", is_active: true, version: 1, created_at: now, updated_at: now }; }
+function demoChannel(kind: ApiChannelKind, name: string, pipelineId: string, stageId: string, assigneeId: string | null): ApiChannelConnection { const now = new Date().toISOString(); return { id: crypto.randomUUID(), kind, name, status: "active", settings: {}, default_pipeline_id: pipelineId, default_stage_id: stageId, default_assignee_id: assigneeId, has_credentials: true, last_healthcheck_at: null, last_error: null, version: 1, created_at: now, updated_at: now }; }
+function demoWebhook(name: string, slug: string, pipelineId: string, stageId: string, assigneeId: string | null): ApiWebhookEndpoint { const now = new Date().toISOString(); return { id: crypto.randomUUID(), name, slug, pipeline_id: pipelineId, stage_id: stageId, assignee_id: assigneeId, source_id: null, is_active: true, version: 1, created_at: now, updated_at: now }; }
+function demoForm(title: string, slug: string, pipelineId: string, stageId: string, origins: string[], assigneeId: string | null): ApiHtmlForm { const now = new Date().toISOString(); return { id: crypto.randomUUID(), title, slug, pipeline_id: pipelineId, stage_id: stageId, assignee_id: assigneeId, source_id: null, fields_schema: [], allowed_origins: origins, honeypot_field: "company_website", success_message: "Спасибо! Мы свяжемся с вами.", is_active: true, version: 1, created_at: now, updated_at: now }; }
 function demoTemplate(name: string, channel: ApiNotificationChannel, body: string): ApiNotificationTemplate { const now = new Date().toISOString(); return { id: crypto.randomUUID(), name, channel, subject_template: null, body_template: body, is_active: true, version: 1, created_at: now, updated_at: now }; }
 function demoCustomField(payload: { entity_type: "deal"; key: string; name: string; field_type: ApiCustomFieldType; options: string[] }): ApiCustomField { return { id: crypto.randomUUID(), is_active: true, ...payload }; }
 function demoRequiredFields(fields: Array<{ built_in_key: string } | { field_definition_id: string }>): ApiRequiredField[] { return fields.map((field) => ({ id: crypto.randomUUID(), built_in_key: "built_in_key" in field ? field.built_in_key : null, field_definition_id: "field_definition_id" in field ? field.field_definition_id : null })); }

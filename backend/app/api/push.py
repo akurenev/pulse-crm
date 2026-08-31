@@ -18,6 +18,8 @@ from app.config import Settings
 from app.db import get_session
 from app.integrations.secrets import SecretCipher
 from app.integrations.web_push import (
+    TEST_PUSH_BODY,
+    TEST_PUSH_SUBJECT,
     delete_subscription,
     enqueue_web_push_delivery,
     has_active_subscription,
@@ -265,8 +267,8 @@ async def queue_test_push(
         db,
         workspace_id=context.workspace_id,
         user_id=context.user_id,
-        subject="Pulse CRM",
-        body="Тестовое push-уведомление. Уведомления настроены правильно.",
+        subject=TEST_PUSH_SUBJECT,
+        body=TEST_PUSH_BODY,
         dedupe_key=(
             f"web-push:test:{context.workspace_id}:{context.user_id}:"
             f"{bucket}"
