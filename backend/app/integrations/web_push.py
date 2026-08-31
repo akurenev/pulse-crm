@@ -29,6 +29,7 @@ from app.services.jobs import SessionFactory
 
 MAX_ACTIVE_SUBSCRIPTIONS_PER_USER = 10
 MAX_WEB_PUSH_PAYLOAD_BYTES = 3_000
+DEFAULT_WEB_PUSH_URL = "/"
 
 
 class WebPushDeliveryError(RuntimeError):
@@ -295,7 +296,13 @@ async def enqueue_web_push_delivery(
     scheduled_at: datetime | None = None,
     rule_id: uuid.UUID | None = None,
     template_id: uuid.UUID | None = None,
+    target_entity_type: str | None = None,
+    target_entity_id: uuid.UUID | None = None,
 ) -> QueuedWebPushDelivery:
+    if (target_entity_type is None) != (target_entity_id is None) or (
+        target_entity_type is not None and target_entity_type not in {"deal", "task"}
+    ):
+        raise ValueError("invalid web push target")
     due_at = scheduled_at or datetime.now(UTC)
     delivery_id = uuid.uuid4()
     inserted_id = (
@@ -312,6 +319,8 @@ async def enqueue_web_push_delivery(
                 recipient_address=str(user_id),
                 subject=subject,
                 body=body,
+                target_entity_type=target_entity_type,
+                target_entity_id=target_entity_id,
                 status=DeliveryStatus.pending,
                 dedupe_key=dedupe_key,
                 scheduled_at=due_at,
@@ -383,6 +392,8 @@ async def mirror_delivered_in_app_notification(
         body=delivery.body,
         rule_id=delivery.rule_id,
         template_id=delivery.template_id,
+        target_entity_type=delivery.target_entity_type,
+        target_entity_id=delivery.target_entity_id,
         dedupe_key=f"web-push:in-app:{delivery.id}",
         scheduled_at=now,
     )
@@ -396,15 +407,32 @@ def _truncate_utf8(value: str, maximum_bytes: int) -> str:
     return encoded[:maximum_bytes].decode("utf-8", errors="ignore")
 
 
+def _web_push_url(delivery: NotificationDelivery) -> str:
+    """Build only the UUID-based relative routes supported by the PWA."""
+
+    if delivery.target_entity_id is None:
+        return DEFAULT_WEB_PUSH_URL
+    try:
+        entity_id = uuid.UUID(str(delivery.target_entity_id))
+    except ValueError:
+        return DEFAULT_WEB_PUSH_URL
+    if delivery.target_entity_type == "deal":
+        return f"/deals?deal={entity_id}"
+    if delivery.target_entity_type == "task":
+        return f"/tasks?task={entity_id}"
+    return DEFAULT_WEB_PUSH_URL
+
+
 def build_web_push_payload(delivery: NotificationDelivery) -> str:
     title = _truncate_utf8(delivery.subject or "Pulse CRM", 240)
     body = _truncate_utf8(delivery.body, 2_600)
+    safe_url = _web_push_url(delivery)
     while True:
         payload = json.dumps(
             {
                 "title": title,
                 "body": body,
-                "url": "/",
+                "url": safe_url,
                 "tag": f"notification:{delivery.id}",
             },
             ensure_ascii=False,
@@ -618,6 +646,7 @@ __all__ = [
     "MAX_ACTIVE_SUBSCRIPTIONS_PER_USER",
     "MAX_WEB_PUSH_PAYLOAD_BYTES",
     "QueuedWebPushDelivery",
+    "DEFAULT_WEB_PUSH_URL",
     "WebPushDeliveryError",
     "WebPushDeliverySender",
     "WebPushSender",

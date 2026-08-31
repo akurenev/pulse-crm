@@ -1,9 +1,10 @@
 import { lazy, Suspense, type ReactNode } from "react";
-import { Navigate, Outlet, Route, Routes } from "react-router-dom";
+import { Navigate, Outlet, Route, Routes, useLocation } from "react-router-dom";
 
 import { PwaInstallPrompt } from "./components/PwaInstallPrompt";
 import { AppShell } from "./components/layout/AppShell";
 import { DealsPage } from "./features/deals/DealsPage";
+import { normalizeInternalAppPath } from "./lib/deep-links";
 import { useAuth } from "./state/auth-store";
 
 const DashboardPage = lazy(() => import("./pages/DashboardPage"));
@@ -44,8 +45,12 @@ export default function App() {
 
 function AuthGate() {
   const { status } = useAuth();
+  const location = useLocation();
   if (status === "loading") return loadingFallback;
-  if (status === "anonymous") return <Navigate to="/login" replace />;
+  if (status === "anonymous") {
+    const from = normalizeInternalAppPath(`${location.pathname}${location.search}`) ?? "/deals";
+    return <Navigate to="/login" replace state={{ from }} />;
+  }
   return <Outlet />;
 }
 

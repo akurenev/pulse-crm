@@ -1,6 +1,9 @@
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { MemoryRouter, useNavigate } from "react-router-dom";
 
+import { DealsPage } from "../features/deals/DealsPage";
 import { ApiError } from "../lib/api";
 import type { ApiDeal, ApiPipeline, ApiTask, ApiUser, CursorPage } from "../types/api";
 import { CrmProvider, useCrm } from "./crm-store";
@@ -45,6 +48,7 @@ const secondaryPipeline: ApiPipeline = {
   version: 1,
   stages: [
     { id: "stage-service-open", pipeline_id: "pipeline-service", name: "В работе", color: "#4b96f8", position: 0, stage_type: "open", version: 1 },
+    { id: "stage-service-won", pipeline_id: "pipeline-service", name: "Выполнено", color: "#16a36d", position: 1, stage_type: "won", version: 1 },
   ],
 };
 
@@ -98,6 +102,7 @@ const owner: ApiUser = {
 function StoreProbe() {
   const {
     deals,
+    pipeline: activePipeline,
     pipelines,
     loading,
     loadedStageIds,
@@ -112,6 +117,8 @@ function StoreProbe() {
     deleteDeal,
     moveDeal,
     selectDeal,
+    openDeal,
+    selectedDeal,
     selectedDealMutationPending,
   } = useCrm();
   return <div>
@@ -119,6 +126,8 @@ function StoreProbe() {
     <output aria-label="Сделки">{deals.map((item) => item.title).join("|")}</output>
     <output aria-label="Версии сделок">{deals.map((item) => `${item.version}:${item.stageId}`).join("|")}</output>
     <output aria-label="Воронки">{pipelines.map((item) => item.id).join("|") || "нет"}</output>
+    <output aria-label="Активная воронка">{activePipeline.id}</output>
+    <output aria-label="Открытая сделка">{selectedDeal?.title ?? "нет"}</output>
     <output aria-label="Мутация сделки">{selectedDealMutationPending ? "pending" : "idle"}</output>
     <output aria-label="Задачи сделок">{deals.flatMap((item) => item.tasks).map((item) => item.title).join("|")}</output>
     <output aria-label="Состояния задач">{deals.flatMap((item) => item.tasks).map((item) => item.completed ? "done" : "open").join("|")}</output>
@@ -146,6 +155,7 @@ function StoreProbe() {
       const currentDeal = deals[0];
       if (currentDeal) selectDeal(currentDeal.id);
     }}>Открыть первую сделку</button>
+    <button type="button" onClick={() => void openDeal("deal-deep-link").catch(() => undefined)}>Открыть сделку по ссылке</button>
     <button type="button" onClick={() => {
       const currentDeal = deals[0];
       if (currentDeal) void moveDeal(currentDeal.id, "stage-won").catch(() => undefined);
@@ -159,6 +169,11 @@ function StoreProbe() {
       void deleteDeal(currentDeal.id).catch(() => undefined);
     }}>Назначить, перенести и удалить одновременно</button>
   </div>;
+}
+
+function ClearDealRouteButton() {
+  const navigate = useNavigate();
+  return <button type="button" onClick={() => navigate("/deals")}>Убрать сделку из адреса</button>;
 }
 
 describe("CrmProvider deal stage loading", () => {
@@ -250,6 +265,99 @@ describe("CrmProvider deal stage loading", () => {
     expect(paths.filter((path) => path === "/users")).toHaveLength(1);
     expect(paths.filter((path) => path === "/tasks?limit=100")).toHaveLength(1);
     await act(async () => resolveTasks({ items: [], next_cursor: null }));
+  });
+
+  it("открывает по deep-link отсутствующую в списке сделку из финального этапа другой воронки", async () => {
+    const deepLinkedDeal = deal(
+      "deal-deep-link",
+      "stage-service-won",
+      "Сделка из уведомления",
+      secondaryPipeline.id,
+    );
+    const neverLoadedFinalStage = new Promise<CursorPage<ApiDeal>>(() => undefined);
+    const baseGet = apiMocks.get.getMockImplementation()!;
+    apiMocks.get.mockImplementation((path: string) => {
+      if (path === "/deals/deal-deep-link") return Promise.resolve(deepLinkedDeal);
+      if (path === "/deals/deal-deep-link/messages?limit=100") return Promise.resolve({ items: [], next_cursor: null });
+      if (path.includes("stage_id=stage-service-won")) return neverLoadedFinalStage;
+      return baseGet(path);
+    });
+    render(<CrmProvider><StoreProbe /></CrmProvider>);
+    await waitFor(() => expect(screen.getByLabelText("Статус")).toHaveTextContent("ready"));
+
+    fireEvent.click(screen.getByRole("button", { name: "Открыть сделку по ссылке" }));
+
+    await waitFor(() => expect(apiMocks.get).toHaveBeenCalledWith("/deals/deal-deep-link"));
+    await waitFor(() => expect(screen.getByLabelText("Активная воронка")).toHaveTextContent(secondaryPipeline.id));
+    expect(screen.getByLabelText("Открытая сделка")).toHaveTextContent("Сделка из уведомления");
+    expect(screen.getByLabelText("Сделки")).toHaveTextContent("Сделка из уведомления");
+  });
+
+  it("не применяет поздний ответ deep-link после удаления deal из URL", async () => {
+    let resolveDeepLink!: (value: ApiDeal) => void;
+    const deepLinkResponse = new Promise<ApiDeal>((resolve) => { resolveDeepLink = resolve; });
+    const deepLinkedDeal = deal(
+      "deal-deep-link",
+      "stage-service-won",
+      "Сделка из отменённой ссылки",
+      secondaryPipeline.id,
+    );
+    const baseGet = apiMocks.get.getMockImplementation()!;
+    apiMocks.get.mockImplementation((path: string) => path === "/deals/deal-deep-link"
+      ? deepLinkResponse
+      : baseGet(path));
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <MemoryRouter initialEntries={["/deals?deal=deal-deep-link"]}>
+        <QueryClientProvider client={queryClient}>
+          <CrmProvider>
+            <DealsPage />
+            <StoreProbe />
+            <ClearDealRouteButton />
+          </CrmProvider>
+        </QueryClientProvider>
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(screen.getByLabelText("Статус")).toHaveTextContent("ready"));
+    await waitFor(() => expect(apiMocks.get.mock.calls
+      .some(([path]) => path === "/deals/deal-deep-link")).toBe(true));
+    const detailCall = apiMocks.get.mock.calls.find(([path]) => path === "/deals/deal-deep-link");
+    const signal = (detailCall?.[1] as RequestInit | undefined)?.signal;
+    expect(signal).toBeInstanceOf(AbortSignal);
+
+    fireEvent.click(screen.getByRole("button", { name: "Убрать сделку из адреса" }));
+    expect(signal?.aborted).toBe(true);
+    await act(async () => resolveDeepLink(deepLinkedDeal));
+
+    expect(screen.getByLabelText("Активная воронка")).toHaveTextContent(pipeline.id);
+    expect(screen.getByLabelText("Открытая сделка")).toHaveTextContent("нет");
+    expect(screen.getByLabelText("Сделки")).toHaveTextContent("Активная сделка");
+    expect(screen.queryByRole("dialog", { name: "Сделка из отменённой ссылки" })).not.toBeInTheDocument();
+  });
+
+  it("не теряет обычную выбранную сделку из-за позднего неполного ответа списка", async () => {
+    let resolveStaleList!: (page: CursorPage<ApiDeal>) => void;
+    const staleList = new Promise<CursorPage<ApiDeal>>((resolve) => { resolveStaleList = resolve; });
+    let returnStaleList = false;
+    const baseGet = apiMocks.get.getMockImplementation()!;
+    apiMocks.get.mockImplementation((path: string) => {
+      if (returnStaleList && path.includes("stage_id=stage-open")) return staleList;
+      return baseGet(path);
+    });
+    render(<CrmProvider><StoreProbe /></CrmProvider>);
+    await waitFor(() => expect(screen.getByLabelText("Статус")).toHaveTextContent("ready"));
+    fireEvent.click(screen.getByRole("button", { name: "Открыть первую сделку" }));
+    expect(screen.getByLabelText("Открытая сделка")).toHaveTextContent("Активная сделка");
+
+    returnStaleList = true;
+    act(() => window.dispatchEvent(new Event("pulse:refresh")));
+    await waitFor(() => expect(apiMocks.get.mock.calls
+      .filter(([path]) => String(path).includes("stage_id=stage-open"))).toHaveLength(2));
+    await act(async () => resolveStaleList({ items: [], next_cursor: null }));
+
+    await waitFor(() => expect(screen.getByLabelText("Статус")).toHaveTextContent("ready"));
+    expect(screen.getByLabelText("Сделки")).toHaveTextContent("Активная сделка");
+    expect(screen.getByLabelText("Открытая сделка")).toHaveTextContent("Активная сделка");
   });
 
   it("игнорирует поздний ответ финального этапа от предыдущего поиска", async () => {

@@ -1,7 +1,7 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import userEvent from "@testing-library/user-event";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, useLocation, useNavigate } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { DndContext } from "@dnd-kit/core";
 import type { ComponentProps } from "react";
@@ -18,13 +18,23 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-function renderPage() {
+function LocationProbe() {
+  const location = useLocation();
+  const navigate = useNavigate();
+  return <>
+    <output aria-label="Текущий адрес">{`${location.pathname}${location.search}`}</output>
+    <button type="button" onClick={() => navigate(-1)}>Назад в истории</button>
+  </>;
+}
+
+function renderPage(initialEntry = "/deals") {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={queryClient}>
-      <MemoryRouter>
+      <MemoryRouter initialEntries={[initialEntry]}>
         <CrmProvider>
           <DealsPage />
+          <LocationProbe />
         </CrmProvider>
       </MemoryRouter>
     </QueryClientProvider>,
@@ -61,6 +71,48 @@ function renderDrawer(overrides: Partial<ComponentProps<typeof DealDrawer>> = {}
 }
 
 describe("DealsPage", () => {
+  it("opens a deal from a deep-link URL and clears the route when the drawer closes", async () => {
+    const user = userEvent.setup();
+    const deal = initialDeals.find((item) => item.id === "deal-sloy")!;
+    renderPage(`/deals?deal=${deal.id}&view=compact`);
+
+    const dialog = await screen.findByRole("dialog", { name: deal.title });
+    expect(screen.getByRole("status", { name: "Текущий адрес" })).toHaveTextContent(`/deals?deal=${deal.id}&view=compact`);
+
+    await user.click(within(dialog).getByRole("button", { name: "Закрыть карточку" }));
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: deal.title })).not.toBeInTheDocument());
+    expect(screen.getByRole("status", { name: "Текущий адрес" })).toHaveTextContent("/deals?view=compact");
+  });
+
+  it("closes the selected deal when browser history removes its query parameter", async () => {
+    const user = userEvent.setup();
+    renderPage();
+
+    await user.click(screen.getByText("Кофейня «Слой»"));
+    expect(await screen.findByRole("dialog", { name: "Кофейня «Слой»" })).toBeInTheDocument();
+    expect(screen.getByRole("status", { name: "Текущий адрес" })).toHaveTextContent("deal=deal-sloy");
+
+    await user.click(screen.getByRole("button", { name: "Назад в истории" }));
+
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Кофейня «Слой»" })).not.toBeInTheDocument());
+    expect(screen.getByRole("status", { name: "Текущий адрес" })).toHaveTextContent(/^\/deals$/);
+  });
+
+  it("adds the created deal to the URL before opening its drawer", async () => {
+    const user = userEvent.setup();
+    renderPage();
+
+    await user.click(screen.getAllByRole("button", { name: "Новая сделка" })[0]);
+    const createDialog = await screen.findByRole("dialog", { name: "Новая сделка" });
+    await user.type(within(createDialog).getByRole("textbox", { name: "Название" }), "Тестовая сделка");
+    await user.type(within(createDialog).getByRole("textbox", { name: "Потребность" }), "Тестовая потребность");
+    await user.type(within(createDialog).getByRole("spinbutton", { name: "Сумма, ₽" }), "1000");
+    await user.click(within(createDialog).getByRole("button", { name: "Создать сделку" }));
+
+    expect(await screen.findByRole("dialog", { name: "Тестовая сделка" })).toBeInTheDocument();
+    expect(screen.getByRole("status", { name: "Текущий адрес" })).toHaveTextContent(/\/deals\?deal=deal-/);
+  });
+
   it("exposes the kanban as a horizontally scrollable region with accessible stages", async () => {
     const user = userEvent.setup();
     renderPage();

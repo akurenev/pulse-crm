@@ -9,7 +9,7 @@ test("creates a contact and switches to companies", async ({ page }) => {
   await expect(importedDialog.getByText("Повторная покупка, VIP", { exact: true })).toBeVisible();
   await importedDialog.getByRole("button", { name: "Закрыть" }).click();
 
-  await page.getByRole("button", { name: "Новый контакт" }).click();
+  await page.getByRole("button", { name: /^(Новый контакт|Добавить контакт)$/ }).click();
   const dialog = page.getByRole("dialog", { name: "Новый контакт" });
   await dialog.getByLabel("Имя").fill("Мария");
   await dialog.getByLabel("Фамилия").fill("Орлова");
@@ -24,21 +24,33 @@ test("creates a contact and switches to companies", async ({ page }) => {
 
 test("creates and completes a task", async ({ page }) => {
   await page.goto("/tasks");
-  await page.getByRole("button", { name: "Новая задача" }).click();
+  await page.getByRole("button", { name: /^(Новая задача|Добавить задачу)$/ }).click();
   const dialog = page.getByRole("dialog", { name: "Новая задача" });
   await dialog.getByLabel("Название").fill("Проверить договор");
   await dialog.getByLabel("Срок").fill("2030-09-01T12:30");
   await dialog.getByRole("button", { name: "Создать задачу" }).click();
-  const task = page.getByRole("button", { name: /Проверить договор/ });
+  const taskTitle = "Проверить договор";
+  const task = page.locator(".task-table-row").filter({
+    has: page.getByText(taskTitle, { exact: true }),
+  });
   await expect(task).toBeVisible();
-  await task.click();
+  await task.getByRole("button", {
+    name: `Завершить задачу «${taskTitle}»`,
+    exact: true,
+  }).click();
+  await expect(task).toHaveCount(0);
+  await page.getByRole("button", { name: "Показать закрытые", exact: true }).click();
   await expect(task).toHaveClass(/task-table-row--done/);
+  await expect(task.getByRole("button", {
+    name: `Возобновить задачу «${taskTitle}»`,
+    exact: true,
+  })).toBeVisible();
 });
 
 test("creates a disabled client notification rule with recorded consent", async ({ page }) => {
   await page.goto("/settings");
   await page.getByRole("tab", { name: /Оповещения/ }).click();
-  await page.getByRole("button", { name: "Новое правило" }).click();
+  await page.getByRole("button", { name: /^(Новое правило|Добавить правило оповещения)$/ }).click();
   const editor = page.locator(".settings-editor");
   await editor.getByLabel("Название правила").fill("Повторная покупка — Анне");
   await editor.getByLabel("Получатель").selectOption("client");

@@ -16,7 +16,8 @@ export function NewDealDialog({ open, onOpenChange, onSubmit }: NewDealDialogPro
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    const form = new FormData(event.currentTarget);
+    const formElement = event.currentTarget;
+    const form = new FormData(formElement);
     setSaving(true);
     try {
       await onSubmit({
@@ -26,7 +27,7 @@ export function NewDealDialog({ open, onOpenChange, onSubmit }: NewDealDialogPro
         source: String(form.get("source") ?? "manual") as SourceCode,
       });
       onOpenChange(false);
-      event.currentTarget.reset();
+      formElement.reset();
     } finally {
       setSaving(false);
     }

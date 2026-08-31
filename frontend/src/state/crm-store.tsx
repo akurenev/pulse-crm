@@ -36,6 +36,7 @@ interface CrmStore {
   selectedDealMutationPending: boolean;
   dealAssignees: UserSummary[];
   selectDeal: (dealId: string | null) => void;
+  openDeal: (dealId: string, signal?: AbortSignal) => Promise<void>;
   selectPipeline: (pipelineId: string) => Promise<void>;
   moveDeal: (dealId: string, stageId: string) => Promise<void>;
   setNextPurchase: (dealId: string, date: string | null) => Promise<void>;
@@ -205,6 +206,8 @@ export function CrmProvider({ children }: PropsWithChildren) {
   const requestedFinalStageIds = useRef(new Set<string>());
   const tasksByDealRef = useRef(new Map<string, ApiTask[]>());
   const dealMutationLocksRef = useRef(new Set<string>());
+  const selectedDealIdRef = useRef<string | null>(null);
+  const openDealGeneration = useRef(0);
 
   const runDealMutation = useCallback(async (dealId: string, mutation: () => Promise<void>) => {
     if (dealMutationLocksRef.current.has(dealId)) throw new DealMutationInProgressError();
@@ -301,7 +304,18 @@ export function CrmProvider({ children }: PropsWithChildren) {
       ));
       setLoadedStageIds(Object.fromEntries(stagesToLoad.map((stage) => [stage.id, true])));
       setStageLoadErrorByStage({});
-      setDeals(mappedDeals);
+      setDeals((current) => {
+        const selected = current.find((deal) => deal.id === selectedDealIdRef.current);
+        if (!selected) return mappedDeals;
+        if (mappedDeals.some((deal) => deal.id === selected.id)) {
+          return mappedDeals.map((deal) => deal.id === selected.id
+            ? { ...deal, messages: selected.messages, tasks: selected.tasks }
+            : deal);
+        }
+        return pipeline.stages.some((stage) => stage.id === selected.stageId)
+          ? [...mappedDeals, selected]
+          : mappedDeals;
+      });
       setError(null);
     }).catch((reason: unknown) => {
       if (!active || generation !== dealRequestGeneration.current) return;
@@ -353,7 +367,12 @@ export function CrmProvider({ children }: PropsWithChildren) {
   const removeDealLocally = useCallback((dealId: string) => {
     tasksByDealRef.current.delete(dealId);
     setDeals((items) => items.filter((deal) => deal.id !== dealId));
-    setSelectedDealId((selected) => selected === dealId ? null : selected);
+    setSelectedDealId((selected) => {
+      if (selected !== dealId) return selected;
+      selectedDealIdRef.current = null;
+      openDealGeneration.current += 1;
+      return null;
+    });
   }, []);
 
   const mergeRemoteDeal = useCallback((persisted: ApiDeal) => {
@@ -434,6 +453,8 @@ export function CrmProvider({ children }: PropsWithChildren) {
   }, [selectedDealId]);
 
   const selectDeal = useCallback((dealId: string | null) => {
+    openDealGeneration.current += 1;
+    selectedDealIdRef.current = dealId;
     setSelectedDealId(dealId);
   }, []);
 
@@ -460,11 +481,62 @@ export function CrmProvider({ children }: PropsWithChildren) {
     setLoadedStageIds({});
     setStageLoadErrorByStage({});
     setLoadingStageId(null);
+    selectedDealIdRef.current = null;
+    openDealGeneration.current += 1;
     setSelectedDealId(null);
     if (remoteEnabled) {
       setLoading(true);
     }
   }, [pipelines]);
+
+  const openDeal = useCallback(async (dealId: string, signal?: AbortSignal) => {
+    if (signal?.aborted) return;
+    const generation = ++openDealGeneration.current;
+    const existing = deals.find((deal) => deal.id === dealId);
+    if (existing) {
+      selectedDealIdRef.current = dealId;
+      setSelectedDealId(dealId);
+      return;
+    }
+    if (!remoteEnabled) throw new ApiError("Сделка не найдена", 404);
+
+    const path = `/deals/${encodeURIComponent(dealId)}`;
+    const persisted = signal
+      ? await api.get<ApiDeal>(path, { signal })
+      : await api.get<ApiDeal>(path);
+    if (signal?.aborted || generation !== openDealGeneration.current) return;
+    const targetPipeline = pipelines.find((item) => item.id === persisted.pipeline_id);
+    if (!targetPipeline) throw new Error("Воронка сделки недоступна");
+    const targetStage = targetPipeline.stages.find((stage) => stage.id === persisted.stage_id);
+    if (!targetStage) throw new Error("Этап сделки недоступен");
+    const mapped = mapRemoteDeal(
+      persisted,
+      targetPipeline.stages,
+      users,
+      sources,
+      tasksByDealRef.current.get(persisted.id) ?? [],
+    );
+
+    if (targetPipeline.id !== activePipelineId.current) {
+      dealRequestGeneration.current += 1;
+      activePipelineId.current = targetPipeline.id;
+      requestedFinalStageIds.current.clear();
+      setPipeline(targetPipeline);
+      setDeals([mapped]);
+      setNextCursorByStage({});
+      setLoadedStageIds({});
+      setStageLoadErrorByStage({});
+      setLoadingStageId(null);
+      setLoading(true);
+    } else {
+      setDeals((current) => current.some((deal) => deal.id === mapped.id)
+        ? current.map((deal) => deal.id === mapped.id ? { ...mapped, messages: deal.messages, tasks: deal.tasks } : deal)
+        : [...current, mapped]);
+    }
+    if (targetStage.stageType !== "open") requestedFinalStageIds.current.add(targetStage.id);
+    selectedDealIdRef.current = dealId;
+    setSelectedDealId(dealId);
+  }, [deals, pipelines, sources, users]);
 
   const loadStageDeals = useCallback(async (stageId: string) => {
     if (loadedStageIds[stageId] || loadingStageId) return;
@@ -702,6 +774,8 @@ export function CrmProvider({ children }: PropsWithChildren) {
     };
 
     setDeals((items) => [optimistic, ...items]);
+    openDealGeneration.current += 1;
+    selectedDealIdRef.current = optimistic.id;
     setSelectedDealId(optimistic.id);
 
     if (!remoteEnabled) return optimistic;
@@ -722,10 +796,12 @@ export function CrmProvider({ children }: PropsWithChildren) {
       });
       const persisted = { ...optimistic, id: created.id, tags: created.tags, version: created.version };
       setDeals((items) => items.map((deal) => (deal.id === optimistic.id ? persisted : deal)));
+      selectedDealIdRef.current = persisted.id;
       setSelectedDealId(persisted.id);
       return persisted;
     } catch (error) {
       setDeals((items) => items.filter((deal) => deal.id !== optimistic.id));
+      selectedDealIdRef.current = null;
       setSelectedDealId(null);
       throw error;
     }
@@ -888,6 +964,7 @@ export function CrmProvider({ children }: PropsWithChildren) {
       selectedDealMutationPending,
       dealAssignees,
       selectDeal,
+      openDeal,
       selectPipeline,
       moveDeal,
       setNextPurchase,
@@ -909,7 +986,7 @@ export function CrmProvider({ children }: PropsWithChildren) {
       retryMessage,
       toggleTask,
     }),
-    [addDeal, dealAssignees, deals, deleteDeal, error, loadMoreDeals, loadStageDeals, loadedStageIds, loading, loadingStageId, moveDeal, nextCursorByStage, pipeline, pipelines, retryMessage, selectDeal, selectPipeline, selectedDeal, selectedDealId, selectedDealMutationPending, sendMessage, setDealAssignee, setDealCompany, setDealContact, setDealCustomFields, setDealSearch, setDealTags, setNextPurchase, stageLoadErrorByStage, toggleTask],
+    [addDeal, dealAssignees, deals, deleteDeal, error, loadMoreDeals, loadStageDeals, loadedStageIds, loading, loadingStageId, moveDeal, nextCursorByStage, openDeal, pipeline, pipelines, retryMessage, selectDeal, selectPipeline, selectedDeal, selectedDealId, selectedDealMutationPending, sendMessage, setDealAssignee, setDealCompany, setDealContact, setDealCustomFields, setDealSearch, setDealTags, setNextPurchase, stageLoadErrorByStage, toggleTask],
   );
 
   return <CrmContext.Provider value={value}>{children}</CrmContext.Provider>;

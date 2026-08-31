@@ -85,6 +85,12 @@ async def test_contact_company_and_task_crud(
         json={"title": "Call customer", "due_at": due_at, "assignee_id": owner_id},
     )
     assert task.status_code == 201, task.text
+    loaded_task = await client.get(f"/api/v1/tasks/{task.json()['id']}")
+    assert loaded_task.status_code == 200, loaded_task.text
+    assert loaded_task.json()["id"] == task.json()["id"]
+    assert loaded_task.json()["title"] == "Call customer"
+    assert loaded_task.json()["assignee_id"] == owner_id
+    assert loaded_task.json()["version"] == task.json()["version"]
     completed = await client.patch(
         f"/api/v1/tasks/{task.json()['id']}",
         headers=headers,
@@ -330,6 +336,8 @@ async def test_task_update_relations_and_delete_are_versioned(
         params={"expected_version": updated_task["version"]},
     )
     assert deleted.status_code == 204, deleted.text
+    missing = await client.get(f"/api/v1/tasks/{task['id']}")
+    assert missing.status_code == 404
     tasks = await client.get(
         "/api/v1/tasks", params={"search": "Updated task", "include_completed": True}
     )
@@ -394,6 +402,9 @@ async def test_contact_and_task_mutations_are_workspace_scoped(
         await db.commit()
         other_contact_id = other_contact.id
         other_task_id = other_task.id
+
+    foreign_read = await client.get(f"/api/v1/tasks/{other_task_id}")
+    assert foreign_read.status_code == 404
 
     for method, path, kwargs in (
         (

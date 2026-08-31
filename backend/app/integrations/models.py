@@ -534,6 +534,12 @@ class NotificationDelivery(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "notification_deliveries"
     __table_args__ = (
         sa.UniqueConstraint("workspace_id", "dedupe_key", name="uq_notification_delivery_dedupe"),
+        sa.CheckConstraint(
+            "(target_entity_type IS NULL AND target_entity_id IS NULL) OR "
+            "(target_entity_type IS NOT NULL AND "
+            "target_entity_type IN ('deal', 'task') AND target_entity_id IS NOT NULL)",
+            name="notification_delivery_target_pair",
+        ),
         sa.Index(
             "ix_notification_deliveries_workspace_status_scheduled",
             "workspace_id",
@@ -561,6 +567,8 @@ class NotificationDelivery(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     recipient_address: Mapped[str] = mapped_column(sa.String(512), nullable=False)
     subject: Mapped[str | None] = mapped_column(sa.String(998))
     body: Mapped[str] = mapped_column(sa.Text, nullable=False)
+    target_entity_type: Mapped[str | None] = mapped_column(sa.String(16))
+    target_entity_id: Mapped[uuid.UUID | None] = mapped_column(UUID_TYPE)
     status: Mapped[DeliveryStatus] = mapped_column(
         sa.Enum(DeliveryStatus, native_enum=False),
         default=DeliveryStatus.pending,

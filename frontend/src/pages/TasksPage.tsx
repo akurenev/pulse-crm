@@ -1,12 +1,14 @@
 import * as Dialog from "@radix-ui/react-dialog";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Check, ChevronLeft, ChevronRight, Circle, Pencil, Plus, Search, Trash2, X } from "lucide-react";
-import { useDeferredValue, useMemo, useState, type FormEvent } from "react";
+import { useDeferredValue, useEffect, useMemo, useState, type FormEvent } from "react";
+import { useSearchParams } from "react-router-dom";
 
 import { Avatar } from "../components/Avatar";
 import { Button } from "../components/Button";
 import { tasks as seedTasks, users as demoUsers } from "../data/demo";
 import { api, remoteEnabled } from "../lib/api";
+import { deepLinkEntityId } from "../lib/deep-links";
 import { useCrm } from "../state/crm-store";
 import type { ApiTask, ApiUser, CursorPage } from "../types/api";
 import type { TaskItem } from "../types/crm";
@@ -79,6 +81,8 @@ export default function TasksPage() {
   const [createError, setCreateError] = useState("");
   const [editError, setEditError] = useState("");
   const [deleteError, setDeleteError] = useState("");
+  const [searchParams, setSearchParams] = useSearchParams();
+  const routedTaskId = deepLinkEntityId(searchParams, "task");
   const queryClient = useQueryClient();
   const taskCursor = taskCursors.at(-1) ?? null;
   const deferredSearch = useDeferredValue(search.trim().toLocaleLowerCase("ru"));
@@ -92,12 +96,25 @@ export default function TasksPage() {
     queryFn: () => api.get<ApiUser[]>("/users"),
     enabled: remoteEnabled,
   });
+  const pagedRoutedApiTask = routedTaskId
+    ? taskQuery.data?.items.find((task) => task.id === routedTaskId) ?? null
+    : null;
+  const taskDetailQuery = useQuery({
+    queryKey: ["tasks", "detail", routedTaskId],
+    queryFn: () => api.get<ApiTask>(`/tasks/${encodeURIComponent(routedTaskId!)}`),
+    enabled: remoteEnabled && Boolean(routedTaskId) && taskQuery.isSuccess && !pagedRoutedApiTask,
+  });
+  const routedApiTask = pagedRoutedApiTask ?? taskDetailQuery.data ?? null;
   const remoteTaskItems = useMemo<TaskItem[]>(() => {
     const usersById = new Map((userQuery.data ?? []).map((user) => [user.id, user]));
     const now = new Date();
     const tomorrow = new Date(now);
     tomorrow.setHours(24, 0, 0, 0);
-    return (taskQuery.data?.items ?? []).map((task) => {
+    const apiTasks = taskQuery.data?.items ?? [];
+    const visibleApiTasks = routedApiTask && !apiTasks.some((task) => task.id === routedApiTask.id)
+      ? [...apiTasks, routedApiTask]
+      : apiTasks;
+    return visibleApiTasks.map((task) => {
       const user = usersById.get(task.assignee_id);
       const dueDate = new Date(task.due_at);
       const name = user?.full_name ?? "Не назначен";
@@ -115,7 +132,7 @@ export default function TasksPage() {
         },
       };
     });
-  }, [taskQuery.data, userQuery.data]);
+  }, [routedApiTask, taskQuery.data, userQuery.data]);
   const sourceTasks = remoteEnabled ? remoteTaskItems : tasks;
   const editingTask = editingTaskSnapshot;
   const deletingTask = deletingTaskSnapshot;
@@ -132,6 +149,24 @@ export default function TasksPage() {
       return matchesCompletion && matchesFilter && matchesSearch;
     });
   }, [filter, search, showCompleted, sourceTasks]);
+
+  useEffect(() => {
+    if (!routedTaskId) {
+      if (editingTaskId) {
+        setEditingTaskId(null);
+        setEditingTaskSnapshot(null);
+        setEditingApiTask(null);
+      }
+      return;
+    }
+    if (editingTaskId === routedTaskId) return;
+    const taskItem = sourceTasks.find((task) => task.id === routedTaskId);
+    if (!taskItem || (remoteEnabled && (!routedApiTask || userQuery.isLoading))) return;
+    setEditError("");
+    setEditingTaskId(routedTaskId);
+    setEditingTaskSnapshot(taskItem);
+    setEditingApiTask(remoteEnabled ? routedApiTask : null);
+  }, [editingTaskId, routedApiTask, routedTaskId, sourceTasks, userQuery.isLoading]);
 
   const currentPage = taskCursors.length;
   const nextCursor = taskQuery.data?.next_cursor;
@@ -167,6 +202,9 @@ export default function TasksPage() {
   }
 
   function openTaskEditor(taskId: string) {
+    const next = new URLSearchParams(searchParams);
+    next.set("task", taskId);
+    setSearchParams(next);
     setEditError("");
     setEditingTaskId(taskId);
     setEditingTaskSnapshot(sourceTasks.find((task) => task.id === taskId) ?? null);
@@ -185,6 +223,9 @@ export default function TasksPage() {
   }
 
   function closeTaskEditor() {
+    const next = new URLSearchParams(searchParams);
+    next.delete("task");
+    setSearchParams(next, { replace: true });
     setEditingTaskId(null);
     setEditingTaskSnapshot(null);
     setEditingApiTask(null);
@@ -336,6 +377,7 @@ export default function TasksPage() {
       </div>
       {taskQuery.isLoading || userQuery.isLoading ? <div className="route-loading" role="status">Загружаем задачи…</div> : null}
       {taskQuery.isError || userQuery.isError ? <div className="load-error" role="alert">Не удалось загрузить задачи</div> : null}
+      {routedTaskId && taskDetailQuery.isError ? <div className="load-error" role="alert">Задача не найдена или недоступна</div> : null}
       {!taskQuery.isLoading && !userQuery.isLoading && !taskQuery.isError && !userQuery.isError ? <section className="task-board">
         <header><span>Статус</span><span>Задача</span><span>Срок</span><span>Исполнитель</span><span>Действия</span></header>
         {visible.map((task) => (

@@ -131,6 +131,7 @@ export function DealDrawer({ deal, pipeline, assignees, mutationPending, onClose
     try {
       await onDelete(deal.id);
       setDeleteConfirmOpen(false);
+      onClose();
     } catch (reason) {
       setDeleteError(dealMutationErrorMessage(reason, "Не удалось удалить сделку. Повторите попытку."));
     } finally {

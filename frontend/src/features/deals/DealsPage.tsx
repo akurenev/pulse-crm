@@ -10,12 +10,14 @@ import {
 import { sortableKeyboardCoordinates } from "@dnd-kit/sortable";
 import { Columns3, Filter, List, Plus, Search } from "lucide-react";
 import { useDeferredValue, useEffect, useId, useMemo, useState } from "react";
+import { useSearchParams } from "react-router-dom";
 
 import { Avatar } from "../../components/Avatar";
 import { Button } from "../../components/Button";
 import { SourceBadge } from "../../components/SourceBadge";
 import { formatMoney, formatShortDate } from "../../lib/format";
 import { ApiError } from "../../lib/api";
+import { deepLinkEntityId } from "../../lib/deep-links";
 import { DealMutationInProgressError, useCrm, useDeferredSelection } from "../../state/crm-store";
 import { DealDrawer } from "./DealDrawer";
 import { NewDealDialog } from "./NewDealDialog";
@@ -32,6 +34,7 @@ export function DealsPage() {
     selectedDeal,
     selectedDealMutationPending,
     dealAssignees,
+    openDeal,
     selectPipeline,
     moveDeal,
     setNextPurchase,
@@ -61,6 +64,8 @@ export function DealsPage() {
   const deferredSearch = useDeferredValue(search.trim().toLocaleLowerCase("ru"));
   const [createOpen, setCreateOpen] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
+  const [searchParams, setSearchParams] = useSearchParams();
+  const routedDealId = deepLinkEntityId(searchParams, "deal");
   const kanbanScrollHintId = useId();
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 8 } }),
@@ -70,6 +75,52 @@ export function DealsPage() {
   useEffect(() => {
     setDealSearch(deferredSearch);
   }, [deferredSearch, setDealSearch]);
+
+  useEffect(() => {
+    if (!routedDealId) {
+      if (selectedDealId) selectDeal(null);
+      return;
+    }
+    if (loading || (selectedDealId === routedDealId && selectedDeal)) return;
+    let active = true;
+    const controller = new AbortController();
+    void openDeal(routedDealId, controller.signal).catch((reason: unknown) => {
+      if (!active || controller.signal.aborted) return;
+      setNotice(reason instanceof ApiError && reason.status === 404
+        ? "Сделка не найдена или уже удалена."
+        : "Не удалось открыть сделку из уведомления.");
+      const next = new URLSearchParams(searchParams);
+      next.delete("deal");
+      setSearchParams(next, { replace: true });
+      selectDeal(null);
+    });
+    return () => {
+      active = false;
+      controller.abort();
+    };
+  }, [loading, openDeal, routedDealId, searchParams, selectDeal, selectedDeal, selectedDealId, setSearchParams]);
+
+  function handleSelectDeal(dealId: string) {
+    const next = new URLSearchParams(searchParams);
+    next.set("deal", dealId);
+    setSearchParams(next);
+    selectDeal(dealId);
+  }
+
+  function handleCloseDeal() {
+    const next = new URLSearchParams(searchParams);
+    next.delete("deal");
+    setSearchParams(next, { replace: true });
+    selectDeal(null);
+  }
+
+  async function handleSelectPipeline(pipelineId: string) {
+    const next = new URLSearchParams(searchParams);
+    next.delete("deal");
+    setSearchParams(next, { replace: true });
+    selectDeal(null);
+    await selectPipeline(pipelineId);
+  }
 
   const visibleDeals = useMemo(() => {
     return deals.filter((deal) => {
@@ -134,7 +185,7 @@ export function DealsPage() {
       <div className="deals-filters">
         <label className="select-control">
           <span className="sr-only">Воронка</span>
-          <select value={pipeline.id} onChange={(event) => void selectPipeline(event.target.value)}>{pipelines.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select>
+          <select value={pipeline.id} onChange={(event) => void handleSelectPipeline(event.target.value)}>{pipelines.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select>
         </label>
         <label className="search-control">
           <Search size={18} aria-hidden="true" />
@@ -174,7 +225,7 @@ export function DealsPage() {
               stage={stage}
               deals={visibleDeals.filter((deal) => deal.stageId === stage.id)}
               selectedDealId={selectedDealId}
-              onSelect={selectDeal}
+              onSelect={handleSelectDeal}
               onAdd={() => setCreateOpen(true)}
               deferred={!loadedStageIds[stage.id] && (stage.stageType === "won" || stage.stageType === "lost")}
               loadError={stageLoadErrorByStage[stage.id]}
@@ -196,7 +247,7 @@ export function DealsPage() {
             type="button"
             key={deal.id}
             aria-label={`Открыть сделку ${deal.title}. Этап ${pipeline.stages.find((stage) => stage.id === deal.stageId)?.name ?? "Без этапа"}. Сумма ${formatMoney(deal.amount)}. Источник ${deal.sourceLabel}. Срок ${formatShortDate(deal.dueDate)}. Ответственный ${deal.assignee.name}`}
-            onClick={() => selectDeal(deal.id)}
+            onClick={() => handleSelectDeal(deal.id)}
           >
             <span className="data-row__primary deals-list__deal" data-label="Сделка">
               <span className="company-avatar" aria-hidden="true">{deal.title.slice(0, 1)}</span>
@@ -225,14 +276,17 @@ export function DealsPage() {
       <NewDealDialog
         open={createOpen}
         onOpenChange={setCreateOpen}
-        onSubmit={async (input) => { await addDeal(input); }}
+        onSubmit={async (input) => {
+          const created = await addDeal(input);
+          handleSelectDeal(created.id);
+        }}
       />
       <DealDrawer
         deal={selectedDeal}
         pipeline={pipeline}
         assignees={dealAssignees}
         mutationPending={selectedDealMutationPending}
-        onClose={() => selectDeal(null)}
+        onClose={handleCloseDeal}
         onMove={moveDeal}
         onSetNextPurchase={setNextPurchase}
         onSetContact={setDealContact}

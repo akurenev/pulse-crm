@@ -2283,6 +2283,23 @@ async def list_tasks(
     )
 
 
+@router.get("/tasks/{task_id}", response_model=TaskRead)
+async def get_task(
+    task_id: uuid.UUID,
+    context: CurrentUser,
+    db: AsyncSession = Depends(get_session),
+) -> Task:
+    task = await db.scalar(
+        sa.select(Task).where(
+            Task.id == task_id,
+            Task.workspace_id == context.workspace_id,
+        )
+    )
+    if task is None:
+        raise not_found("task")
+    return task
+
+
 @router.post("/tasks", response_model=TaskRead, status_code=status.HTTP_201_CREATED)
 async def create_task(
     payload: TaskCreate,

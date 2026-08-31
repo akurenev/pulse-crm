@@ -2,6 +2,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { PropsWithChildren } from "react";
+import { MemoryRouter, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { ApiTask, ApiUser, CursorPage } from "../types/api";
@@ -56,12 +57,20 @@ function task(
   };
 }
 
-function renderPage() {
+function LocationProbe() {
+  const location = useLocation();
+  return <output aria-label="Текущий адрес">{`${location.pathname}${location.search}`}</output>;
+}
+
+function renderPage(initialEntry = "/tasks") {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const rendered = render(
-    <QueryClientProvider client={queryClient}>
-      <TasksPage />
-    </QueryClientProvider>,
+    <MemoryRouter initialEntries={[initialEntry]}>
+      <QueryClientProvider client={queryClient}>
+        <TasksPage />
+        <LocationProbe />
+      </QueryClientProvider>
+    </MemoryRouter>,
   );
   return { ...rendered, queryClient };
 }
@@ -121,6 +130,29 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("TasksPage", () => {
+  it("loads and opens a task outside the current page from a deep-link URL", async () => {
+    const user = userEvent.setup();
+    const deepLinkedTask = task("task-deep-link", "Задача из уведомления", "open", "deal-1");
+    getMock.mockImplementation((path: string) => {
+      if (path === "/users") return Promise.resolve([assignee]);
+      if (path === "/tasks/task-deep-link") return Promise.resolve(deepLinkedTask);
+      if (path.startsWith("/tasks?")) {
+        return Promise.resolve({ items: [task("task-1", "Отправить предложение", "open", "deal-1")], next_cursor: null });
+      }
+      return Promise.reject(new Error(`Unexpected GET ${path}`));
+    });
+
+    renderPage("/tasks?task=task-deep-link&view=compact");
+
+    const dialog = await screen.findByRole("dialog", { name: "Редактировать задачу" });
+    expect(within(dialog).getByRole("textbox", { name: "Название" })).toHaveValue("Задача из уведомления");
+    expect(getMock).toHaveBeenCalledWith("/tasks/task-deep-link");
+
+    await user.click(within(dialog).getByRole("button", { name: "Закрыть" }));
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Редактировать задачу" })).not.toBeInTheDocument());
+    expect(screen.getByRole("status", { name: "Текущий адрес" })).toHaveTextContent("/tasks?view=compact");
+  });
+
   it("keeps the desktop segments and mobile picker in sync", async () => {
     const user = userEvent.setup();
     renderPage();

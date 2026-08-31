@@ -28,29 +28,87 @@ self.addEventListener("push", (event) => {
   event.waitUntil(self.registration.showNotification(title, options));
 });
 
+const APP_PATHS = new Set(["/", "/deals", "/tasks", "/contacts", "/activity", "/settings"]);
+const ENTITY_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
+
+function applicationRootUrl() {
+  return new URL("/", self.location.origin).href;
+}
+
+function internalNotificationUrl(candidate) {
+  const rawCandidate = typeof candidate === "string" ? candidate : "/";
+  try {
+    const decodedPath = decodeURIComponent(rawCandidate.split(/[?#]/, 1)[0]);
+    if (decodedPath.split("/").some((segment) => segment === "." || segment === "..")) {
+      return applicationRootUrl();
+    }
+  } catch {
+    return applicationRootUrl();
+  }
+  let parsed;
+  try {
+    parsed = new URL(rawCandidate, self.location.origin);
+  } catch {
+    return applicationRootUrl();
+  }
+  if (parsed.origin !== self.location.origin || parsed.username || parsed.password) return applicationRootUrl();
+
+  const dynamicMatch = parsed.pathname.match(/^\/(deals|tasks)\/([^/]+)\/?$/);
+  if (dynamicMatch) {
+    let id;
+    try {
+      id = decodeURIComponent(dynamicMatch[2]);
+    } catch {
+      return applicationRootUrl();
+    }
+    if (!ENTITY_ID_PATTERN.test(id)) return applicationRootUrl();
+    const pathname = dynamicMatch[1] === "deals" ? "/deals" : "/tasks";
+    const key = pathname === "/deals" ? "deal" : "task";
+    return new URL(`${pathname}?${key}=${encodeURIComponent(id)}`, self.location.origin).href;
+  }
+
+  const pathname = parsed.pathname.length > 1 ? parsed.pathname.replace(/\/$/, "") : parsed.pathname;
+  if (!APP_PATHS.has(pathname)) return applicationRootUrl();
+  if (pathname === "/deals" || pathname === "/tasks") {
+    const key = pathname === "/deals" ? "deal" : "task";
+    const id = parsed.searchParams.get(key);
+    if (id && ENTITY_ID_PATTERN.test(id)) {
+      return new URL(`${pathname}?${key}=${encodeURIComponent(id)}`, self.location.origin).href;
+    }
+  }
+  return new URL(pathname, self.location.origin).href;
+}
+
 self.addEventListener("notificationclick", (event) => {
   event.notification.close();
   event.waitUntil((async () => {
-    const candidate = event.notification.data?.url;
-    let targetUrl = self.location.origin;
-    try {
-      const parsed = new URL(typeof candidate === "string" ? candidate : "/", self.location.origin);
-      if (parsed.origin === self.location.origin) targetUrl = parsed.href;
-    } catch {
-      // Invalid or cross-origin targets fall back to the application root.
-    }
+    const targetUrl = internalNotificationUrl(event.notification.data?.url);
 
     const windowClients = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
-    for (const client of windowClients) {
-      if (new URL(client.url).origin !== self.location.origin) continue;
-      if ("navigate" in client) {
-        try {
-          await client.navigate(targetUrl);
-        } catch {
-          // A focused existing window is still preferable if navigation is blocked.
-        }
+    const applicationClients = windowClients.filter((client) => {
+      try {
+        return new URL(client.url).origin === self.location.origin;
+      } catch {
+        return false;
       }
-      return client.focus();
+    });
+    const exactClient = applicationClients.find((client) => client.url === targetUrl);
+    if (exactClient) {
+      try {
+        return await exactClient.focus();
+      } catch {
+        // A stale window must not prevent opening the requested application route.
+      }
+    }
+
+    for (const client of applicationClients) {
+      if (!("navigate" in client)) continue;
+      try {
+        const navigated = await client.navigate(targetUrl);
+        return await (navigated ?? client).focus();
+      } catch {
+        // Try another window, then fall back to opening a new application window.
+      }
     }
     return self.clients.openWindow(targetUrl);
   })());

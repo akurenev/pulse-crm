@@ -119,6 +119,15 @@ JOB_TASK_DUE_EVENT = "monitor.task.due"
 JOB_TASK_OVERDUE_EVENT = "monitor.task.overdue"
 JOB_DEAL_INACTIVE_EVENT = "monitor.deal.inactive"
 
+DIRECT_NOTIFICATION_TARGETS = {
+    "lead.created": "deal",
+    "deal.assigned": "deal",
+    "deal.stage_changed": "deal",
+    "deal.inactive": "deal",
+    "task.due_soon": "task",
+    "task.overdue": "task",
+}
+
 RUNTIME_JOB_TYPES = frozenset(
     {
         JOB_OUTBOX_DISPATCH,
@@ -235,6 +244,43 @@ def _optional_uuid(value: Any) -> uuid.UUID | None:
         return uuid.UUID(str(value))
     except (TypeError, ValueError, AttributeError):
         return None
+
+
+async def _trusted_notification_target(
+    session: AsyncSession,
+    event: OutboxEvent,
+) -> tuple[str | None, uuid.UUID | None]:
+    """Materialize an allowlisted, workspace-owned push navigation target."""
+
+    target_type: str | None = None
+    target_id: uuid.UUID | None = None
+    direct_target_type = DIRECT_NOTIFICATION_TARGETS.get(event.event_type)
+    if direct_target_type is not None and event.aggregate_type == direct_target_type:
+        target_type = direct_target_type
+        target_id = event.aggregate_id
+    elif (
+        event.event_type == "purchase.due_soon"
+        and event.aggregate_type == "purchase_schedule"
+    ):
+        target_type = "task"
+        target_id = _optional_uuid(event.payload.get("task_id"))
+    elif event.event_type == "message.inbound.received" and event.aggregate_type == "message":
+        target_type = "deal"
+        target_id = _optional_uuid(event.payload.get("deal_id"))
+    if target_type is None or target_id is None:
+        return None, None
+
+    model = Deal if target_type == "deal" else Task
+    target_query = sa.select(model.id).where(
+        model.id == target_id,
+        model.workspace_id == event.workspace_id,
+    )
+    if target_type == "deal":
+        target_query = target_query.where(Deal.deleted_at.is_(None))
+    target_exists = await session.scalar(target_query)
+    if target_exists is None:
+        return None, None
+    return target_type, target_id
 
 
 def _optional_int(value: Any) -> int | None:
@@ -741,9 +787,17 @@ class RuntimeHandlers:
                 )
             )
         ).all()
-        for rule, template in rows:
-            if not self._rule_matches(rule, event.payload):
-                continue
+        matching_rows = [
+            (rule, template)
+            for rule, template in rows
+            if self._rule_matches(rule, event.payload)
+        ]
+        if not matching_rows:
+            return
+        target_entity_type, target_entity_id = await _trusted_notification_target(
+            session, event
+        )
+        for rule, template in matching_rows:
             variables = {
                 "event_type": event.event_type,
                 "entity_id": str(event.aggregate_id),
@@ -771,6 +825,8 @@ class RuntimeHandlers:
                         channel=rule.channel,
                         recipient_address=address,
                         recipient_id=_optional_uuid(recipient.get("recipient_id")),
+                        target_entity_type=target_entity_type,
+                        target_entity_id=target_entity_id,
                         contact_id=_optional_uuid(recipient.get("contact_id")),
                         normalized_address=(
                             str(recipient["normalized_address"])

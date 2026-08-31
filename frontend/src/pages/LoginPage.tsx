@@ -1,16 +1,18 @@
 import { ArrowRight, LockKeyhole, Mail } from "lucide-react";
 import { type FormEvent, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { useLocation, useNavigate } from "react-router-dom";
 
 import { BrandMark } from "../components/BrandMark";
 import { Button } from "../components/Button";
 import { ApiError, remoteEnabled } from "../lib/api";
+import { normalizeInternalAppPath } from "../lib/deep-links";
 import { useAuth } from "../state/auth-store";
 
 export default function LoginPage() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const navigate = useNavigate();
+  const location = useLocation();
   const { login } = useAuth();
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
@@ -20,7 +22,10 @@ export default function LoginPage() {
     setError("");
     try {
       await login(String(data.get("email") ?? ""), String(data.get("password") ?? ""));
-      navigate("/deals", { replace: true });
+      const from = location.state && typeof location.state === "object" && "from" in location.state
+        ? normalizeInternalAppPath(location.state.from)
+        : null;
+      navigate(from ?? "/deals", { replace: true });
     } catch (reason) {
       setError(reason instanceof ApiError && reason.status === 401
         ? "Неверный email или пароль"

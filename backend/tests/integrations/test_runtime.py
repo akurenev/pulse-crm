@@ -38,6 +38,8 @@ from app.integrations.models import (
     MessageStatus,
     NotificationAudience,
     NotificationDelivery,
+    NotificationRule,
+    NotificationTemplate,
     PurchaseSchedule,
     PurchaseScheduleStatus,
     WebhookEndpoint,
@@ -66,6 +68,9 @@ from app.models import (
     OutboxEvent,
     RealtimeEvent,
     Source,
+    Task,
+    TaskStatus,
+    Workspace,
 )
 from app.services.jobs import ClaimedJob
 
@@ -349,6 +354,153 @@ async def test_purchase_notification_expansion_skips_cancelled_or_missing_schedu
         )
 
     assert expanded_event_ids == [events[-1].id]
+
+
+@pytest.mark.parametrize(
+    ("event_case", "expected_target_type"),
+    [
+        ("lead", "deal"),
+        ("task", "task"),
+        ("message", "deal"),
+        ("purchase", "task"),
+        ("invalid_message", None),
+        ("foreign_task", None),
+    ],
+)
+@pytest.mark.asyncio
+async def test_static_notification_expansion_materializes_tenant_owned_target(
+    db: AsyncSession,
+    integration_domain: dict[str, Any],
+    event_case: str,
+    expected_target_type: str | None,
+) -> None:
+    workspace = integration_domain["workspace"]
+    user = integration_domain["user"]
+    deal = integration_domain["deal"]
+    task = Task(
+        workspace_id=workspace.id,
+        title="Deep-link task",
+        status=TaskStatus.open,
+        due_at=FIXED_NOW + timedelta(days=2),
+        assignee_id=user.id,
+        deal_id=deal.id,
+    )
+    db.add(task)
+    await db.flush()
+
+    if event_case == "lead":
+        event_type = "lead.created"
+        aggregate_type = "deal"
+        aggregate_id = deal.id
+        payload: dict[str, Any] = {}
+        expected_target_id = deal.id
+    elif event_case == "task":
+        event_type = "task.due_soon"
+        aggregate_type = "task"
+        aggregate_id = task.id
+        payload = {}
+        expected_target_id = task.id
+    elif event_case == "message":
+        event_type = "message.inbound.received"
+        aggregate_type = "message"
+        aggregate_id = uuid.uuid4()
+        payload = {"deal_id": str(deal.id)}
+        expected_target_id = deal.id
+    elif event_case == "purchase":
+        schedule = PurchaseSchedule(
+            workspace_id=workspace.id,
+            deal_id=deal.id,
+            contact_id=integration_domain["contact"].id,
+            assignee_id=user.id,
+            scheduled_for=FIXED_NOW + timedelta(days=2),
+            remind_at=FIXED_NOW,
+            task_id=task.id,
+            status=PurchaseScheduleStatus.active,
+        )
+        db.add(schedule)
+        await db.flush()
+        event_type = "purchase.due_soon"
+        aggregate_type = "purchase_schedule"
+        aggregate_id = schedule.id
+        payload = {"task_id": str(task.id)}
+        expected_target_id = task.id
+    elif event_case == "invalid_message":
+        event_type = "message.inbound.received"
+        aggregate_type = "message"
+        aggregate_id = uuid.uuid4()
+        payload = {"deal_id": "https://attacker.invalid/not-a-uuid"}
+        expected_target_id = None
+    else:
+        other_workspace = Workspace(name="Foreign Target", slug="foreign-target")
+        db.add(other_workspace)
+        await db.flush()
+        foreign_task = Task(
+            workspace_id=other_workspace.id,
+            title="Foreign task",
+            status=TaskStatus.open,
+            due_at=FIXED_NOW + timedelta(days=2),
+            assignee_id=user.id,
+        )
+        db.add(foreign_task)
+        await db.flush()
+        event_type = "task.overdue"
+        aggregate_type = "task"
+        aggregate_id = foreign_task.id
+        payload = {}
+        expected_target_id = None
+
+    template = NotificationTemplate(
+        workspace_id=workspace.id,
+        name=f"Deep link {event_case}",
+        channel="in_app",
+        subject_template="CRM event",
+        body_template="Open {entity_id}",
+        is_active=True,
+    )
+    db.add(template)
+    await db.flush()
+    rule = NotificationRule(
+        workspace_id=workspace.id,
+        template_id=template.id,
+        name=f"Deep link rule {event_case}",
+        event_type=event_type,
+        audience=NotificationAudience.employee,
+        channel="in_app",
+        recipients=[{"address": str(user.id), "recipient_id": str(user.id)}],
+        delay_seconds=30 * 24 * 3600,
+        require_client_consent=False,
+        is_enabled=True,
+    )
+    event = OutboxEvent(
+        workspace_id=workspace.id,
+        event_type=event_type,
+        aggregate_type=aggregate_type,
+        aggregate_id=aggregate_id,
+        payload=payload,
+        available_at=FIXED_NOW,
+    )
+    db.add_all([rule, event])
+    await db.commit()
+
+    handlers = RuntimeHandlers(session_factory=SessionLocal, now=lambda: FIXED_NOW)
+    await handlers.expand_notification(
+        claimed_job(
+            JOB_NOTIFICATION_EXPAND,
+            {"outbox_event_id": str(event.id)},
+            workspace_id=workspace.id,
+        )
+    )
+
+    delivery = await db.scalar(
+        sa.select(NotificationDelivery).where(
+            NotificationDelivery.workspace_id == workspace.id,
+            NotificationDelivery.dedupe_key.like(f"%:event:{event.id}:recipient:%"),
+        )
+    )
+    assert delivery is not None
+    assert delivery.target_entity_type == expected_target_type
+    assert delivery.target_entity_id == expected_target_id
+    assert delivery.scheduled_at == (FIXED_NOW + timedelta(days=30)).replace(tzinfo=None)
 
 
 @pytest.mark.asyncio

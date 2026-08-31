@@ -106,6 +106,8 @@ async def queue_notification(
     variables: Mapping[str, Any],
     scheduled_at: datetime | None = None,
     recipient_id: uuid.UUID | None = None,
+    target_entity_type: str | None = None,
+    target_entity_id: uuid.UUID | None = None,
     contact_id: uuid.UUID | None = None,
     normalized_address: str | None = None,
     consent_purpose: str = "notifications",
@@ -123,6 +125,10 @@ async def queue_notification(
         raise ValueError("invalid notification recipient address")
     if not dedupe_key or len(dedupe_key) > 255:
         raise ValueError("invalid notification dedupe key")
+    if (target_entity_type is None) != (target_entity_id is None) or (
+        target_entity_type is not None and target_entity_type not in {"deal", "task"}
+    ):
+        raise ValueError("invalid notification target")
 
     requires_consent = audience is NotificationAudience.client and (
         rule is None or rule.require_client_consent
@@ -160,6 +166,8 @@ async def queue_notification(
             recipient_address=address,
             subject=subject,
             body=body,
+            target_entity_type=target_entity_type,
+            target_entity_id=target_entity_id,
             status=DeliveryStatus.pending,
             dedupe_key=dedupe_key,
             scheduled_at=due_at,
