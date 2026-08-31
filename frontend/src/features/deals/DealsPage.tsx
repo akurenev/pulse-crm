@@ -16,7 +16,7 @@ import { Button } from "../../components/Button";
 import { SourceBadge } from "../../components/SourceBadge";
 import { formatMoney, formatShortDate } from "../../lib/format";
 import { ApiError } from "../../lib/api";
-import { useCrm, useDeferredSelection } from "../../state/crm-store";
+import { DealMutationInProgressError, useCrm, useDeferredSelection } from "../../state/crm-store";
 import { DealDrawer } from "./DealDrawer";
 import { NewDealDialog } from "./NewDealDialog";
 import { StageColumn } from "./StageColumn";
@@ -30,11 +30,14 @@ export function DealsPage() {
     error,
     selectedDealId,
     selectedDeal,
+    selectedDealMutationPending,
+    dealAssignees,
     selectPipeline,
     moveDeal,
     setNextPurchase,
     setDealContact,
     setDealCompany,
+    setDealAssignee,
     setDealTags,
     setDealSearch,
     setDealCustomFields,
@@ -45,6 +48,7 @@ export function DealsPage() {
     loadStageDeals,
     loadMoreDeals,
     addDeal,
+    deleteDeal,
     sendMessage,
     retryMessage,
     toggleTask,
@@ -97,7 +101,13 @@ export function DealsPage() {
         : undefined;
       setNotice(missing?.length
         ? `Заполните обязательные поля: ${missing.join(", ")}`
-        : "Не удалось изменить этап. Проверьте обязательные поля.");
+        : reason instanceof DealMutationInProgressError
+          ? reason.message
+          : reason instanceof ApiError && reason.status === 409
+            ? "Сделка изменилась у другого пользователя. Данные обновлены — повторите действие."
+            : reason instanceof ApiError && reason.status === 404
+              ? "Сделка уже удалена другим пользователем."
+              : "Не удалось изменить этап. Проверьте обязательные поля.");
     }
   }
 
@@ -220,16 +230,20 @@ export function DealsPage() {
       <DealDrawer
         deal={selectedDeal}
         pipeline={pipeline}
+        assignees={dealAssignees}
+        mutationPending={selectedDealMutationPending}
         onClose={() => selectDeal(null)}
         onMove={moveDeal}
         onSetNextPurchase={setNextPurchase}
         onSetContact={setDealContact}
         onSetCompany={setDealCompany}
+        onSetAssignee={setDealAssignee}
         onSetTags={setDealTags}
         onSetCustomFields={setDealCustomFields}
         onSendMessage={sendMessage}
         onRetryMessage={retryMessage}
         onToggleTask={toggleTask}
+        onDelete={deleteDeal}
       />
     </div>
   );

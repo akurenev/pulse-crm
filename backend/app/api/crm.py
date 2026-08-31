@@ -18,6 +18,7 @@ from app.integrations.models import (
     ExternalEntityMap,
     ExternalIdentity,
     Form,
+    NotificationDelivery,
     NotificationRule,
     PurchaseSchedule,
     PurchaseScheduleStatus,
@@ -26,13 +27,16 @@ from app.integrations.models import (
 from app.integrations.purchases import create_purchase_schedule
 from app.models import (
     ActivityEvent,
+    BackgroundJob,
     Company,
     Contact,
     CustomFieldDefinition,
     Deal,
     DealContact,
     DealStageHistory,
+    DeliveryStatus,
     FieldEntity,
+    JobStatus,
     Membership,
     OutboxEvent,
     Pipeline,
@@ -1409,6 +1413,7 @@ async def _sync_purchase_schedule(
     *,
     deal: Deal,
     fallback_assignee_id: uuid.UUID,
+    actor_id: uuid.UUID,
 ) -> None:
     """Keep the durable next-purchase schedule aligned with a deal date."""
 
@@ -1419,7 +1424,7 @@ async def _sync_purchase_schedule(
                     PurchaseSchedule.workspace_id == deal.workspace_id,
                     PurchaseSchedule.deal_id == deal.id,
                     PurchaseSchedule.status == PurchaseScheduleStatus.active,
-                )
+                ).with_for_update()
             )
         ).all()
     )
@@ -1432,6 +1437,8 @@ async def _sync_purchase_schedule(
     scheduled_for = deal.next_purchase_at
     if scheduled_for.tzinfo is None:
         scheduled_for = scheduled_for.replace(tzinfo=UTC)
+    else:
+        scheduled_for = scheduled_for.astimezone(UTC)
     contact_id = await db.scalar(
         sa.select(DealContact.contact_id)
         .where(
@@ -1442,12 +1449,41 @@ async def _sync_purchase_schedule(
         .limit(1)
     )
     for schedule in active:
-        if schedule.scheduled_for != scheduled_for:
+        existing_scheduled_for = schedule.scheduled_for
+        if existing_scheduled_for.tzinfo is None:
+            existing_scheduled_for = existing_scheduled_for.replace(tzinfo=UTC)
+        else:
+            existing_scheduled_for = existing_scheduled_for.astimezone(UTC)
+        if existing_scheduled_for != scheduled_for:
             schedule.status = PurchaseScheduleStatus.cancelled
             schedule.version += 1
         else:
+            assignee_id = deal.assignee_id or fallback_assignee_id
             schedule.contact_id = contact_id
-            schedule.assignee_id = deal.assignee_id or fallback_assignee_id
+            schedule.assignee_id = assignee_id
+            if schedule.task_id is not None:
+                task = await db.scalar(
+                    sa.select(Task)
+                    .where(
+                        Task.id == schedule.task_id,
+                        Task.workspace_id == deal.workspace_id,
+                        Task.status == TaskStatus.open,
+                    )
+                    .with_for_update()
+                )
+                if task is not None and task.assignee_id != assignee_id:
+                    task.assignee_id = assignee_id
+                    task.version += 1
+                    task.updated_at = datetime.now(UTC)
+                    record_domain_event(
+                        db,
+                        workspace_id=deal.workspace_id,
+                        event_type="task.updated",
+                        entity_type="task",
+                        entity_id=task.id,
+                        actor_id=actor_id,
+                        payload={"fields": ["assignee_id"], "deal_id": str(deal.id)},
+                    )
             return
 
     await create_purchase_schedule(
@@ -1458,6 +1494,158 @@ async def _sync_purchase_schedule(
         assignee_id=deal.assignee_id or fallback_assignee_id,
         scheduled_for=scheduled_for,
         remind_at=scheduled_for - timedelta(days=7),
+    )
+
+
+async def _cancel_purchase_tasks_and_reminders(
+    db: AsyncSession,
+    *,
+    workspace_id: uuid.UUID,
+    deal_id: uuid.UUID,
+    schedules: list[PurchaseSchedule],
+    actor_id: uuid.UUID,
+    cancelled_at: datetime,
+) -> None:
+    task_ids = {schedule.task_id for schedule in schedules if schedule.task_id is not None}
+    if not task_ids:
+        return
+
+    tasks = list(
+        (
+            await db.scalars(
+                sa.select(Task)
+                .where(
+                    Task.id.in_(task_ids),
+                    Task.workspace_id == workspace_id,
+                    Task.status == TaskStatus.open,
+                )
+                .with_for_update()
+            )
+        ).all()
+    )
+    if not tasks:
+        return
+
+    cancelled_task_ids = [task.id for task in tasks]
+    for task in tasks:
+        task.status = TaskStatus.cancelled
+        task.completed_at = None
+        task.updated_at = cancelled_at
+        task.version += 1
+        record_domain_event(
+            db,
+            workspace_id=workspace_id,
+            event_type="task.updated",
+            entity_type="task",
+            entity_id=task.id,
+            actor_id=actor_id,
+            payload={"fields": ["status"], "deal_id": str(deal_id)},
+        )
+
+    reminder_events = list(
+        (
+            await db.scalars(
+                sa.select(OutboxEvent)
+                .where(
+                    OutboxEvent.workspace_id == workspace_id,
+                    OutboxEvent.aggregate_type == "task",
+                    OutboxEvent.aggregate_id.in_(cancelled_task_ids),
+                    OutboxEvent.event_type.in_(["task.due_soon", "task.overdue"]),
+                )
+                .with_for_update()
+            )
+        ).all()
+    )
+    for event in reminder_events:
+        if event.processed_at is None:
+            event.processed_at = cancelled_at
+
+    reminder_event_ids = [event.id for event in reminder_events]
+    deliveries: list[NotificationDelivery] = []
+    if reminder_event_ids:
+        deliveries = list(
+            (
+                await db.scalars(
+                    sa.select(NotificationDelivery)
+                    .where(
+                        NotificationDelivery.workspace_id == workspace_id,
+                        NotificationDelivery.status.in_(
+                            [DeliveryStatus.pending, DeliveryStatus.processing]
+                        ),
+                        sa.or_(
+                            *[
+                                NotificationDelivery.dedupe_key.like(
+                                    f"%:event:{event_id}:recipient:%"
+                                )
+                                for event_id in reminder_event_ids
+                            ]
+                        ),
+                    )
+                    .with_for_update()
+                )
+            ).all()
+        )
+        for delivery in deliveries:
+            delivery.status = DeliveryStatus.failed
+            delivery.last_error = "source task cancelled because its deal was deleted"
+            delivery.updated_at = cancelled_at
+
+    delivery_ids = [delivery.id for delivery in deliveries]
+    delivery_events: list[OutboxEvent] = []
+    if delivery_ids:
+        delivery_events = list(
+            (
+                await db.scalars(
+                    sa.select(OutboxEvent)
+                    .where(
+                        OutboxEvent.workspace_id == workspace_id,
+                        OutboxEvent.aggregate_type == "notification_delivery",
+                        OutboxEvent.aggregate_id.in_(delivery_ids),
+                        OutboxEvent.event_type == "notification.delivery.queued",
+                        OutboxEvent.processed_at.is_(None),
+                    )
+                    .with_for_update()
+                )
+            ).all()
+        )
+        for event in delivery_events:
+            event.processed_at = cancelled_at
+
+    queued_job_keys: list[Any] = []
+    for task_id in cancelled_task_ids:
+        queued_job_keys.extend(
+            [
+                BackgroundJob.dedupe_key.like(f"monitor.task.due:{task_id}:%"),
+                BackgroundJob.dedupe_key.like(f"monitor.task.overdue:{task_id}:%"),
+            ]
+        )
+    for event_id in reminder_event_ids:
+        queued_job_keys.extend(
+            [
+                BackgroundJob.dedupe_key == f"outbox:{event_id}:dispatch",
+                BackgroundJob.dedupe_key == f"outbox:{event_id}:notifications",
+            ]
+        )
+    for delivery_id in delivery_ids:
+        queued_job_keys.append(
+            BackgroundJob.dedupe_key == f"notification-delivery:{delivery_id}:send"
+        )
+    for event in delivery_events:
+        queued_job_keys.append(BackgroundJob.dedupe_key == f"outbox:{event.id}:dispatch")
+    await db.execute(
+        sa.update(BackgroundJob)
+        .where(
+            BackgroundJob.workspace_id == workspace_id,
+            BackgroundJob.status == JobStatus.queued,
+            sa.or_(*queued_job_keys),
+        )
+        .values(
+            status=JobStatus.succeeded,
+            lease_owner=None,
+            lease_until=None,
+            last_error=None,
+            updated_at=cancelled_at,
+        )
     )
 
 
@@ -1657,6 +1845,7 @@ async def create_deal(
         db,
         deal=deal,
         fallback_assignee_id=context.user_id,
+        actor_id=context.user_id,
     )
     db.add(
         DealStageHistory(
@@ -1793,6 +1982,7 @@ async def update_deal(
             db,
             deal=deal,
             fallback_assignee_id=context.user_id,
+            actor_id=context.user_id,
         )
     record_domain_event(
         db,
@@ -1820,6 +2010,81 @@ async def update_deal(
         )
     await db.commit()
     return await _deal_read(db, deal)
+
+
+@router.delete("/deals/{deal_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_deal(
+    deal_id: uuid.UUID,
+    context: CurrentMutationUser,
+    db: AsyncSession = Depends(get_session),
+    expected_version: int = Query(ge=1),
+) -> None:
+    deal = await db.scalar(
+        sa.select(Deal)
+        .where(
+            Deal.id == deal_id,
+            Deal.workspace_id == context.workspace_id,
+            Deal.deleted_at.is_(None),
+        )
+        .with_for_update()
+    )
+    if deal is None:
+        raise not_found("deal")
+    if deal.version != expected_version:
+        raise conflict()
+
+    deleted_at = datetime.now(UTC)
+    active_schedules = list(
+        (
+            await db.scalars(
+                sa.select(PurchaseSchedule)
+                .where(
+                    PurchaseSchedule.workspace_id == context.workspace_id,
+                    PurchaseSchedule.deal_id == deal.id,
+                    PurchaseSchedule.status == PurchaseScheduleStatus.active,
+                )
+                .with_for_update()
+            )
+        ).all()
+    )
+    await _cancel_purchase_tasks_and_reminders(
+        db,
+        workspace_id=context.workspace_id,
+        deal_id=deal.id,
+        schedules=active_schedules,
+        actor_id=context.user_id,
+        cancelled_at=deleted_at,
+    )
+    for schedule in active_schedules:
+        schedule.status = PurchaseScheduleStatus.cancelled
+        schedule.completed_at = deleted_at
+        schedule.updated_at = deleted_at
+        schedule.version += 1
+    if active_schedules:
+        await db.execute(
+            sa.update(OutboxEvent)
+            .where(
+                OutboxEvent.workspace_id == context.workspace_id,
+                OutboxEvent.aggregate_type == "purchase_schedule",
+                OutboxEvent.aggregate_id.in_([schedule.id for schedule in active_schedules]),
+                OutboxEvent.event_type == "purchase.due_soon",
+                OutboxEvent.processed_at.is_(None),
+            )
+            .values(processed_at=deleted_at)
+        )
+
+    deal.deleted_at = deleted_at
+    deal.updated_at = deleted_at
+    deal.version += 1
+    record_domain_event(
+        db,
+        workspace_id=context.workspace_id,
+        event_type="deal.deleted",
+        entity_type="deal",
+        entity_id=deal.id,
+        actor_id=context.user_id,
+    )
+    await db.commit()
 
 
 def _is_blank(value: Any) -> bool:

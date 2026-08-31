@@ -241,8 +241,12 @@ Web Push остаётся выключенным, пока не заданы в�
 backend-зависимостей:
 
 ```bash
-python scripts/generate_vapid_keys.py --subject mailto:admin@example.com
+./.venv/bin/python scripts/generate_vapid_keys.py --subject mailto:admin@example.com
 ```
+
+Если виртуальное окружение уже активировано через `source .venv/bin/activate`,
+ту же команду можно запускать с `python`. Системный alias `python` в macOS по
+умолчанию может отсутствовать.
 
 Открытый ключ можно передать браузеру, закрытый необходимо сохранить только в
 secret variables. Замена пары потребует повторной подписки устройств.

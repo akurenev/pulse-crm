@@ -13,46 +13,73 @@ import {
   Phone,
   Send,
   Tag,
+  Trash2,
   UserRound,
   UserRoundCheck,
   X,
 } from "lucide-react";
-import { useDeferredValue, useId, useState, type FormEvent } from "react";
+import { useDeferredValue, useEffect, useId, useState, type FormEvent } from "react";
 
 import { Avatar } from "../../components/Avatar";
-import { api, remoteEnabled } from "../../lib/api";
+import { Button } from "../../components/Button";
+import { ApiError, api, remoteEnabled } from "../../lib/api";
 import { parseDealTags } from "../../lib/deal-tags";
 import { formatLongDate, formatMoney, formatTime } from "../../lib/format";
+import { DealMutationInProgressError } from "../../state/crm-store";
 import type { ApiActivity, ApiCompany, ApiContact, ApiCustomField, CursorPage } from "../../types/api";
-import type { Deal, Pipeline } from "../../types/crm";
+import type { Deal, Pipeline, UserSummary } from "../../types/crm";
 
 interface DealDrawerProps {
   deal: Deal | null;
   pipeline: Pipeline;
+  assignees: UserSummary[];
+  mutationPending: boolean;
   onClose: () => void;
   onMove: (dealId: string, stageId: string) => Promise<void>;
   onSetNextPurchase: (dealId: string, date: string | null) => Promise<void>;
   onSetContact: (dealId: string, contact: { id: string; name: string; phone?: string; email?: string } | null) => Promise<void>;
   onSetCompany: (dealId: string, company: { id: string; name: string } | null) => Promise<void>;
+  onSetAssignee: (dealId: string, assignee: UserSummary | null) => Promise<void>;
   onSetTags: (dealId: string, tags: string[]) => Promise<void>;
   onSetCustomFields: (dealId: string, fields: Record<string, unknown>) => Promise<void>;
   onSendMessage: (dealId: string, body: string, attachment?: File) => Promise<void>;
   onRetryMessage: (dealId: string, messageId: string) => Promise<void>;
   onToggleTask: (dealId: string, taskId: string) => Promise<void>;
+  onDelete: (dealId: string) => Promise<void>;
 }
 
-export function DealDrawer({ deal, pipeline, onClose, onMove, onSetNextPurchase, onSetContact, onSetCompany, onSetTags, onSetCustomFields, onSendMessage, onRetryMessage, onToggleTask }: DealDrawerProps) {
+export function DealDrawer({ deal, pipeline, assignees, mutationPending, onClose, onMove, onSetNextPurchase, onSetContact, onSetCompany, onSetAssignee, onSetTags, onSetCustomFields, onSendMessage, onRetryMessage, onToggleTask, onDelete }: DealDrawerProps) {
   const queryClient = useQueryClient();
+  const mobileModal = useMediaQuery("(max-width: 720px)");
   const [tab, setTab] = useState("details");
   const [messageError, setMessageError] = useState("");
   const [noteError, setNoteError] = useState("");
   const [noteSaving, setNoteSaving] = useState(false);
+  const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState("");
+  const [stageError, setStageError] = useState("");
   const historyQuery = useQuery({
     queryKey: ["activity", "deal", deal?.id],
     queryFn: () => api.get<CursorPage<ApiActivity>>(`/activity?limit=100&entity_type=deal&entity_id=${deal?.id}`),
     enabled: remoteEnabled && Boolean(deal?.id),
   });
+  useEffect(() => {
+    setDeleteConfirmOpen(false);
+    setDeleteError("");
+    setStageError("");
+  }, [deal?.id]);
   if (!deal) return null;
+
+  async function handleMove(stageId: string) {
+    if (!deal) return;
+    setStageError("");
+    try {
+      await onMove(deal.id, stageId);
+    } catch (reason) {
+      setStageError(dealMutationErrorMessage(reason, "Не удалось изменить этап сделки."));
+    }
+  }
 
   async function handleMessage(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -97,11 +124,26 @@ export function DealDrawer({ deal, pipeline, onClose, onMove, onSetNextPurchase,
     }
   }
 
+  async function handleDelete() {
+    if (!deal) return;
+    setDeleting(true);
+    setDeleteError("");
+    try {
+      await onDelete(deal.id);
+      setDeleteConfirmOpen(false);
+    } catch (reason) {
+      setDeleteError(dealMutationErrorMessage(reason, "Не удалось удалить сделку. Повторите попытку."));
+    } finally {
+      setDeleting(false);
+    }
+  }
+
   return (
-    <Dialog.Root open modal={false} onOpenChange={(open) => { if (!open) onClose(); }}>
+    <>
+      <Dialog.Root open modal={mobileModal && !deleteConfirmOpen} onOpenChange={(open) => { if (!open && !deleteConfirmOpen) onClose(); }}>
       <Dialog.Portal>
         <Dialog.Overlay className="drawer-overlay" />
-        <Dialog.Content className="deal-drawer" aria-describedby={undefined}>
+        <Dialog.Content className="deal-drawer" aria-describedby={undefined} aria-busy={mutationPending}>
           <header className="deal-drawer__header">
             <div className="deal-drawer__identity">
               <Dialog.Title>{deal.title}</Dialog.Title>
@@ -109,14 +151,27 @@ export function DealDrawer({ deal, pipeline, onClose, onMove, onSetNextPurchase,
             </div>
             <label className="stage-select deal-drawer__stage">
               <span className="sr-only">Этап сделки</span>
-              <select value={deal.stageId} onChange={(event) => void onMove(deal.id, event.target.value)}>
+              <select value={deal.stageId} disabled={mutationPending} onChange={(event) => void handleMove(event.target.value)}>
                 {pipeline.stages.map((stage) => <option key={stage.id} value={stage.id}>{stage.name}</option>)}
               </select>
             </label>
-            <Dialog.Close className="icon-button deal-drawer__close" aria-label="Закрыть карточку">
-              <X size={19} />
-            </Dialog.Close>
+            <div className="deal-drawer__header-actions">
+              <button
+                type="button"
+                className="icon-button deal-drawer__delete"
+                aria-label="Удалить сделку"
+                title="Удалить сделку"
+                disabled={mutationPending}
+                onClick={() => { setDeleteError(""); setDeleteConfirmOpen(true); }}
+              >
+                <Trash2 size={18} aria-hidden="true" />
+              </button>
+              <Dialog.Close className="icon-button deal-drawer__close" aria-label="Закрыть карточку">
+                <X size={19} />
+              </Dialog.Close>
+            </div>
           </header>
+          {stageError ? <p className="form-error" role="alert">{stageError}</p> : null}
 
           <Tabs.Root value={tab} onValueChange={setTab} className="deal-tabs">
             <Tabs.List aria-label="Разделы сделки">
@@ -131,28 +186,28 @@ export function DealDrawer({ deal, pipeline, onClose, onMove, onSetNextPurchase,
                 <dl className="details-list deal-details">
                   <div className="deal-details__row deal-details__row--contact">
                     <dt className="deal-details__label"><UserRound size={17} aria-hidden="true" /><span className="deal-details__label-text">Контакт</span></dt>
-                    <dd className="deal-details__value"><ContactPicker deal={deal} onSave={onSetContact} /></dd>
+                    <dd className="deal-details__value"><ContactPicker deal={deal} disabled={mutationPending} onSave={onSetContact} /></dd>
                   </div>
                   {deal.phone ? <div className="deal-details__row deal-details__row--phone"><dt className="deal-details__label"><Phone size={17} aria-hidden="true" /><span className="deal-details__label-text">Телефон</span></dt><dd className="deal-details__value"><a href={`tel:${deal.phone}`}>{deal.phone}</a></dd></div> : null}
                   {deal.email ? <div className="deal-details__row deal-details__row--email"><dt className="deal-details__label"><Mail size={17} aria-hidden="true" /><span className="deal-details__label-text">Email</span></dt><dd className="deal-details__value"><a href={`mailto:${deal.email}`}>{deal.email}</a></dd></div> : null}
                   <div className="deal-details__row deal-details__row--company">
                     <dt className="deal-details__label"><Building2 size={17} aria-hidden="true" /><span className="deal-details__label-text">Компания</span></dt>
-                    <dd className="deal-details__value"><CompanyPicker deal={deal} onSave={onSetCompany} /></dd>
+                    <dd className="deal-details__value"><CompanyPicker deal={deal} disabled={mutationPending} onSave={onSetCompany} /></dd>
                   </div>
                   <div className="deal-details__row deal-details__row--owner">
                     <dt className="deal-details__label"><UserRoundCheck size={17} aria-hidden="true" /><span className="deal-details__label-text">Ответственный</span></dt>
-                    <dd className="owner-line deal-details__value"><Avatar user={deal.assignee} size="sm" /> <span>{deal.assignee.name}</span></dd>
+                    <dd className="deal-details__value"><AssigneePicker key={deal.id} deal={deal} assignees={assignees} disabled={mutationPending} onSave={onSetAssignee} /></dd>
                   </div>
                   <div className="deal-details__row deal-details__row--tags">
                     <dt className="deal-details__label"><Tag size={17} aria-hidden="true" /><span className="deal-details__label-text">Теги</span></dt>
-                    <dd className="deal-details__value"><DealTagsEditor key={deal.id} deal={deal} onSave={onSetTags} /></dd>
+                    <dd className="deal-details__value"><DealTagsEditor key={deal.id} deal={deal} disabled={mutationPending} onSave={onSetTags} /></dd>
                   </div>
                   <div className="deal-details__row deal-details__row--next-purchase">
                     <dt className="deal-details__label"><CalendarDays size={17} aria-hidden="true" /><span className="deal-details__label-text">Следующая покупка</span></dt>
-                    <dd className="deal-details__value"><NextPurchaseEditor key={deal.id} deal={deal} onSave={onSetNextPurchase} /></dd>
+                    <dd className="deal-details__value"><NextPurchaseEditor key={deal.id} deal={deal} disabled={mutationPending} onSave={onSetNextPurchase} /></dd>
                   </div>
                 </dl>
-                <CustomFieldsEditor key={deal.id} deal={deal} onSave={onSetCustomFields} />
+                <CustomFieldsEditor key={deal.id} deal={deal} disabled={mutationPending} onSave={onSetCustomFields} />
                 <DrawerTasks deal={deal} onToggleTask={onToggleTask} />
                 <DrawerMessages deal={deal} onSubmit={handleMessage} onRetryMessage={onRetryMessage} error={messageError} />
               </Tabs.Content>
@@ -187,7 +242,36 @@ export function DealDrawer({ deal, pipeline, onClose, onMove, onSetNextPurchase,
           </Tabs.Root>
         </Dialog.Content>
       </Dialog.Portal>
-    </Dialog.Root>
+      </Dialog.Root>
+
+      <Dialog.Root
+        open={deleteConfirmOpen}
+        onOpenChange={(open) => {
+          if (!deleting) {
+            setDeleteConfirmOpen(open);
+            if (!open) setDeleteError("");
+          }
+        }}
+      >
+        <Dialog.Portal>
+          <Dialog.Overlay className="dialog-overlay dialog-overlay--confirm" />
+          <Dialog.Content className="dialog-content confirm-dialog">
+            <div className="dialog-header">
+              <div>
+                <Dialog.Title>Удалить сделку?</Dialog.Title>
+                <Dialog.Description>«{deal.title}» будет удалена из CRM. Это действие нельзя отменить.</Dialog.Description>
+              </div>
+              <Dialog.Close className="icon-button" aria-label="Закрыть подтверждение" disabled={deleting}><X size={20} /></Dialog.Close>
+            </div>
+            {deleteError ? <p className="form-error" role="alert">{deleteError}</p> : null}
+            <div className="dialog-actions">
+              <Dialog.Close asChild><Button type="button" disabled={deleting}>Отмена</Button></Dialog.Close>
+              <Button type="button" variant="danger" disabled={deleting || mutationPending} onClick={() => void handleDelete()}>{deleting ? "Удаляем…" : "Удалить сделку"}</Button>
+            </div>
+          </Dialog.Content>
+        </Dialog.Portal>
+      </Dialog.Root>
+    </>
   );
 }
 
@@ -216,7 +300,98 @@ function formatActivityDate(value: string) {
   return new Intl.DateTimeFormat("ru-RU", { dateStyle: "medium", timeStyle: "short" }).format(new Date(value));
 }
 
-function ContactPicker({ deal, onSave }: { deal: Deal; onSave: DealDrawerProps["onSetContact"] }) {
+function useMediaQuery(query: string) {
+  const [matches, setMatches] = useState(() => typeof window !== "undefined"
+    && typeof window.matchMedia === "function"
+    && window.matchMedia(query).matches);
+
+  useEffect(() => {
+    if (typeof window.matchMedia !== "function") return undefined;
+    const media = window.matchMedia(query);
+    const update = () => setMatches(media.matches);
+    update();
+    if (typeof media.addEventListener === "function") {
+      media.addEventListener("change", update);
+      return () => media.removeEventListener("change", update);
+    }
+    media.addListener(update);
+    return () => media.removeListener(update);
+  }, [query]);
+
+  return matches;
+}
+
+function dealMutationErrorMessage(reason: unknown, fallback: string) {
+  if (reason instanceof DealMutationInProgressError) return reason.message;
+  if (!(reason instanceof ApiError)) return fallback;
+  if (reason.status === 404) return "Сделка уже удалена другим пользователем.";
+  if (reason.status === 409) return "Сделка уже изменена другим пользователем. Данные обновлены — повторите действие.";
+  const detail = reason.details && typeof reason.details === "object" && "detail" in reason.details
+    ? (reason.details as { detail?: unknown }).detail
+    : undefined;
+  if (detail && typeof detail === "object" && "code" in detail && detail.code === "missing_required_fields") {
+    const fields = "fields" in detail && Array.isArray(detail.fields)
+      ? detail.fields.map((field) => {
+        if (!field || typeof field !== "object") return "";
+        if ("name" in field && field.name) return String(field.name);
+        return "key" in field && field.key ? String(field.key) : "";
+      }).filter(Boolean)
+      : [];
+    return fields.length ? `Заполните обязательные поля: ${fields.join(", ")}.` : "Заполните обязательные поля этапа.";
+  }
+  return fallback;
+}
+
+function AssigneePicker({ deal, assignees, disabled, onSave }: {
+  deal: Deal;
+  assignees: UserSummary[];
+  disabled: boolean;
+  onSave: DealDrawerProps["onSetAssignee"];
+}) {
+  const [editing, setEditing] = useState(false);
+  const [selectedId, setSelectedId] = useState(deal.assignee.id === "unassigned" ? "" : deal.assignee.id);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+
+  function startEditing() {
+    setSelectedId(deal.assignee.id === "unassigned" ? "" : deal.assignee.id);
+    setError("");
+    setEditing(true);
+  }
+
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const assignee = assignees.find((user) => user.id === selectedId) ?? null;
+    setSaving(true);
+    setError("");
+    try {
+      await onSave(deal.id, assignee);
+      setEditing(false);
+    } catch (reason) {
+      setError(dealMutationErrorMessage(reason, "Не удалось изменить ответственного сделки."));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  if (!editing) {
+    return <span className="relation-value owner-value"><span className="owner-line"><Avatar user={deal.assignee} size="sm" /><span>{deal.assignee.name}</span></span><EditFieldButton label="Изменить ответственного сделки" disabled={disabled} onClick={startEditing} /></span>;
+  }
+
+  return <form className="owner-picker" onSubmit={(event) => void submit(event)}>
+    <select autoFocus aria-label="Ответственный сделки" value={selectedId} onChange={(event) => setSelectedId(event.target.value)} disabled={saving || disabled}>
+      <option value="">Не назначен</option>
+      {assignees.map((assignee) => <option key={assignee.id} value={assignee.id}>{assignee.name}</option>)}
+    </select>
+    <span className="owner-picker__actions">
+      <button type="button" disabled={saving} onClick={() => setEditing(false)}>Отмена</button>
+      <button type="submit" aria-label="Сохранить ответственного сделки" disabled={saving || disabled}>{saving ? "Сохраняем…" : "Сохранить"}</button>
+    </span>
+    {error ? <small className="message-error" role="alert">{error}</small> : null}
+  </form>;
+}
+
+function ContactPicker({ deal, disabled, onSave }: { deal: Deal; disabled: boolean; onSave: DealDrawerProps["onSetContact"] }) {
   const [editing, setEditing] = useState(false);
   const [search, setSearch] = useState("");
   const [saving, setSaving] = useState(false);
@@ -248,19 +423,19 @@ function ContactPicker({ deal, onSave }: { deal: Deal; onSave: DealDrawerProps["
   }
 
   if (!editing) {
-    return <span className="relation-value"><span>{deal.contactName ?? "Не указан"}</span>{remoteEnabled ? <EditFieldButton label="Изменить контакт сделки" onClick={() => setEditing(true)} /> : null}</span>;
+    return <span className="relation-value"><span>{deal.contactName ?? "Не указан"}</span>{remoteEnabled ? <EditFieldButton label="Изменить контакт сделки" disabled={disabled} onClick={() => setEditing(true)} /> : null}</span>;
   }
   return <span className="relation-picker">
-    <input autoFocus aria-label="Поиск контакта" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Имя, телефон или email" />
+    <input autoFocus aria-label="Поиск контакта" value={search} disabled={disabled} onChange={(event) => setSearch(event.target.value)} placeholder="Имя, телефон или email" />
     {results.isLoading ? <small>Ищем…</small> : null}
     {deferredSearch.length < 2 ? <small>Введите минимум 2 символа</small> : null}
-    {(results.data?.items ?? []).map((contact) => <button type="button" key={contact.id} disabled={saving} onClick={() => void choose(contact)}><strong>{`${contact.first_name} ${contact.last_name}`.trim()}</strong><small>{contact.primary_phone ?? contact.primary_email ?? "Без контактов"}</small></button>)}
-    <span className="relation-picker__actions">{deal.contactIds?.length ? <button type="button" disabled={saving} onClick={() => void choose(null)}>Очистить</button> : null}<button type="button" onClick={() => setEditing(false)}>Отмена</button></span>
+    {(results.data?.items ?? []).map((contact) => <button type="button" key={contact.id} disabled={saving || disabled} onClick={() => void choose(contact)}><strong>{`${contact.first_name} ${contact.last_name}`.trim()}</strong><small>{contact.primary_phone ?? contact.primary_email ?? "Без контактов"}</small></button>)}
+    <span className="relation-picker__actions">{deal.contactIds?.length ? <button type="button" disabled={saving || disabled} onClick={() => void choose(null)}>Очистить</button> : null}<button type="button" disabled={saving} onClick={() => setEditing(false)}>Отмена</button></span>
     {error ? <small className="message-error" role="alert">{error}</small> : null}
   </span>;
 }
 
-function CompanyPicker({ deal, onSave }: { deal: Deal; onSave: DealDrawerProps["onSetCompany"] }) {
+function CompanyPicker({ deal, disabled, onSave }: { deal: Deal; disabled: boolean; onSave: DealDrawerProps["onSetCompany"] }) {
   const [editing, setEditing] = useState(false);
   const [search, setSearch] = useState("");
   const [saving, setSaving] = useState(false);
@@ -287,19 +462,19 @@ function CompanyPicker({ deal, onSave }: { deal: Deal; onSave: DealDrawerProps["
   }
 
   if (!editing) {
-    return <span className="relation-value"><span>{deal.companyName ?? "Не указана"}</span>{remoteEnabled ? <EditFieldButton label="Изменить компанию сделки" onClick={() => setEditing(true)} /> : null}</span>;
+    return <span className="relation-value"><span>{deal.companyName ?? "Не указана"}</span>{remoteEnabled ? <EditFieldButton label="Изменить компанию сделки" disabled={disabled} onClick={() => setEditing(true)} /> : null}</span>;
   }
   return <span className="relation-picker">
-    <input autoFocus aria-label="Поиск компании" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Название, телефон или email" />
+    <input autoFocus aria-label="Поиск компании" value={search} disabled={disabled} onChange={(event) => setSearch(event.target.value)} placeholder="Название, телефон или email" />
     {results.isLoading ? <small>Ищем…</small> : null}
     {deferredSearch.length < 2 ? <small>Введите минимум 2 символа</small> : null}
-    {(results.data?.items ?? []).map((company) => <button type="button" key={company.id} disabled={saving} onClick={() => void choose(company)}><strong>{company.name}</strong><small>{company.phone ?? company.email ?? "Без контактов"}</small></button>)}
-    <span className="relation-picker__actions">{deal.companyId ? <button type="button" disabled={saving} onClick={() => void choose(null)}>Очистить</button> : null}<button type="button" onClick={() => setEditing(false)}>Отмена</button></span>
+    {(results.data?.items ?? []).map((company) => <button type="button" key={company.id} disabled={saving || disabled} onClick={() => void choose(company)}><strong>{company.name}</strong><small>{company.phone ?? company.email ?? "Без контактов"}</small></button>)}
+    <span className="relation-picker__actions">{deal.companyId ? <button type="button" disabled={saving || disabled} onClick={() => void choose(null)}>Очистить</button> : null}<button type="button" disabled={saving} onClick={() => setEditing(false)}>Отмена</button></span>
     {error ? <small className="message-error" role="alert">{error}</small> : null}
   </span>;
 }
 
-function DealTagsEditor({ deal, onSave }: { deal: Deal; onSave: DealDrawerProps["onSetTags"] }) {
+function DealTagsEditor({ deal, disabled, onSave }: { deal: Deal; disabled: boolean; onSave: DealDrawerProps["onSetTags"] }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(deal.tags.join(", "));
   const [saving, setSaving] = useState(false);
@@ -326,26 +501,26 @@ function DealTagsEditor({ deal, onSave }: { deal: Deal; onSave: DealDrawerProps[
   }
 
   if (!editing) {
-    return <span className="deal-tags-editor__display"><span className="deal-tags-list">{deal.tags.length ? deal.tags.map((tag) => <span className="deal-tag" key={tag}>{tag}</span>) : <small>Нет тегов</small>}</span><EditFieldButton label="Изменить теги сделки" onClick={startEditing} /></span>;
+    return <span className="deal-tags-editor__display"><span className="deal-tags-list">{deal.tags.length ? deal.tags.map((tag) => <span className="deal-tag" key={tag}>{tag}</span>) : <small>Нет тегов</small>}</span><EditFieldButton label="Изменить теги сделки" disabled={disabled} onClick={startEditing} /></span>;
   }
 
   return <form className="deal-tags-editor" onSubmit={(event) => void submit(event)}>
-    <input autoFocus aria-label="Теги сделки" value={draft} onChange={(event) => setDraft(event.target.value)} maxLength={10_000} placeholder="VIP, Повторная покупка" />
+    <input autoFocus aria-label="Теги сделки" value={draft} disabled={disabled} onChange={(event) => setDraft(event.target.value)} maxLength={10_000} placeholder="VIP, Повторная покупка" />
     <small>Разделяйте теги запятыми</small>
-    <span><button type="button" disabled={saving} onClick={() => setEditing(false)}>Отмена</button><button type="submit" aria-label="Сохранить теги сделки" disabled={saving}>{saving ? "Сохраняем…" : "Сохранить"}</button></span>
+    <span><button type="button" disabled={saving} onClick={() => setEditing(false)}>Отмена</button><button type="submit" aria-label="Сохранить теги сделки" disabled={saving || disabled}>{saving ? "Сохраняем…" : "Сохранить"}</button></span>
     {error ? <small className="message-error" role="alert">{error}</small> : null}
   </form>;
 }
 
-function EditFieldButton({ label, onClick }: { label: string; onClick: () => void }) {
+function EditFieldButton({ label, disabled = false, onClick }: { label: string; disabled?: boolean; onClick: () => void }) {
   return (
-    <button type="button" className="deal-field-edit icon-button" aria-label={label} title={label} onClick={onClick}>
+    <button type="button" className="deal-field-edit icon-button" aria-label={label} title={label} disabled={disabled} onClick={onClick}>
       <Pencil size={15} aria-hidden="true" />
     </button>
   );
 }
 
-function CustomFieldsEditor({ deal, onSave }: { deal: Deal; onSave: DealDrawerProps["onSetCustomFields"] }) {
+function CustomFieldsEditor({ deal, disabled, onSave }: { deal: Deal; disabled: boolean; onSave: DealDrawerProps["onSetCustomFields"] }) {
   const definitions = useQuery({
     queryKey: ["deal-custom-fields"],
     queryFn: () => api.get<ApiCustomField[]>("/custom-fields?entity_type=deal"),
@@ -405,18 +580,18 @@ function CustomFieldsEditor({ deal, onSave }: { deal: Deal; onSave: DealDrawerPr
       <form onSubmit={(event) => void submit(event)}>
         {(definitions.data ?? []).map((definition) => <label className="field custom-fields-editor__field" key={definition.id}>
           <span className="custom-fields-editor__label">{definition.name}</span>
-          {definition.field_type === "boolean" ? <input type="checkbox" checked={Boolean(draft[definition.key])} onChange={(event) => setDraft((current) => ({ ...current, [definition.key]: event.target.checked }))} />
-            : definition.field_type === "select" ? <select value={String(draft[definition.key] ?? "")} onChange={(event) => setDraft((current) => ({ ...current, [definition.key]: event.target.value }))}><option value="">Не выбрано</option>{definition.options.map((option) => <option key={option} value={option}>{option}</option>)}</select>
-              : <input type={definition.field_type === "number" ? "number" : definition.field_type === "date" ? "date" : "text"} value={String(draft[definition.key] ?? "")} onChange={(event) => setDraft((current) => ({ ...current, [definition.key]: event.target.value }))} />}
+          {definition.field_type === "boolean" ? <input type="checkbox" checked={Boolean(draft[definition.key])} disabled={disabled} onChange={(event) => setDraft((current) => ({ ...current, [definition.key]: event.target.checked }))} />
+            : definition.field_type === "select" ? <select value={String(draft[definition.key] ?? "")} disabled={disabled} onChange={(event) => setDraft((current) => ({ ...current, [definition.key]: event.target.value }))}><option value="">Не выбрано</option>{definition.options.map((option) => <option key={option} value={option}>{option}</option>)}</select>
+              : <input type={definition.field_type === "number" ? "number" : definition.field_type === "date" ? "date" : "text"} value={String(draft[definition.key] ?? "")} disabled={disabled} onChange={(event) => setDraft((current) => ({ ...current, [definition.key]: event.target.value }))} />}
         </label>)}
-        <button type="submit" disabled={saving}>{saving ? "Сохраняем…" : "Сохранить поля"}</button>
+        <button type="submit" disabled={saving || disabled}>{saving ? "Сохраняем…" : "Сохранить поля"}</button>
         {error ? <small className="message-error" role="alert">{error}</small> : null}
       </form>
     </div>
   </section>;
 }
 
-function NextPurchaseEditor({ deal, onSave }: { deal: Deal; onSave: DealDrawerProps["onSetNextPurchase"] }) {
+function NextPurchaseEditor({ deal, disabled, onSave }: { deal: Deal; disabled: boolean; onSave: DealDrawerProps["onSetNextPurchase"] }) {
   const [date, setDate] = useState(deal.nextPurchaseAt?.slice(0, 10) ?? "");
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
@@ -436,8 +611,8 @@ function NextPurchaseEditor({ deal, onSave }: { deal: Deal; onSave: DealDrawerPr
 
   return (
     <form className="next-purchase-editor" onSubmit={(event) => void submit(event)}>
-      <input aria-label="Дата следующей покупки" type="date" value={date} onChange={(event) => setDate(event.target.value)} />
-      <button type="submit" disabled={saving}>{saving ? "…" : "Сохранить"}</button>
+      <input aria-label="Дата следующей покупки" type="date" value={date} disabled={disabled} onChange={(event) => setDate(event.target.value)} />
+      <button type="submit" disabled={saving || disabled}>{saving ? "…" : "Сохранить"}</button>
       {deal.nextPurchaseAt ? <small>{formatLongDate(deal.nextPurchaseAt)}</small> : null}
       {error ? <small className="message-error" role="alert">{error}</small> : null}
     </form>

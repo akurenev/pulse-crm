@@ -158,6 +158,7 @@ describe("AppShell realtime refresh", () => {
       source.emit("task.updated");
       vi.advanceTimersByTime(100);
       source.emit("task.deleted");
+      source.emit("deal.deleted");
       source.emit("contact.deleted");
       vi.advanceTimersByTime(49);
     });

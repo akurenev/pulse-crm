@@ -412,13 +412,19 @@ async def _validate_routing(
     assignee_id: uuid.UUID | None,
     source_id: uuid.UUID | None = None,
     require_pipeline_stage: bool = True,
+    allow_pipeline_without_stage: bool = False,
 ) -> None:
     if require_pipeline_stage and (pipeline_id is None or stage_id is None):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="pipeline and stage are required",
         )
-    if (pipeline_id is None) != (stage_id is None):
+    if stage_id is not None and pipeline_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="pipeline and stage must be configured together",
+        )
+    if pipeline_id is not None and stage_id is None and not allow_pipeline_without_stage:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="pipeline and stage must be configured together",
@@ -432,15 +438,16 @@ async def _validate_routing(
         )
         if pipeline is None:
             raise _not_found("pipeline")
-        stage = await db.scalar(
-            sa.select(Stage).where(
-                Stage.id == stage_id,
-                Stage.workspace_id == workspace_id,
-                Stage.pipeline_id == pipeline_id,
+        if stage_id is not None:
+            stage = await db.scalar(
+                sa.select(Stage).where(
+                    Stage.id == stage_id,
+                    Stage.workspace_id == workspace_id,
+                    Stage.pipeline_id == pipeline_id,
+                )
             )
-        )
-        if stage is None:
-            raise _not_found("stage")
+            if stage is None:
+                raise _not_found("stage")
     if assignee_id is not None:
         member_id = await db.scalar(
             sa.select(Membership.id).where(
@@ -1185,6 +1192,7 @@ async def _validate_rule(
         assignee_id=None,
         source_id=source_id,
         require_pipeline_stage=False,
+        allow_pipeline_without_stage=True,
     )
 
 

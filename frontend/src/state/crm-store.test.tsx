@@ -1,7 +1,8 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { ApiDeal, ApiPipeline, ApiTask, CursorPage } from "../types/api";
+import { ApiError } from "../lib/api";
+import type { ApiDeal, ApiPipeline, ApiTask, ApiUser, CursorPage } from "../types/api";
 import { CrmProvider, useCrm } from "./crm-store";
 
 const apiMocks = vi.hoisted(() => ({
@@ -15,7 +16,11 @@ const apiMocks = vi.hoisted(() => ({
 
 vi.mock("../lib/api", () => ({
   remoteEnabled: true,
-  ApiError: class ApiError extends Error {},
+  ApiError: class ApiError extends Error {
+    constructor(message: string, public readonly status: number, public readonly details?: unknown) {
+      super(message);
+    }
+  },
   api: { ...apiMocks, setCsrf: vi.fn() },
 }));
 
@@ -83,9 +88,17 @@ const wonDealTask: ApiTask = {
   version: 1,
 };
 
+const owner: ApiUser = {
+  id: "user-owner",
+  email: "owner@example.com",
+  full_name: "Тестовый сотрудник",
+  role: "owner",
+};
+
 function StoreProbe() {
   const {
     deals,
+    pipelines,
     loading,
     loadedStageIds,
     nextCursorByStage,
@@ -94,12 +107,22 @@ function StoreProbe() {
     setDealSearch,
     selectPipeline,
     toggleTask,
+    dealAssignees,
+    setDealAssignee,
+    deleteDeal,
+    moveDeal,
+    selectDeal,
+    selectedDealMutationPending,
   } = useCrm();
   return <div>
     <output aria-label="Статус">{loading ? "loading" : "ready"}</output>
     <output aria-label="Сделки">{deals.map((item) => item.title).join("|")}</output>
+    <output aria-label="Версии сделок">{deals.map((item) => `${item.version}:${item.stageId}`).join("|")}</output>
+    <output aria-label="Воронки">{pipelines.map((item) => item.id).join("|") || "нет"}</output>
+    <output aria-label="Мутация сделки">{selectedDealMutationPending ? "pending" : "idle"}</output>
     <output aria-label="Задачи сделок">{deals.flatMap((item) => item.tasks).map((item) => item.title).join("|")}</output>
     <output aria-label="Состояния задач">{deals.flatMap((item) => item.tasks).map((item) => item.completed ? "done" : "open").join("|")}</output>
+    <output aria-label="Ответственные сделок">{deals.map((item) => item.assignee.name).join("|")}</output>
     <output aria-label="Финальный этап">{loadedStageIds["stage-won"] ? "loaded" : "deferred"}</output>
     <button type="button" onClick={() => void loadStageDeals("stage-won")}>Загрузить финал</button>
     {nextCursorByStage["stage-won"] ? <button type="button" onClick={() => void loadMoreDeals("stage-won")}>Ещё финал</button> : null}
@@ -110,6 +133,31 @@ function StoreProbe() {
       const task = dealWithTask?.tasks[0];
       if (dealWithTask && task) void toggleTask(dealWithTask.id, task.id);
     }}>Завершить задачу сделки</button>
+    <button type="button" onClick={() => {
+      const currentDeal = deals[0];
+      const nextAssignee = dealAssignees[0];
+      if (currentDeal && nextAssignee) void setDealAssignee(currentDeal.id, nextAssignee).catch(() => undefined);
+    }}>Назначить ответственного</button>
+    <button type="button" onClick={() => {
+      const currentDeal = deals[0];
+      if (currentDeal) void deleteDeal(currentDeal.id).catch(() => undefined);
+    }}>Удалить первую сделку</button>
+    <button type="button" onClick={() => {
+      const currentDeal = deals[0];
+      if (currentDeal) selectDeal(currentDeal.id);
+    }}>Открыть первую сделку</button>
+    <button type="button" onClick={() => {
+      const currentDeal = deals[0];
+      if (currentDeal) void moveDeal(currentDeal.id, "stage-won").catch(() => undefined);
+    }}>Перенести первую сделку</button>
+    <button type="button" onClick={() => {
+      const currentDeal = deals[0];
+      const nextAssignee = dealAssignees[0];
+      if (!currentDeal || !nextAssignee) return;
+      void setDealAssignee(currentDeal.id, nextAssignee).catch(() => undefined);
+      void moveDeal(currentDeal.id, "stage-won").catch(() => undefined);
+      void deleteDeal(currentDeal.id).catch(() => undefined);
+    }}>Назначить, перенести и удалить одновременно</button>
   </div>;
 }
 
@@ -122,11 +170,15 @@ describe("CrmProvider deal stage loading", () => {
     deferredWonPage = null;
     apiMocks.get.mockReset();
     apiMocks.patch.mockReset();
+    apiMocks.delete.mockReset();
+    apiMocks.delete.mockResolvedValue(undefined);
     apiMocks.patch.mockResolvedValue({ ...wonDealTask, status: "completed", version: 2 });
     apiMocks.get.mockImplementation((path: string) => {
       if (path === "/pipelines") return Promise.resolve([pipeline, secondaryPipeline]);
-      if (path === "/sources" || path === "/users") return Promise.resolve([]);
+      if (path === "/sources") return Promise.resolve([]);
+      if (path === "/users") return Promise.resolve([owner]);
       if (path === "/tasks?limit=100") return taskPagePromise;
+      if (path === "/deals/deal-open/messages?limit=100") return Promise.resolve({ items: [], next_cursor: null });
       if (path.includes("stage_id=stage-service-open")) {
         return Promise.resolve({ items: [deal("deal-service", "stage-service-open", "Сервисная сделка", secondaryPipeline.id)], next_cursor: null } satisfies CursorPage<ApiDeal>);
       }
@@ -226,5 +278,97 @@ describe("CrmProvider deal stage loading", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Поиск в архиве" }));
     expect(screen.queryByRole("button", { name: "Ещё финал" })).not.toBeInTheDocument();
+  });
+
+  it("назначает ответственного и удаляет сделку с актуальной версией", async () => {
+    const updated = { ...deal("deal-open", "stage-open", "Активная сделка"), assignee_id: owner.id, version: 2 };
+    apiMocks.patch.mockImplementation((path: string) => path === "/deals/deal-open"
+      ? Promise.resolve(updated)
+      : Promise.resolve({ ...wonDealTask, status: "completed", version: 2 }));
+    render(<CrmProvider><StoreProbe /></CrmProvider>);
+    await waitFor(() => expect(screen.getByLabelText("Статус")).toHaveTextContent("ready"));
+
+    fireEvent.click(screen.getByRole("button", { name: "Назначить ответственного" }));
+    await waitFor(() => expect(screen.getByLabelText("Ответственные сделок")).toHaveTextContent(owner.full_name));
+    expect(apiMocks.patch).toHaveBeenCalledWith("/deals/deal-open", {
+      expected_version: 1,
+      assignee_id: owner.id,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Удалить первую сделку" }));
+    await waitFor(() => expect(screen.getByLabelText("Сделки")).not.toHaveTextContent("Активная сделка"));
+    expect(apiMocks.delete).toHaveBeenCalledWith("/deals/deal-open?expected_version=2");
+  });
+
+  it("не раскрывает demo-воронку до завершения remote metadata bootstrap", async () => {
+    let resolvePipelines!: (value: ApiPipeline[]) => void;
+    const pipelinesPromise = new Promise<ApiPipeline[]>((resolve) => { resolvePipelines = resolve; });
+    const baseGet = apiMocks.get.getMockImplementation()!;
+    apiMocks.get.mockImplementation((path: string) => path === "/pipelines" ? pipelinesPromise : baseGet(path));
+
+    render(<CrmProvider><StoreProbe /></CrmProvider>);
+    expect(screen.getByLabelText("Воронки")).toHaveTextContent("нет");
+
+    await act(async () => resolvePipelines([pipeline, secondaryPipeline]));
+    await waitFor(() => expect(screen.getByLabelText("Воронки")).toHaveTextContent("pipeline-sales|pipeline-service"));
+  });
+
+  it("блокирует параллельное удаление, пока сохраняется ответственный", async () => {
+    let resolveAssignment!: (value: ApiDeal) => void;
+    const assignmentPromise = new Promise<ApiDeal>((resolve) => { resolveAssignment = resolve; });
+    apiMocks.patch.mockImplementation((path: string) => path === "/deals/deal-open"
+      ? assignmentPromise
+      : Promise.resolve({ ...wonDealTask, status: "completed", version: 2 }));
+
+    render(<CrmProvider><StoreProbe /></CrmProvider>);
+    await waitFor(() => expect(screen.getByLabelText("Статус")).toHaveTextContent("ready"));
+    fireEvent.click(screen.getByRole("button", { name: "Открыть первую сделку" }));
+    fireEvent.click(screen.getByRole("button", { name: "Назначить, перенести и удалить одновременно" }));
+
+    await waitFor(() => expect(screen.getByLabelText("Мутация сделки")).toHaveTextContent("pending"));
+    expect(apiMocks.delete).not.toHaveBeenCalled();
+    expect(apiMocks.patch.mock.calls.some(([path]) => path === "/deals/deal-open/stage")).toBe(false);
+    await act(async () => resolveAssignment({
+      ...deal("deal-open", "stage-open", "Активная сделка"),
+      assignee_id: owner.id,
+      version: 2,
+    }));
+    await waitFor(() => expect(screen.getByLabelText("Мутация сделки")).toHaveTextContent("idle"));
+
+    fireEvent.click(screen.getByRole("button", { name: "Удалить первую сделку" }));
+    await waitFor(() => expect(apiMocks.delete).toHaveBeenCalledWith("/deals/deal-open?expected_version=2"));
+  });
+
+  it("после 409 перечитывает сделку и повторяет мутацию с новой версией", async () => {
+    const fresh = { ...deal("deal-open", "stage-open", "Актуальная сделка"), version: 4 };
+    const baseGet = apiMocks.get.getMockImplementation()!;
+    apiMocks.get.mockImplementation((path: string) => path === "/deals/deal-open" ? Promise.resolve(fresh) : baseGet(path));
+    apiMocks.patch.mockRejectedValueOnce(new ApiError("conflict", 409, { detail: { code: "version_conflict" } }));
+
+    render(<CrmProvider><StoreProbe /></CrmProvider>);
+    await waitFor(() => expect(screen.getByLabelText("Статус")).toHaveTextContent("ready"));
+    fireEvent.click(screen.getByRole("button", { name: "Назначить ответственного" }));
+
+    await waitFor(() => expect(apiMocks.get).toHaveBeenCalledWith("/deals/deal-open"));
+    await waitFor(() => expect(screen.getByLabelText("Сделки")).toHaveTextContent("Актуальная сделка"));
+    expect(screen.getByLabelText("Версии сделок")).toHaveTextContent("4:stage-open");
+
+    apiMocks.patch.mockResolvedValue({ ...fresh, assignee_id: owner.id, version: 5 });
+    fireEvent.click(screen.getByRole("button", { name: "Назначить ответственного" }));
+    await waitFor(() => expect(screen.getByLabelText("Ответственные сделок")).toHaveTextContent(owner.full_name));
+    expect(apiMocks.patch).toHaveBeenLastCalledWith("/deals/deal-open", {
+      expected_version: 4,
+      assignee_id: owner.id,
+    });
+  });
+
+  it("считает 404 при удалении идемпотентным и закрывает сделку локально", async () => {
+    apiMocks.delete.mockRejectedValueOnce(new ApiError("not found", 404));
+    render(<CrmProvider><StoreProbe /></CrmProvider>);
+    await waitFor(() => expect(screen.getByLabelText("Статус")).toHaveTextContent("ready"));
+
+    fireEvent.click(screen.getByRole("button", { name: "Удалить первую сделку" }));
+    await waitFor(() => expect(screen.getByLabelText("Сделки")).not.toHaveTextContent("Активная сделка"));
+    expect(apiMocks.get).not.toHaveBeenCalledWith("/deals/deal-open");
   });
 });

@@ -384,6 +384,40 @@ async def test_notification_template_and_rule_crud_enforces_catalog_and_consent(
     )
     assert unsafe_client_rule.status_code == 422
 
+    pipeline_rule_response = await admin_client.post(
+        f"{API_ROOT}/notification-rules",
+        headers=auth(admin_seed.admin_token),
+        json={
+            "template_id": template["id"],
+            "name": "All stages in sales pipeline",
+            "event_type": "lead.created",
+            "audience": "employee",
+            "channel": "email",
+            "pipeline_id": admin_seed.pipeline_id,
+            "stage_id": None,
+            "is_enabled": True,
+        },
+    )
+    assert pipeline_rule_response.status_code == 201, pipeline_rule_response.text
+    pipeline_rule = pipeline_rule_response.json()
+    assert pipeline_rule["pipeline_id"] == admin_seed.pipeline_id
+    assert pipeline_rule["stage_id"] is None
+
+    stage_without_pipeline = await admin_client.post(
+        f"{API_ROOT}/notification-rules",
+        headers=auth(admin_seed.admin_token),
+        json={
+            "template_id": template["id"],
+            "name": "Invalid stage-only filter",
+            "event_type": "lead.created",
+            "audience": "employee",
+            "channel": "email",
+            "pipeline_id": None,
+            "stage_id": admin_seed.stage_id,
+        },
+    )
+    assert stage_without_pipeline.status_code == 422
+
     rule_response = await admin_client.post(
         f"{API_ROOT}/notification-rules",
         headers=auth(admin_seed.admin_token),
@@ -421,6 +455,12 @@ async def test_notification_template_and_rule_crud_enforces_catalog_and_consent(
     assert (
         await admin_client.delete(
             f"{API_ROOT}/notification-rules/{rule['id']}?expected_version=2",
+            headers=auth(admin_seed.owner_token),
+        )
+    ).status_code == 204
+    assert (
+        await admin_client.delete(
+            f"{API_ROOT}/notification-rules/{pipeline_rule['id']}?expected_version=1",
             headers=auth(admin_seed.owner_token),
         )
     ).status_code == 204

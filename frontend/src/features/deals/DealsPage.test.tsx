@@ -1,15 +1,22 @@
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { DndContext } from "@dnd-kit/core";
+import type { ComponentProps } from "react";
 
+import { initialDeals, pipeline as demoPipeline, users as demoUsers } from "../../data/demo";
+import { ApiError } from "../../lib/api";
 import { CrmProvider } from "../../state/crm-store";
+import { DealDrawer } from "./DealDrawer";
 import { DealsPage } from "./DealsPage";
 import { StageColumn } from "./StageColumn";
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.unstubAllGlobals();
+});
 
 function renderPage() {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -20,6 +27,35 @@ function renderPage() {
           <DealsPage />
         </CrmProvider>
       </MemoryRouter>
+    </QueryClientProvider>,
+  );
+}
+
+function renderDrawer(overrides: Partial<ComponentProps<typeof DealDrawer>> = {}) {
+  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  const props: ComponentProps<typeof DealDrawer> = {
+    deal: initialDeals[0],
+    pipeline: demoPipeline,
+    assignees: Object.values(demoUsers),
+    mutationPending: false,
+    onClose: vi.fn(),
+    onMove: vi.fn().mockResolvedValue(undefined),
+    onSetNextPurchase: vi.fn().mockResolvedValue(undefined),
+    onSetContact: vi.fn().mockResolvedValue(undefined),
+    onSetCompany: vi.fn().mockResolvedValue(undefined),
+    onSetAssignee: vi.fn().mockResolvedValue(undefined),
+    onSetTags: vi.fn().mockResolvedValue(undefined),
+    onSetCustomFields: vi.fn().mockResolvedValue(undefined),
+    onSendMessage: vi.fn().mockResolvedValue(undefined),
+    onRetryMessage: vi.fn().mockResolvedValue(undefined),
+    onToggleTask: vi.fn().mockResolvedValue(undefined),
+    onDelete: vi.fn().mockResolvedValue(undefined),
+    ...overrides,
+  };
+  return render(
+    <QueryClientProvider client={queryClient}>
+      <button type="button">Внешнее действие</button>
+      <DealDrawer {...props} />
     </QueryClientProvider>,
   );
 }
@@ -163,5 +199,130 @@ describe("DealsPage", () => {
     expect(within(dialog).getByText("Ключевой", { exact: true })).toBeInTheDocument();
     expect(within(dialog).getByText("Продление", { exact: true })).toBeInTheDocument();
     expect(within(dialog).queryAllByText("Ключевой", { exact: true })).toHaveLength(1);
+  });
+
+  it("changes the deal assignee from the deal details", async () => {
+    const user = userEvent.setup();
+    renderPage();
+
+    await user.click(screen.getByText("Кофейня «Слой»"));
+    const dialog = await screen.findByRole("dialog", { name: "Кофейня «Слой»" });
+    const ownerRow = dialog.querySelector(".deal-details__row--owner");
+    expect(ownerRow).not.toBeNull();
+    expect(within(ownerRow as HTMLElement).getByText("Алексей Кузнецов")).toBeInTheDocument();
+
+    await user.click(within(dialog).getByRole("button", { name: "Изменить ответственного сделки" }));
+    await user.selectOptions(within(dialog).getByRole("combobox", { name: "Ответственный сделки" }), "user-ek");
+    await user.click(within(ownerRow as HTMLElement).getByRole("button", { name: "Сохранить ответственного сделки" }));
+
+    expect(within(ownerRow as HTMLElement).getByText("Елена Крылова")).toBeInTheDocument();
+    expect(within(ownerRow as HTMLElement).queryByText("Алексей Кузнецов")).not.toBeInTheDocument();
+  });
+
+  it("requires confirmation before deleting a deal", async () => {
+    const user = userEvent.setup();
+    renderPage();
+
+    await user.click(screen.getByText("Кофейня «Слой»"));
+    const dealDialog = await screen.findByRole("dialog", { name: "Кофейня «Слой»" });
+    await user.click(within(dealDialog).getByRole("button", { name: "Удалить сделку" }));
+
+    let confirmation = await screen.findByRole("dialog", { name: "Удалить сделку?" });
+    expect(confirmation).toHaveTextContent("Это действие нельзя отменить");
+    await user.click(within(confirmation).getByRole("button", { name: "Отмена" }));
+    expect(screen.queryByRole("dialog", { name: "Удалить сделку?" })).not.toBeInTheDocument();
+    expect(screen.getByRole("dialog", { name: "Кофейня «Слой»" })).toBeInTheDocument();
+
+    await user.click(within(dealDialog).getByRole("button", { name: "Удалить сделку" }));
+    confirmation = await screen.findByRole("dialog", { name: "Удалить сделку?" });
+    await user.click(within(confirmation).getByRole("button", { name: "Удалить сделку" }));
+
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Кофейня «Слой»" })).not.toBeInTheDocument());
+    expect(screen.queryByText("Кофейня «Слой»")).not.toBeInTheDocument();
+  });
+
+  it("disables conflicting deal controls while a versioned mutation is pending", async () => {
+    renderDrawer({ mutationPending: true });
+    const dialog = await screen.findByRole("dialog", { name: initialDeals[0].title });
+
+    expect(within(dialog).getByRole("combobox", { name: "Этап сделки" })).toBeDisabled();
+    expect(within(dialog).getByRole("button", { name: "Удалить сделку" })).toBeDisabled();
+    expect(within(dialog).getByRole("button", { name: "Изменить ответственного сделки" })).toBeDisabled();
+    expect(dialog).toHaveAttribute("aria-busy", "true");
+  });
+
+  it("shows a reconciled conflict message when the stage update fails", async () => {
+    const user = userEvent.setup();
+    const onMove = vi.fn().mockRejectedValue(new ApiError("conflict", 409, { detail: { code: "version_conflict" } }));
+    renderDrawer({ onMove });
+    const dialog = await screen.findByRole("dialog", { name: initialDeals[0].title });
+
+    const stage = within(dialog).getByRole("combobox", { name: "Этап сделки" });
+    const nextStage = demoPipeline.stages.find((item) => item.id !== initialDeals[0].stageId)!;
+    await user.selectOptions(stage, nextStage.id);
+
+    expect(await within(dialog).findByRole("alert")).toHaveTextContent("Данные обновлены — повторите действие");
+  });
+
+  it("keeps the specific conflict explanation in the assignee editor", async () => {
+    const user = userEvent.setup();
+    const onSetAssignee = vi.fn().mockRejectedValue(new ApiError("conflict", 409, { detail: { code: "version_conflict" } }));
+    renderDrawer({ onSetAssignee });
+    const dialog = await screen.findByRole("dialog", { name: initialDeals[0].title });
+    await user.click(within(dialog).getByRole("button", { name: "Изменить ответственного сделки" }));
+    const assignee = Object.values(demoUsers).find((item) => item.id !== initialDeals[0].assignee.id)!;
+    await user.selectOptions(within(dialog).getByRole("combobox", { name: "Ответственный сделки" }), assignee.id);
+    await user.click(within(dialog).getByRole("button", { name: "Сохранить ответственного сделки" }));
+
+    expect(await within(dialog).findByRole("alert")).toHaveTextContent("Данные обновлены — повторите действие");
+  });
+
+  it("keeps delete confirmation open and explains a version conflict", async () => {
+    const user = userEvent.setup();
+    const onDelete = vi.fn().mockRejectedValue(new ApiError("conflict", 409, { detail: { code: "version_conflict" } }));
+    renderDrawer({ onDelete });
+    const dealDialog = await screen.findByRole("dialog", { name: initialDeals[0].title });
+    await user.click(within(dealDialog).getByRole("button", { name: "Удалить сделку" }));
+    const confirmation = await screen.findByRole("dialog", { name: "Удалить сделку?" });
+    await user.click(within(confirmation).getByRole("button", { name: "Удалить сделку" }));
+
+    expect(await within(confirmation).findByRole("alert")).toHaveTextContent("Данные обновлены — повторите действие");
+    expect(screen.getByRole("dialog", { name: "Удалить сделку?" })).toBeInTheDocument();
+  });
+
+  it("makes the full-screen mobile drawer modal while desktop remains non-modal", async () => {
+    const user = userEvent.setup();
+    const mediaListeners = new Set<() => void>();
+    vi.stubGlobal("matchMedia", vi.fn().mockReturnValue({
+      matches: true,
+      media: "(max-width: 720px)",
+      onchange: null,
+      addEventListener: (_type: string, listener: () => void) => mediaListeners.add(listener),
+      removeEventListener: (_type: string, listener: () => void) => mediaListeners.delete(listener),
+      dispatchEvent: vi.fn(),
+    }));
+
+    const mobile = renderDrawer();
+    const mobileDrawer = await screen.findByRole("dialog", { name: initialDeals[0].title });
+    expect(mobile.container).toHaveAttribute("aria-hidden", "true");
+    await user.click(within(mobileDrawer).getByRole("button", { name: "Удалить сделку" }));
+    const confirmation = await screen.findByRole("dialog", { name: "Удалить сделку?" });
+    expect(confirmation).toContainElement(document.activeElement as HTMLElement);
+    expect(screen.queryByRole("dialog", { name: initialDeals[0].title })).not.toBeInTheDocument();
+    await user.click(within(confirmation).getByRole("button", { name: "Отмена" }));
+    expect(await screen.findByRole("dialog", { name: initialDeals[0].title })).toBeInTheDocument();
+    cleanup();
+
+    vi.stubGlobal("matchMedia", vi.fn().mockReturnValue({
+      matches: false,
+      media: "(max-width: 720px)",
+      onchange: null,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      dispatchEvent: vi.fn(),
+    }));
+    const desktop = renderDrawer();
+    await screen.findByRole("dialog", { name: initialDeals[0].title });
+    expect(desktop.container).not.toHaveAttribute("aria-hidden");
   });
 });

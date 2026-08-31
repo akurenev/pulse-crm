@@ -40,6 +40,7 @@ const realtimeEventTypes = [
   "deal.updated",
   "deal.stage_changed",
   "deal.assigned",
+  "deal.deleted",
   "lead.created",
   "message.inbound.received",
   "message.outbound.queued",

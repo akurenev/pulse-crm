@@ -12,8 +12,8 @@ import {
   type PropsWithChildren,
 } from "react";
 
-import { initialDeals, pipeline as demoPipeline } from "../data/demo";
-import { api, remoteEnabled } from "../lib/api";
+import { initialDeals, pipeline as demoPipeline, users as demoUsers } from "../data/demo";
+import { ApiError, api, remoteEnabled } from "../lib/api";
 import { normalizeDealTags } from "../lib/deal-tags";
 import type { ApiDeal, ApiMessage, ApiMessageWithAttachment, ApiPipeline, ApiSource, ApiTask, ApiUser, CursorPage } from "../types/api";
 import type { Deal, Message, Pipeline, SourceCode, Stage, UserSummary } from "../types/crm";
@@ -33,12 +33,15 @@ interface CrmStore {
   error: string | null;
   selectedDealId: string | null;
   selectedDeal: Deal | null;
+  selectedDealMutationPending: boolean;
+  dealAssignees: UserSummary[];
   selectDeal: (dealId: string | null) => void;
   selectPipeline: (pipelineId: string) => Promise<void>;
   moveDeal: (dealId: string, stageId: string) => Promise<void>;
   setNextPurchase: (dealId: string, date: string | null) => Promise<void>;
   setDealContact: (dealId: string, contact: { id: string; name: string; phone?: string; email?: string } | null) => Promise<void>;
   setDealCompany: (dealId: string, company: { id: string; name: string } | null) => Promise<void>;
+  setDealAssignee: (dealId: string, assignee: UserSummary | null) => Promise<void>;
   setDealTags: (dealId: string, tags: string[]) => Promise<void>;
   setDealSearch: (query: string) => void;
   setDealCustomFields: (dealId: string, fields: Record<string, unknown>) => Promise<void>;
@@ -49,12 +52,20 @@ interface CrmStore {
   loadStageDeals: (stageId: string) => Promise<void>;
   loadMoreDeals: (stageId: string) => Promise<void>;
   addDeal: (input: NewDealInput) => Promise<Deal>;
+  deleteDeal: (dealId: string) => Promise<void>;
   sendMessage: (dealId: string, body: string, attachment?: File) => Promise<void>;
   retryMessage: (dealId: string, messageId: string) => Promise<void>;
   toggleTask: (dealId: string, taskId: string) => Promise<void>;
 }
 
 const CrmContext = createContext<CrmStore | null>(null);
+
+export class DealMutationInProgressError extends Error {
+  constructor() {
+    super("Дождитесь завершения текущего изменения сделки");
+    this.name = "DealMutationInProgressError";
+  }
+}
 
 const sourceCodes = new Set<SourceCode>([
   "manual", "email", "telegram", "max", "webhook", "html_form", "amo_import",
@@ -166,19 +177,19 @@ function mapRemoteTasks(tasks: ApiTask[], loadedUsers: ApiUser[]): Deal["tasks"]
 export function CrmProvider({ children }: PropsWithChildren) {
   const [deals, setDeals] = useState<Deal[]>(() => remoteEnabled ? [] : initialDeals);
   const [pipeline, setPipeline] = useState<Pipeline>(demoPipeline);
-  const [pipelines, setPipelines] = useState<Pipeline[]>([demoPipeline]);
+  const [pipelines, setPipelines] = useState<Pipeline[]>(() => remoteEnabled ? [] : [demoPipeline]);
   const [loading, setLoading] = useState(remoteEnabled);
   const [error, setError] = useState<string | null>(null);
   const [sources, setSources] = useState<ApiSource[]>([]);
   const [users, setUsers] = useState<ApiUser[]>([]);
   const [nextCursorByStage, setNextCursorByStage] = useState<Record<string, string | null>>({});
-  const [loadedStageIds, setLoadedStageIds] = useState<Record<string, boolean>>(() =>
-    Object.fromEntries(
+  const [loadedStageIds, setLoadedStageIds] = useState<Record<string, boolean>>(() => remoteEnabled
+    ? {}
+    : Object.fromEntries(
       demoPipeline.stages
         .filter((stage) => stage.stageType !== "won" && stage.stageType !== "lost")
         .map((stage) => [stage.id, true]),
-    ),
-  );
+    ));
   const [stageLoadErrorByStage, setStageLoadErrorByStage] = useState<Record<string, string | null>>({});
   const [loadingStageId, setLoadingStageId] = useState<string | null>(null);
   const [selectedDealId, setSelectedDealId] = useState<string | null>(null);
@@ -186,12 +197,30 @@ export function CrmProvider({ children }: PropsWithChildren) {
   const [refreshTick, setRefreshTick] = useState(0);
   const [taskRefreshTick, setTaskRefreshTick] = useState(0);
   const [metadataRevision, setMetadataRevision] = useState(remoteEnabled ? 0 : 1);
+  const [pendingDealMutationIds, setPendingDealMutationIds] = useState<ReadonlySet<string>>(() => new Set());
   const hasLoaded = useRef(!remoteEnabled);
   const activePipelineId = useRef(remoteEnabled ? "" : demoPipeline.id);
   const activeDealSearch = useRef("");
   const dealRequestGeneration = useRef(0);
   const requestedFinalStageIds = useRef(new Set<string>());
   const tasksByDealRef = useRef(new Map<string, ApiTask[]>());
+  const dealMutationLocksRef = useRef(new Set<string>());
+
+  const runDealMutation = useCallback(async (dealId: string, mutation: () => Promise<void>) => {
+    if (dealMutationLocksRef.current.has(dealId)) throw new DealMutationInProgressError();
+    dealMutationLocksRef.current.add(dealId);
+    setPendingDealMutationIds((current) => new Set(current).add(dealId));
+    try {
+      await mutation();
+    } finally {
+      dealMutationLocksRef.current.delete(dealId);
+      setPendingDealMutationIds((current) => {
+        const next = new Set(current);
+        next.delete(dealId);
+        return next;
+      });
+    }
+  }, []);
 
   useEffect(() => {
     if (!remoteEnabled) return;
@@ -313,6 +342,72 @@ export function CrmProvider({ children }: PropsWithChildren) {
     () => deals.find((deal) => deal.id === selectedDealId) ?? null,
     [deals, selectedDealId],
   );
+  const selectedDealMutationPending = Boolean(
+    selectedDealId && pendingDealMutationIds.has(selectedDealId),
+  );
+  const dealAssignees = useMemo(
+    () => remoteEnabled ? users.map((user) => userSummary(user)) : Object.values(demoUsers),
+    [users],
+  );
+
+  const removeDealLocally = useCallback((dealId: string) => {
+    tasksByDealRef.current.delete(dealId);
+    setDeals((items) => items.filter((deal) => deal.id !== dealId));
+    setSelectedDealId((selected) => selected === dealId ? null : selected);
+  }, []);
+
+  const mergeRemoteDeal = useCallback((persisted: ApiDeal) => {
+    setDeals((items) => items.map((current) => {
+      if (current.id !== persisted.id) return current;
+      const mapped = mapRemoteDeal(
+        persisted,
+        pipeline.stages,
+        users,
+        sources,
+        tasksByDealRef.current.get(persisted.id) ?? [],
+      );
+      return { ...mapped, messages: current.messages, tasks: current.tasks };
+    }));
+  }, [pipeline.stages, sources, users]);
+
+  const reconcileDeal = useCallback(async (dealId: string) => {
+    try {
+      const persisted = await api.get<ApiDeal>(`/deals/${dealId}`);
+      mergeRemoteDeal(persisted);
+    } catch (reason) {
+      if (reason instanceof ApiError && reason.status === 404) {
+        removeDealLocally(dealId);
+        return;
+      }
+      window.dispatchEvent(new Event("pulse:refresh"));
+    }
+  }, [mergeRemoteDeal, removeDealLocally]);
+
+  const recoverVersionedDeal = useCallback(async (dealId: string, reason: unknown) => {
+    if (!(reason instanceof ApiError)) return;
+    if (reason.status === 404) {
+      removeDealLocally(dealId);
+      return;
+    }
+    if (reason.status === 409) await reconcileDeal(dealId);
+  }, [reconcileDeal, removeDealLocally]);
+
+  const persistDealPatch = useCallback(async (
+    dealId: string,
+    expectedVersion: number,
+    payload: Record<string, unknown>,
+  ) => {
+    try {
+      const persisted = await api.patch<ApiDeal>(`/deals/${dealId}`, {
+        expected_version: expectedVersion,
+        ...payload,
+      });
+      mergeRemoteDeal(persisted);
+    } catch (reason) {
+      await recoverVersionedDeal(dealId, reason);
+      throw reason;
+    }
+  }, [mergeRemoteDeal, recoverVersionedDeal]);
 
   useEffect(() => {
     if (!remoteEnabled || !selectedDealId) return;
@@ -450,28 +545,25 @@ export function CrmProvider({ children }: PropsWithChildren) {
   const moveDeal = useCallback(async (dealId: string, stageId: string) => {
     const current = deals.find((deal) => deal.id === dealId);
     if (!current || current.stageId === stageId) return;
-
-    setDeals((items) =>
-      items.map((deal) =>
-        deal.id === dealId ? { ...deal, stageId, version: deal.version + 1 } : deal,
-      ),
-    );
-
-    if (!remoteEnabled) return;
-
-    try {
-      const updated = await api.patch<ApiDeal>(`/deals/${dealId}/stage`, {
-        target_stage_id: stageId,
-        expected_version: current.version,
-      });
-      setDeals((items) => items.map((deal) => deal.id === dealId
-        ? { ...deal, stageId: updated.stage_id, version: updated.version }
-        : deal));
-    } catch (error) {
-      setDeals((items) => items.map((deal) => (deal.id === dealId ? current : deal)));
-      throw error;
-    }
-  }, [deals]);
+    await runDealMutation(dealId, async () => {
+      if (!remoteEnabled) {
+        setDeals((items) => items.map((deal) => deal.id === dealId
+          ? { ...deal, stageId, version: deal.version + 1 }
+          : deal));
+        return;
+      }
+      try {
+        const persisted = await api.patch<ApiDeal>(`/deals/${dealId}/stage`, {
+          target_stage_id: stageId,
+          expected_version: current.version,
+        });
+        mergeRemoteDeal(persisted);
+      } catch (reason) {
+        await recoverVersionedDeal(dealId, reason);
+        throw reason;
+      }
+    });
+  }, [deals, mergeRemoteDeal, recoverVersionedDeal, runDealMutation]);
 
   const setNextPurchase = useCallback(async (dealId: string, date: string | null) => {
     const current = deals.find((deal) => deal.id === dealId);
@@ -479,23 +571,16 @@ export function CrmProvider({ children }: PropsWithChildren) {
     const nextPurchaseAt = date
       ? new Date(`${date}T09:00:00`).toISOString()
       : undefined;
-    setDeals((items) => items.map((deal) => deal.id === dealId
-      ? { ...deal, nextPurchaseAt, version: deal.version + 1 }
-      : deal));
-    if (!remoteEnabled) return;
-    try {
-      const updated = await api.patch<ApiDeal>(`/deals/${dealId}`, {
-        expected_version: current.version,
-        next_purchase_at: nextPurchaseAt ?? null,
-      });
-      setDeals((items) => items.map((deal) => deal.id === dealId
-        ? { ...deal, nextPurchaseAt: updated.next_purchase_at ?? undefined, version: updated.version }
-        : deal));
-    } catch (reason) {
-      setDeals((items) => items.map((deal) => deal.id === dealId ? current : deal));
-      throw reason;
-    }
-  }, [deals]);
+    await runDealMutation(dealId, async () => {
+      if (!remoteEnabled) {
+        setDeals((items) => items.map((deal) => deal.id === dealId
+          ? { ...deal, nextPurchaseAt, version: deal.version + 1 }
+          : deal));
+        return;
+      }
+      await persistDealPatch(dealId, current.version, { next_purchase_at: nextPurchaseAt ?? null });
+    });
+  }, [deals, persistDealPatch, runDealMutation]);
 
   const setDealContact = useCallback(async (
     dealId: string,
@@ -503,29 +588,21 @@ export function CrmProvider({ children }: PropsWithChildren) {
   ) => {
     const current = deals.find((deal) => deal.id === dealId);
     if (!current) return;
-    const optimistic = {
-      ...current,
-      contactIds: contact ? [contact.id] : [],
-      contactName: contact?.name,
-      phone: contact?.phone,
-      email: contact?.email,
-      version: current.version + 1,
-    };
-    setDeals((items) => items.map((deal) => deal.id === dealId ? optimistic : deal));
-    if (!remoteEnabled) return;
-    try {
-      const updated = await api.patch<ApiDeal>(`/deals/${dealId}`, {
-        expected_version: current.version,
-        contact_ids: contact ? [contact.id] : [],
-      });
-      setDeals((items) => items.map((deal) => deal.id === dealId
-        ? { ...optimistic, contactIds: updated.contact_ids, version: updated.version }
-        : deal));
-    } catch (reason) {
-      setDeals((items) => items.map((deal) => deal.id === dealId ? current : deal));
-      throw reason;
-    }
-  }, [deals]);
+    await runDealMutation(dealId, async () => {
+      if (!remoteEnabled) {
+        setDeals((items) => items.map((deal) => deal.id === dealId ? {
+          ...deal,
+          contactIds: contact ? [contact.id] : [],
+          contactName: contact?.name,
+          phone: contact?.phone,
+          email: contact?.email,
+          version: deal.version + 1,
+        } : deal));
+        return;
+      }
+      await persistDealPatch(dealId, current.version, { contact_ids: contact ? [contact.id] : [] });
+    });
+  }, [deals, persistDealPatch, runDealMutation]);
 
   const setDealCompany = useCallback(async (
     dealId: string,
@@ -533,48 +610,48 @@ export function CrmProvider({ children }: PropsWithChildren) {
   ) => {
     const current = deals.find((deal) => deal.id === dealId);
     if (!current) return;
-    const optimistic = {
-      ...current,
-      companyId: company?.id,
-      companyName: company?.name,
-      version: current.version + 1,
-    };
-    setDeals((items) => items.map((deal) => deal.id === dealId ? optimistic : deal));
-    if (!remoteEnabled) return;
-    try {
-      const updated = await api.patch<ApiDeal>(`/deals/${dealId}`, {
-        expected_version: current.version,
-        company_id: company?.id ?? null,
-      });
-      setDeals((items) => items.map((deal) => deal.id === dealId
-        ? { ...optimistic, companyId: updated.company_id ?? undefined, companyName: updated.company?.name, version: updated.version }
-        : deal));
-    } catch (reason) {
-      setDeals((items) => items.map((deal) => deal.id === dealId ? current : deal));
-      throw reason;
-    }
-  }, [deals]);
+    await runDealMutation(dealId, async () => {
+      if (!remoteEnabled) {
+        setDeals((items) => items.map((deal) => deal.id === dealId ? {
+          ...deal,
+          companyId: company?.id,
+          companyName: company?.name,
+          version: deal.version + 1,
+        } : deal));
+        return;
+      }
+      await persistDealPatch(dealId, current.version, { company_id: company?.id ?? null });
+    });
+  }, [deals, persistDealPatch, runDealMutation]);
+
+  const setDealAssignee = useCallback(async (dealId: string, assignee: UserSummary | null) => {
+    const current = deals.find((deal) => deal.id === dealId);
+    if (!current) return;
+    await runDealMutation(dealId, async () => {
+      if (!remoteEnabled) {
+        setDeals((items) => items.map((deal) => deal.id === dealId
+          ? { ...deal, assignee: assignee ?? userSummary(undefined), version: deal.version + 1 }
+          : deal));
+        return;
+      }
+      await persistDealPatch(dealId, current.version, { assignee_id: assignee?.id ?? null });
+    });
+  }, [deals, persistDealPatch, runDealMutation]);
 
   const setDealTags = useCallback(async (dealId: string, tags: string[]) => {
     const current = deals.find((deal) => deal.id === dealId);
     if (!current) return;
     const normalizedTags = normalizeDealTags(tags);
-    const optimistic = { ...current, tags: normalizedTags, version: current.version + 1 };
-    setDeals((items) => items.map((deal) => deal.id === dealId ? optimistic : deal));
-    if (!remoteEnabled) return;
-    try {
-      const updated = await api.patch<ApiDeal>(`/deals/${dealId}`, {
-        expected_version: current.version,
-        tags: normalizedTags,
-      });
-      setDeals((items) => items.map((deal) => deal.id === dealId
-        ? { ...optimistic, tags: updated.tags, version: updated.version }
-        : deal));
-    } catch (reason) {
-      setDeals((items) => items.map((deal) => deal.id === dealId ? current : deal));
-      throw reason;
-    }
-  }, [deals]);
+    await runDealMutation(dealId, async () => {
+      if (!remoteEnabled) {
+        setDeals((items) => items.map((deal) => deal.id === dealId
+          ? { ...deal, tags: normalizedTags, version: deal.version + 1 }
+          : deal));
+        return;
+      }
+      await persistDealPatch(dealId, current.version, { tags: normalizedTags });
+    });
+  }, [deals, persistDealPatch, runDealMutation]);
 
   const setDealCustomFields = useCallback(async (
     dealId: string,
@@ -582,22 +659,16 @@ export function CrmProvider({ children }: PropsWithChildren) {
   ) => {
     const current = deals.find((deal) => deal.id === dealId);
     if (!current) return;
-    const optimistic = { ...current, customFields: fields, version: current.version + 1 };
-    setDeals((items) => items.map((deal) => deal.id === dealId ? optimistic : deal));
-    if (!remoteEnabled) return;
-    try {
-      const updated = await api.patch<ApiDeal>(`/deals/${dealId}`, {
-        expected_version: current.version,
-        custom_fields: fields,
-      });
-      setDeals((items) => items.map((deal) => deal.id === dealId
-        ? { ...optimistic, customFields: updated.custom_fields, version: updated.version }
-        : deal));
-    } catch (reason) {
-      setDeals((items) => items.map((deal) => deal.id === dealId ? current : deal));
-      throw reason;
-    }
-  }, [deals]);
+    await runDealMutation(dealId, async () => {
+      if (!remoteEnabled) {
+        setDeals((items) => items.map((deal) => deal.id === dealId
+          ? { ...deal, customFields: fields, version: deal.version + 1 }
+          : deal));
+        return;
+      }
+      await persistDealPatch(dealId, current.version, { custom_fields: fields });
+    });
+  }, [deals, persistDealPatch, runDealMutation]);
 
   const addDeal = useCallback(async (input: NewDealInput) => {
     const sourceLabels: Record<SourceCode, string> = {
@@ -659,6 +730,26 @@ export function CrmProvider({ children }: PropsWithChildren) {
       throw error;
     }
   }, [pipeline, sources]);
+
+  const deleteDeal = useCallback(async (dealId: string) => {
+    const current = deals.find((deal) => deal.id === dealId);
+    if (!current) return;
+    await runDealMutation(dealId, async () => {
+      if (remoteEnabled) {
+        try {
+          await api.delete(`/deals/${dealId}?expected_version=${current.version}`);
+        } catch (reason) {
+          if (reason instanceof ApiError && reason.status === 404) {
+            removeDealLocally(dealId);
+            return;
+          }
+          await recoverVersionedDeal(dealId, reason);
+          throw reason;
+        }
+      }
+      removeDealLocally(dealId);
+    });
+  }, [deals, recoverVersionedDeal, removeDealLocally, runDealMutation]);
 
   const sendMessage = useCallback(async (dealId: string, body: string, attachment?: File) => {
     const message: Message = {
@@ -794,12 +885,15 @@ export function CrmProvider({ children }: PropsWithChildren) {
       error,
       selectedDealId,
       selectedDeal,
+      selectedDealMutationPending,
+      dealAssignees,
       selectDeal,
       selectPipeline,
       moveDeal,
       setNextPurchase,
       setDealContact,
       setDealCompany,
+      setDealAssignee,
       setDealTags,
       setDealSearch,
       setDealCustomFields,
@@ -810,11 +904,12 @@ export function CrmProvider({ children }: PropsWithChildren) {
       loadStageDeals,
       loadMoreDeals,
       addDeal,
+      deleteDeal,
       sendMessage,
       retryMessage,
       toggleTask,
     }),
-    [addDeal, deals, error, loadMoreDeals, loadStageDeals, loadedStageIds, loading, loadingStageId, moveDeal, nextCursorByStage, pipeline, pipelines, retryMessage, selectDeal, selectPipeline, selectedDeal, selectedDealId, sendMessage, setDealCompany, setDealContact, setDealCustomFields, setDealSearch, setDealTags, setNextPurchase, stageLoadErrorByStage, toggleTask],
+    [addDeal, dealAssignees, deals, deleteDeal, error, loadMoreDeals, loadStageDeals, loadedStageIds, loading, loadingStageId, moveDeal, nextCursorByStage, pipeline, pipelines, retryMessage, selectDeal, selectPipeline, selectedDeal, selectedDealId, selectedDealMutationPending, sendMessage, setDealAssignee, setDealCompany, setDealContact, setDealCustomFields, setDealSearch, setDealTags, setNextPurchase, stageLoadErrorByStage, toggleTask],
   );
 
   return <CrmContext.Provider value={value}>{children}</CrmContext.Provider>;

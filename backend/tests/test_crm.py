@@ -16,21 +16,31 @@ from app.integrations.models import (
     ExternalIdentity,
     Form,
     NotificationAudience,
+    NotificationDelivery,
     NotificationRule,
     NotificationTemplate,
     PurchaseSchedule,
     PurchaseScheduleStatus,
     WebhookEndpoint,
 )
+from app.integrations.purchases import ensure_purchase_task
 from app.models import (
     ActivityEvent,
+    BackgroundJob,
     Contact,
     CustomFieldDefinition,
+    Deal,
+    DeliveryStatus,
+    JobStatus,
+    Membership,
     OutboxEvent,
     Pipeline,
     RealtimeEvent,
+    Role,
     Stage,
     Task,
+    TaskStatus,
+    User,
     Workspace,
 )
 
@@ -676,6 +686,478 @@ async def test_deal_tags_round_trip_through_create_list_get_and_update(
     )
     assert updated.status_code == 200, updated.text
     assert updated.json()["tags"] == ["priority"]
+
+
+@pytest.mark.asyncio
+async def test_deal_assignee_update_is_versioned_and_workspace_scoped(
+    client: httpx.AsyncClient, owner_auth: dict[str, object]
+) -> None:
+    headers = csrf(owner_auth)
+    workspace_id = as_uuid(owner_auth["workspace"]["id"])
+    assignee = User(
+        email="deal-assignee@example.com",
+        full_name="Deal Assignee",
+        password_hash="not-used",
+    )
+    outsider = User(
+        email="deal-outsider@example.com",
+        full_name="Deal Outsider",
+        password_hash="not-used",
+    )
+    async with SessionLocal() as db:
+        db.add_all([assignee, outsider])
+        await db.flush()
+        db.add(
+            Membership(
+                workspace_id=workspace_id,
+                user_id=assignee.id,
+                role=Role.manager,
+            )
+        )
+        await db.commit()
+        assignee_id = assignee.id
+        outsider_id = outsider.id
+
+    pipeline = (await client.get("/api/v1/pipelines")).json()[0]
+    created = await client.post(
+        "/api/v1/deals",
+        headers=headers,
+        json={
+            "title": "Assigned deal",
+            "pipeline_id": pipeline["id"],
+            "stage_id": pipeline["stages"][0]["id"],
+            "next_purchase_at": (datetime.now(UTC) + timedelta(days=10)).isoformat(),
+        },
+    )
+    assert created.status_code == 201, created.text
+    deal = created.json()
+    deal_id = as_uuid(deal["id"])
+    async with SessionLocal() as db:
+        original_schedule = await db.scalar(
+            sa.select(PurchaseSchedule).where(
+                PurchaseSchedule.workspace_id == workspace_id,
+                PurchaseSchedule.deal_id == deal_id,
+                PurchaseSchedule.status == PurchaseScheduleStatus.active,
+            )
+        )
+        assert original_schedule is not None
+        original_schedule_id = original_schedule.id
+        materialized = await ensure_purchase_task(
+            db,
+            workspace_id=workspace_id,
+            schedule_id=original_schedule.id,
+        )
+        materialized_task_id = materialized.task.id
+        materialized_task_version = materialized.task.version
+        materialized_task_updated_at = materialized.task.updated_at
+        await db.commit()
+
+    assigned = await client.patch(
+        f"/api/v1/deals/{deal['id']}",
+        headers=headers,
+        json={"expected_version": deal["version"], "assignee_id": str(assignee_id)},
+    )
+    assert assigned.status_code == 200, assigned.text
+    assert assigned.json()["assignee_id"] == str(assignee_id)
+    assert assigned.json()["version"] == deal["version"] + 1
+
+    rejected = await client.patch(
+        f"/api/v1/deals/{deal['id']}",
+        headers=headers,
+        json={
+            "expected_version": assigned.json()["version"],
+            "assignee_id": str(outsider_id),
+        },
+    )
+    assert rejected.status_code == 404
+
+    async with SessionLocal() as db:
+        stored = await db.get(Deal, deal_id)
+        assert stored is not None
+        assert stored.assignee_id == assignee_id
+        assert stored.version == assigned.json()["version"]
+        schedule = await db.scalar(
+            sa.select(PurchaseSchedule).where(
+                PurchaseSchedule.workspace_id == workspace_id,
+                PurchaseSchedule.deal_id == deal_id,
+                PurchaseSchedule.status == PurchaseScheduleStatus.active,
+            )
+        )
+        assert schedule is not None
+        assert schedule.id == original_schedule_id
+        assert schedule.assignee_id == assignee_id
+        materialized_task = await db.get(Task, materialized_task_id)
+        assert materialized_task is not None
+        assert materialized_task.status is TaskStatus.open
+        assert materialized_task.assignee_id == assignee_id
+        assert materialized_task.version == materialized_task_version + 1
+        assert materialized_task.updated_at != materialized_task_updated_at
+        assigned_event = await db.scalar(
+            sa.select(ActivityEvent).where(
+                ActivityEvent.workspace_id == workspace_id,
+                ActivityEvent.entity_id == deal_id,
+                ActivityEvent.event_type == "deal.assigned",
+            )
+        )
+        assert assigned_event is not None
+        assert assigned_event.payload["assignee_id"] == str(assignee_id)
+        task_event = await db.scalar(
+            sa.select(ActivityEvent).where(
+                ActivityEvent.workspace_id == workspace_id,
+                ActivityEvent.entity_id == materialized_task_id,
+                ActivityEvent.event_type == "task.updated",
+            )
+        )
+        assert task_event is not None
+        assert task_event.payload == {
+            "fields": ["assignee_id"],
+            "deal_id": str(deal_id),
+        }
+        assert (
+            await db.scalar(
+                sa.select(sa.func.count())
+                .select_from(OutboxEvent)
+                .where(
+                    OutboxEvent.workspace_id == workspace_id,
+                    OutboxEvent.aggregate_id == materialized_task_id,
+                    OutboxEvent.event_type == "task.updated",
+                )
+            )
+            == 1
+        )
+        task_realtime = await db.scalar(
+            sa.select(RealtimeEvent).where(
+                RealtimeEvent.workspace_id == workspace_id,
+                RealtimeEvent.event_type == "task.updated",
+            )
+        )
+        assert task_realtime is not None
+        assert task_realtime.payload["entity_id"] == str(materialized_task_id)
+
+
+@pytest.mark.asyncio
+async def test_deal_soft_delete_is_versioned_and_cancels_purchase_schedule(
+    client: httpx.AsyncClient, owner_auth: dict[str, object]
+) -> None:
+    headers = csrf(owner_auth)
+    workspace_id = as_uuid(owner_auth["workspace"]["id"])
+    owner_id = as_uuid(owner_auth["user"]["id"])
+    pipeline = (await client.get("/api/v1/pipelines")).json()[0]
+    created = await client.post(
+        "/api/v1/deals",
+        headers=headers,
+        json={
+            "title": "Disposable deal",
+            "pipeline_id": pipeline["id"],
+            "stage_id": pipeline["stages"][0]["id"],
+            "next_purchase_at": (datetime.now(UTC) + timedelta(days=10)).isoformat(),
+        },
+    )
+    assert created.status_code == 201, created.text
+    deal = created.json()
+    deal_id = as_uuid(deal["id"])
+
+    async with SessionLocal() as db:
+        schedule = await db.scalar(
+            sa.select(PurchaseSchedule).where(
+                PurchaseSchedule.workspace_id == workspace_id,
+                PurchaseSchedule.deal_id == deal_id,
+                PurchaseSchedule.status == PurchaseScheduleStatus.active,
+            )
+        )
+        assert schedule is not None
+        schedule_id = schedule.id
+        materialized = await ensure_purchase_task(
+            db,
+            workspace_id=workspace_id,
+            schedule_id=schedule.id,
+        )
+        task = materialized.task
+        task_id = task.id
+        task_version = task.version
+        task_updated_at = task.updated_at
+        reminder = OutboxEvent(
+            workspace_id=workspace_id,
+            event_type="purchase.due_soon",
+            aggregate_type="purchase_schedule",
+            aggregate_id=schedule.id,
+            payload={"deal_id": str(deal_id)},
+        )
+        pending_task_due = OutboxEvent(
+            workspace_id=workspace_id,
+            event_type="task.due_soon",
+            aggregate_type="task",
+            aggregate_id=task.id,
+            payload={"task_id": str(task.id)},
+        )
+        pending_task_overdue = OutboxEvent(
+            workspace_id=workspace_id,
+            event_type="task.overdue",
+            aggregate_type="task",
+            aggregate_id=task.id,
+            payload={"task_id": str(task.id)},
+        )
+        expanded_task_due = OutboxEvent(
+            workspace_id=workspace_id,
+            event_type="task.due_soon",
+            aggregate_type="task",
+            aggregate_id=task.id,
+            payload={"task_id": str(task.id)},
+            processed_at=datetime.now(UTC),
+        )
+        db.add_all([reminder, pending_task_due, pending_task_overdue, expanded_task_due])
+        await db.flush()
+        notification = NotificationDelivery(
+            workspace_id=workspace_id,
+            audience=NotificationAudience.employee,
+            channel="in_app",
+            recipient_id=owner_id,
+            recipient_address=str(owner_id),
+            subject="Task reminder",
+            body="Task is due",
+            status=DeliveryStatus.pending,
+            dedupe_key=f"rule:test:event:{expanded_task_due.id}:recipient:0",
+            scheduled_at=datetime.now(UTC) + timedelta(hours=1),
+        )
+        db.add(notification)
+        await db.flush()
+        notification_outbox = OutboxEvent(
+            workspace_id=workspace_id,
+            event_type="notification.delivery.queued",
+            aggregate_type="notification_delivery",
+            aggregate_id=notification.id,
+            payload={"delivery_id": str(notification.id)},
+        )
+        db.add(notification_outbox)
+        await db.flush()
+        jobs = [
+            BackgroundJob(
+                workspace_id=workspace_id,
+                job_type="monitor.task.due",
+                payload={"task_id": str(task.id)},
+                status=JobStatus.queued,
+                dedupe_key=f"monitor.task.due:{task.id}:{task.remind_at.isoformat()}",
+            ),
+            BackgroundJob(
+                workspace_id=workspace_id,
+                job_type="monitor.task.overdue",
+                payload={"task_id": str(task.id)},
+                status=JobStatus.queued,
+                dedupe_key=f"monitor.task.overdue:{task.id}:{task.due_at.isoformat()}",
+            ),
+            BackgroundJob(
+                workspace_id=workspace_id,
+                job_type="notification.expand",
+                payload={"outbox_event_id": str(expanded_task_due.id)},
+                status=JobStatus.queued,
+                dedupe_key=f"outbox:{expanded_task_due.id}:notifications",
+            ),
+            BackgroundJob(
+                workspace_id=workspace_id,
+                job_type="notification.deliver",
+                payload={"notification_delivery_id": str(notification.id)},
+                status=JobStatus.queued,
+                dedupe_key=f"notification-delivery:{notification.id}:send",
+            ),
+            BackgroundJob(
+                workspace_id=workspace_id,
+                job_type="outbox.dispatch",
+                payload={"outbox_event_id": str(notification_outbox.id)},
+                status=JobStatus.queued,
+                dedupe_key=f"outbox:{notification_outbox.id}:dispatch",
+            ),
+        ]
+        db.add_all(jobs)
+        await db.commit()
+        reminder_id = reminder.id
+        pending_task_event_ids = [pending_task_due.id, pending_task_overdue.id]
+        notification_id = notification.id
+        notification_outbox_id = notification_outbox.id
+        job_ids = [job.id for job in jobs]
+
+    stale = await client.delete(
+        f"/api/v1/deals/{deal['id']}",
+        headers=headers,
+        params={"expected_version": deal["version"] + 1},
+    )
+    assert stale.status_code == 409
+    assert stale.json()["detail"]["code"] == "version_conflict"
+
+    deleted = await client.delete(
+        f"/api/v1/deals/{deal['id']}",
+        headers=headers,
+        params={"expected_version": deal["version"]},
+    )
+    assert deleted.status_code == 204, deleted.text
+    assert (await client.get(f"/api/v1/deals/{deal['id']}")).status_code == 404
+    listed = await client.get("/api/v1/deals", params={"pipeline_id": pipeline["id"]})
+    assert listed.status_code == 200
+    assert deal["id"] not in {item["id"] for item in listed.json()["items"]}
+    repeated = await client.delete(
+        f"/api/v1/deals/{deal['id']}",
+        headers=headers,
+        params={"expected_version": deal["version"] + 1},
+    )
+    assert repeated.status_code == 404
+
+    async with SessionLocal() as db:
+        stored = await db.get(Deal, deal_id)
+        assert stored is not None
+        assert stored.deleted_at is not None
+        assert stored.version == deal["version"] + 1
+        cancelled_schedule = await db.get(PurchaseSchedule, schedule_id)
+        assert cancelled_schedule is not None
+        assert cancelled_schedule.status is PurchaseScheduleStatus.cancelled
+        assert cancelled_schedule.completed_at is not None
+        cancelled_task = await db.get(Task, task_id)
+        assert cancelled_task is not None
+        assert cancelled_task.status is TaskStatus.cancelled
+        assert cancelled_task.completed_at is None
+        assert cancelled_task.version == task_version + 1
+        assert cancelled_task.updated_at != task_updated_at
+        processed_reminder = await db.get(OutboxEvent, reminder_id)
+        assert processed_reminder is not None
+        assert processed_reminder.processed_at is not None
+        pending_task_events = list(
+            (
+                await db.scalars(
+                    sa.select(OutboxEvent).where(OutboxEvent.id.in_(pending_task_event_ids))
+                )
+            ).all()
+        )
+        assert len(pending_task_events) == 2
+        assert all(event.processed_at is not None for event in pending_task_events)
+        cancelled_notification = await db.get(NotificationDelivery, notification_id)
+        assert cancelled_notification is not None
+        assert cancelled_notification.status is DeliveryStatus.failed
+        assert cancelled_notification.last_error == (
+            "source task cancelled because its deal was deleted"
+        )
+        processed_notification_outbox = await db.get(OutboxEvent, notification_outbox_id)
+        assert processed_notification_outbox is not None
+        assert processed_notification_outbox.processed_at is not None
+        cancelled_jobs = list(
+            (
+                await db.scalars(sa.select(BackgroundJob).where(BackgroundJob.id.in_(job_ids)))
+            ).all()
+        )
+        assert len(cancelled_jobs) == len(job_ids)
+        assert all(job.status is JobStatus.succeeded for job in cancelled_jobs)
+        task_cancelled_event = await db.scalar(
+            sa.select(ActivityEvent).where(
+                ActivityEvent.workspace_id == workspace_id,
+                ActivityEvent.entity_id == task_id,
+                ActivityEvent.event_type == "task.updated",
+            )
+        )
+        assert task_cancelled_event is not None
+        assert task_cancelled_event.payload == {
+            "fields": ["status"],
+            "deal_id": str(deal_id),
+        }
+        assert (
+            await db.scalar(
+                sa.select(sa.func.count())
+                .select_from(OutboxEvent)
+                .where(
+                    OutboxEvent.workspace_id == workspace_id,
+                    OutboxEvent.aggregate_id == task_id,
+                    OutboxEvent.event_type == "task.updated",
+                )
+            )
+            == 1
+        )
+        task_realtime = await db.scalar(
+            sa.select(RealtimeEvent).where(
+                RealtimeEvent.workspace_id == workspace_id,
+                RealtimeEvent.event_type == "task.updated",
+            )
+        )
+        assert task_realtime is not None
+        assert task_realtime.payload["entity_id"] == str(task_id)
+        assert (
+            await db.scalar(
+                sa.select(sa.func.count())
+                .select_from(ActivityEvent)
+                .where(
+                    ActivityEvent.workspace_id == workspace_id,
+                    ActivityEvent.entity_id == deal_id,
+                    ActivityEvent.event_type == "deal.deleted",
+                )
+            )
+            == 1
+        )
+        assert (
+            await db.scalar(
+                sa.select(sa.func.count())
+                .select_from(OutboxEvent)
+                .where(
+                    OutboxEvent.workspace_id == workspace_id,
+                    OutboxEvent.aggregate_id == deal_id,
+                    OutboxEvent.event_type == "deal.deleted",
+                )
+            )
+            == 1
+        )
+        assert (
+            await db.scalar(
+                sa.select(sa.func.count())
+                .select_from(RealtimeEvent)
+                .where(
+                    RealtimeEvent.workspace_id == workspace_id,
+                    RealtimeEvent.event_type == "deal.deleted",
+                )
+            )
+            == 1
+        )
+
+
+@pytest.mark.asyncio
+async def test_deal_delete_is_workspace_scoped(
+    client: httpx.AsyncClient, owner_auth: dict[str, object]
+) -> None:
+    headers = csrf(owner_auth)
+    async with SessionLocal() as db:
+        other_workspace = Workspace(name="Other deal workspace", slug="other-deal-workspace")
+        db.add(other_workspace)
+        await db.flush()
+        other_pipeline = Pipeline(
+            workspace_id=other_workspace.id,
+            name="Other pipeline",
+            position=0,
+        )
+        db.add(other_pipeline)
+        await db.flush()
+        other_stage = Stage(
+            workspace_id=other_workspace.id,
+            pipeline_id=other_pipeline.id,
+            name="Other stage",
+            position=0,
+        )
+        db.add(other_stage)
+        await db.flush()
+        other_deal = Deal(
+            workspace_id=other_workspace.id,
+            pipeline_id=other_pipeline.id,
+            stage_id=other_stage.id,
+            title="Other deal",
+        )
+        db.add(other_deal)
+        await db.commit()
+        other_deal_id = other_deal.id
+
+    response = await client.delete(
+        f"/api/v1/deals/{other_deal_id}",
+        headers=headers,
+        params={"expected_version": 1},
+    )
+    assert response.status_code == 404
+
+    async with SessionLocal() as db:
+        stored = await db.get(Deal, other_deal_id)
+        assert stored is not None
+        assert stored.deleted_at is None
+        assert stored.version == 1
 
 
 @pytest.mark.asyncio

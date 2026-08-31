@@ -29,7 +29,7 @@ import {
   Webhook,
   X,
 } from "lucide-react";
-import { useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
+import { useEffect, useId, useMemo, useRef, useState, type FormEvent, type MouseEvent as ReactMouseEvent, type ReactNode } from "react";
 
 import { Button } from "../components/Button";
 import { contacts as demoContacts } from "../data/demo";
@@ -107,7 +107,7 @@ function demoRule(name: string, eventType: string, channel: ApiNotificationChann
 }
 
 export default function SettingsPage() {
-  const { pipeline, deals, loading } = useCrm();
+  const { pipeline, pipelines, deals, loading } = useCrm();
   return (
     <div className="page settings-page">
       <header className="page-header"><div><h1>Настройки</h1><p>Воронки, поля, каналы, уведомления и импорт</p></div></header>
@@ -122,8 +122,8 @@ export default function SettingsPage() {
         <div className="settings-content">
           <Tabs.Content value="pipelines"><PipelinesPanel currentPipeline={pipeline} dealsCount={deals.length} /></Tabs.Content>
           <Tabs.Content value="users"><InviteUsersPanel /></Tabs.Content>
-          <Tabs.Content value="channels"><ChannelsPanel pipeline={pipeline} routingLoading={loading} /></Tabs.Content>
-          <Tabs.Content value="notifications"><NotificationsPanel pipeline={pipeline} /></Tabs.Content>
+          <Tabs.Content value="channels"><ChannelsPanel pipelines={pipelines} currentPipelineId={pipeline.id} routingLoading={loading} /></Tabs.Content>
+          <Tabs.Content value="notifications"><NotificationsPanel pipelines={pipelines} /></Tabs.Content>
           <Tabs.Content value="import"><ImportPanel /></Tabs.Content>
         </div>
       </Tabs.Root>
@@ -553,7 +553,7 @@ function RequiredFieldsForm({ pipelineName, stage, customFields, initialFields, 
   );
 }
 
-function ChannelsPanel({ pipeline, routingLoading }: { pipeline: Pipeline; routingLoading: boolean }) {
+export function ChannelsPanel({ pipelines, currentPipelineId, routingLoading, requireLoadedRouting = remoteEnabled }: { pipelines: Pipeline[]; currentPipelineId: string; routingLoading: boolean; requireLoadedRouting?: boolean }) {
   const [editor, setEditor] = useState<"channel" | "webhook" | "form" | null>(null);
   const [localChannels, setLocalChannels] = useState(demoChannels);
   const [localWebhooks, setLocalWebhooks] = useState(demoWebhooks);
@@ -566,36 +566,60 @@ function ChannelsPanel({ pipeline, routingLoading }: { pipeline: Pipeline; routi
   const forms = remoteEnabled ? formsQuery.data ?? [] : localForms;
   const webhooks = remoteEnabled ? webhooksQuery.data ?? [] : localWebhooks;
   const loadFailed = channelsQuery.isError || formsQuery.isError || webhooksQuery.isError;
+  const routingState = !requireLoadedRouting ? "ready" : routingLoading ? "loading" : pipelines.length ? "ready" : "empty";
+  const routingDisabled = routingState !== "ready";
+  const returnFocusRef = useRef<HTMLButtonElement | null>(null);
+
+  function restoreTriggerFocus() {
+    window.setTimeout(() => returnFocusRef.current?.focus(), 0);
+  }
+
+  function closeEditor() {
+    setEditor(null);
+    restoreTriggerFocus();
+  }
+
+  function toggleEditor(kind: "channel" | "webhook" | "form", event: ReactMouseEvent<HTMLButtonElement>) {
+    if (routingDisabled) return;
+    returnFocusRef.current = event.currentTarget;
+    if (editor === kind) {
+      closeEditor();
+      return;
+    }
+    setEditor(kind);
+  }
 
   async function createdChannel(created: ApiChannelConnection) {
     if (remoteEnabled) await channelsQuery.refetch(); else setLocalChannels((items) => [created, ...items]);
-    setEditor(null);
+    closeEditor();
   }
   async function createdWebhook(created: ApiWebhookEndpointCreated) {
     if (remoteEnabled) await webhooksQuery.refetch(); else setLocalWebhooks((items) => [created, ...items]);
     setWebhookSecret(created);
-    setEditor(null);
+    closeEditor();
   }
   async function createdForm(created: ApiHtmlForm) {
     if (remoteEnabled) await formsQuery.refetch(); else setLocalForms((items) => [created, ...items]);
-    setEditor(null);
+    closeEditor();
   }
 
   return (
     <>
-      <SettingsHeading title="Общие каналы компании" action="Подключить канал" onAction={() => setEditor((current) => current === "channel" ? null : "channel")} />
+      <SettingsHeading title="Общие каналы компании" action="Подключить канал" actionControls="channel-editor" actionExpanded={editor === "channel"} actionDisabled={routingDisabled} mobileFab onAction={(event) => toggleEditor("channel", event)} />
+      <button type="button" className="mobile-fab settings-panel__mobile-add" aria-label="Добавить канал" aria-controls="channel-editor" aria-expanded={editor === "channel"} hidden={editor !== null} disabled={routingDisabled} onClick={(event) => toggleEditor("channel", event)}><Plus size={26} aria-hidden="true" /></button>
       <div className="settings-quick-actions" aria-label="Добавить источник">
-        <Button compact onClick={() => setEditor((current) => current === "webhook" ? null : "webhook")}><Webhook size={16} /> Webhook</Button>
-        <Button compact onClick={() => setEditor((current) => current === "form" ? null : "form")}><Code2 size={16} /> HTML-форма</Button>
+        <Button compact disabled={routingDisabled} aria-controls="webhook-editor" aria-expanded={editor === "webhook"} onClick={(event) => toggleEditor("webhook", event)}><Webhook size={16} /> Webhook</Button>
+        <Button compact disabled={routingDisabled} aria-controls="html-form-editor" aria-expanded={editor === "form"} onClick={(event) => toggleEditor("form", event)}><Code2 size={16} /> HTML-форма</Button>
       </div>
-      {routingLoading && remoteEnabled ? <SettingsNotice tone="neutral">Загружаем маршруты воронки…</SettingsNotice> : null}
+      {routingState === "loading" ? <SettingsNotice tone="neutral">Загружаем доступные воронки и этапы. Добавление источника станет доступно после загрузки.</SettingsNotice> : null}
+      {routingState === "empty" ? <SettingsNotice tone="error">Нет доступных воронок. Создайте активную воронку с рабочим этапом и повторите попытку.</SettingsNotice> : null}
       {loadFailed ? <SettingsNotice tone="error">Не удалось загрузить часть подключений. Обновите страницу или проверьте доступ администратора.</SettingsNotice> : null}
-      {editor === "channel" ? <ChannelEditor pipeline={pipeline} onCancel={() => setEditor(null)} onCreated={createdChannel} /> : null}
-      {editor === "webhook" ? <WebhookEditor pipeline={pipeline} onCancel={() => setEditor(null)} onCreated={createdWebhook} /> : null}
-      {editor === "form" ? <HtmlFormEditor pipeline={pipeline} onCancel={() => setEditor(null)} onCreated={createdForm} /> : null}
+      {editor === "channel" ? <ChannelEditor pipelines={pipelines} defaultPipelineId={currentPipelineId} routingDisabled={routingDisabled} onCancel={closeEditor} onCreated={createdChannel} /> : null}
+      {editor === "webhook" ? <WebhookEditor pipelines={pipelines} defaultPipelineId={currentPipelineId} routingDisabled={routingDisabled} onCancel={closeEditor} onCreated={createdWebhook} /> : null}
+      {editor === "form" ? <HtmlFormEditor pipelines={pipelines} defaultPipelineId={currentPipelineId} routingDisabled={routingDisabled} onCancel={closeEditor} onCreated={createdForm} /> : null}
       {webhookSecret ? <WebhookSecret result={webhookSecret} onClose={() => setWebhookSecret(null)} /> : null}
       <section className="channel-list" aria-label="Подключённые источники">
-        {channels.map((channel) => <div className="channel-row" key={channel.id}><span className="channel-icon">{channel.kind === "email" ? <Mail size={20} /> : <Bot size={20} />}</span><span><strong>{channel.name}</strong><small>{channelLabel(channel.kind)} · {routeLabel(channel.default_stage_id, pipeline)}</small>{channel.last_error ? <small className="settings-inline-error">{channel.last_error}</small> : null}</span><StatusPill status={channel.status} /><ChevronRight size={18} aria-hidden="true" /></div>)}
+        {channels.map((channel) => <div className="channel-row" key={channel.id}><span className="channel-icon">{channel.kind === "email" ? <Mail size={20} /> : <Bot size={20} />}</span><span><strong>{channel.name}</strong><small>{channelLabel(channel.kind)} · {routeLabel(channel.default_pipeline_id, channel.default_stage_id, pipelines)}</small>{channel.last_error ? <small className="settings-inline-error">{channel.last_error}</small> : null}</span><StatusPill status={channel.status} /><ChevronRight size={18} aria-hidden="true" /></div>)}
         {webhooks.map((endpoint) => <div className="channel-row" key={endpoint.id}><span className="channel-icon"><Braces size={20} /></span><span><strong>{endpoint.name}</strong><small>POST /hooks/v1/generic/{endpoint.slug}</small></span><StatusPill status={endpoint.is_active ? "active" : "disabled"} /><ChevronRight size={18} aria-hidden="true" /></div>)}
         {forms.map((form) => <div className="channel-row" key={form.id}><span className="channel-icon"><FileText size={20} /></span><span><strong>{form.title}</strong><small>/forms/{form.slug} · {form.allowed_origins.length || "только Pulse"} домен(а)</small></span><StatusPill status={form.is_active ? "active" : "disabled"} /><ChevronRight size={18} aria-hidden="true" /></div>)}
         {!channels.length && !webhooks.length && !forms.length && !channelsQuery.isLoading ? <SettingsEmpty icon={<MessageCircle size={22} />} title="Источники пока не подключены" text="Добавьте корпоративную почту, бота, webhook или форму." /> : null}
@@ -604,22 +628,57 @@ function ChannelsPanel({ pipeline, routingLoading }: { pipeline: Pipeline; routi
   );
 }
 
-function ChannelEditor({ pipeline, onCancel, onCreated }: { pipeline: Pipeline; onCancel: () => void; onCreated: (created: ApiChannelConnection) => void | Promise<void> }) {
+function routableStages(pipeline: Pipeline | undefined): Pipeline["stages"] {
+  return pipeline?.stages.filter((stage) => stage.stageType !== "won" && stage.stageType !== "lost") ?? [];
+}
+
+function usePipelineStageSelection(pipelines: Pipeline[], defaultPipelineId: string) {
+  const initialPipeline = pipelines.find((pipeline) => pipeline.id === defaultPipelineId) ?? pipelines[0];
+  const [pipelineId, setPipelineId] = useState(initialPipeline?.id ?? "");
+  const [stageId, setStageId] = useState(routableStages(initialPipeline)[0]?.id ?? "");
+  const selectedPipeline = pipelines.find((pipeline) => pipeline.id === pipelineId);
+  const stages = useMemo(() => routableStages(selectedPipeline), [selectedPipeline]);
+
+  useEffect(() => {
+    if (selectedPipeline || pipelines.length === 0) return;
+    const fallback = pipelines.find((pipeline) => pipeline.id === defaultPipelineId) ?? pipelines[0];
+    setPipelineId(fallback?.id ?? "");
+    setStageId(routableStages(fallback)[0]?.id ?? "");
+  }, [defaultPipelineId, pipelines, selectedPipeline]);
+
+  useEffect(() => {
+    if (!selectedPipeline || stages.some((stage) => stage.id === stageId)) return;
+    setStageId(stages[0]?.id ?? "");
+  }, [selectedPipeline, stageId, stages]);
+
+  function selectPipeline(nextPipelineId: string) {
+    const nextPipeline = pipelines.find((pipeline) => pipeline.id === nextPipelineId);
+    setPipelineId(nextPipelineId);
+    setStageId(routableStages(nextPipeline)[0]?.id ?? "");
+  }
+
+  return { pipelineId, stageId, selectedPipeline, stages, selectPipeline, setStageId };
+}
+
+export function ChannelEditor({ pipelines, defaultPipelineId, routingDisabled = false, onCancel, onCreated }: { pipelines: Pipeline[]; defaultPipelineId: string; routingDisabled?: boolean; onCancel: () => void; onCreated: (created: ApiChannelConnection) => void | Promise<void> }) {
   const [kind, setKind] = useState<ApiChannelKind>("email");
   const [credentials, setCredentials] = useState(credentialsExample("email"));
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
+  const route = usePipelineStageSelection(pipelines, defaultPipelineId);
+  const selectedStage = route.stages.find((stage) => stage.id === route.stageId);
+  const routeReady = !routingDisabled && Boolean(route.selectedPipeline && selectedStage);
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const data = new FormData(event.currentTarget);
-    const stageId = String(data.get("stage_id"));
     setSaving(true);
     setError("");
     try {
+      if (!routeReady || !route.selectedPipeline || !selectedStage) throw new Error("Дождитесь загрузки воронок и выберите начальный этап.");
       const parsed = JSON.parse(credentials) as unknown;
       if (!parsed || Array.isArray(parsed) || typeof parsed !== "object") throw new Error("JSON должен быть объектом");
-      const payload = { kind, name: String(data.get("name")).trim(), status: "active", credentials: parsed, settings: {}, default_pipeline_id: pipeline.id, default_stage_id: stageId, default_assignee_id: null };
-      const created = remoteEnabled ? await api.post<ApiChannelConnection>("/admin/integrations/channels", payload) : demoChannel(payload.kind, payload.name, pipeline.id, stageId);
+      const payload = { kind, name: String(data.get("name")).trim(), status: "active", credentials: parsed, settings: {}, default_pipeline_id: route.selectedPipeline.id, default_stage_id: selectedStage.id, default_assignee_id: null };
+      const created = remoteEnabled ? await api.post<ApiChannelConnection>("/admin/integrations/channels", payload) : demoChannel(payload.kind, payload.name, payload.default_pipeline_id, payload.default_stage_id);
       await onCreated(created);
     } catch (reason) {
       setError(errorMessage(reason, "Не удалось подключить канал. Проверьте JSON и реквизиты."));
@@ -628,34 +687,39 @@ function ChannelEditor({ pipeline, onCancel, onCreated }: { pipeline: Pipeline; 
     }
   }
   return (
-    <SettingsEditor title="Подключение корпоративного канала" icon={<Bot size={19} />} onCancel={onCancel}>
+    <SettingsEditor id="channel-editor" title="Подключение корпоративного канала" icon={<Bot size={19} />} onCancel={onCancel}>
       <form onSubmit={(event) => void submit(event)}>
         <div className="settings-form-grid">
           <label className="field"><span>Тип канала</span><select name="kind" value={kind} onChange={(event) => { const next = event.target.value as ApiChannelKind; setKind(next); setCredentials(credentialsExample(next)); }}><option value="email">Email (IMAP/SMTP)</option><option value="telegram">Telegram-бот</option><option value="max">MAX-бот</option></select></label>
           <label className="field"><span>Название</span><input name="name" required maxLength={160} placeholder="Например, Общая почта" /></label>
-          <label className="field"><span>Воронка</span><input value={pipeline.name} readOnly /></label>
-          <label className="field"><span>Начальный этап</span><select name="stage_id" required>{pipeline.stages.map((stage) => <option key={stage.id} value={stage.id}>{stage.name}</option>)}</select></label>
+          <label className="field"><span>Воронка</span><select name="pipeline_id" value={route.selectedPipeline?.id ?? ""} required disabled={routingDisabled || !pipelines.length} onChange={(event) => route.selectPipeline(event.target.value)}>{!pipelines.length ? <option value="">Воронки недоступны</option> : null}{pipelines.map((pipeline) => <option key={pipeline.id} value={pipeline.id}>{pipeline.name}</option>)}</select></label>
+          <label className="field"><span>Начальный этап</span><select name="stage_id" value={selectedStage?.id ?? ""} required disabled={routingDisabled || !route.stages.length} onChange={(event) => route.setStageId(event.target.value)}>{!route.stages.length ? <option value="">Рабочие этапы недоступны</option> : null}{route.stages.map((stage) => <option key={stage.id} value={stage.id}>{stage.name}</option>)}</select></label>
         </div>
         <label className="field settings-json"><span>Реквизиты (сохраняются зашифрованными)</span><textarea value={credentials} onChange={(event) => setCredentials(event.target.value)} rows={kind === "email" ? 12 : 6} spellCheck={false} /></label>
         <p className="settings-form-help">Для ботов webhook_secret должен совпадать с секретом, заданным у провайдера. Секреты после сохранения больше не отображаются.</p>
+        {!routeReady ? <p className="form-error" role="status">Добавление канала недоступно, пока не загружена активная воронка с рабочим этапом.</p> : null}
         {error ? <p className="form-error" role="alert">{error}</p> : null}
-        <EditorActions saving={saving} onCancel={onCancel} submitLabel="Подключить" />
+        <EditorActions saving={saving} disabled={!routeReady} onCancel={onCancel} submitLabel="Подключить" />
       </form>
     </SettingsEditor>
   );
 }
 
-function WebhookEditor({ pipeline, onCancel, onCreated }: { pipeline: Pipeline; onCancel: () => void; onCreated: (created: ApiWebhookEndpointCreated) => void | Promise<void> }) {
+export function WebhookEditor({ pipelines, defaultPipelineId, routingDisabled = false, onCancel, onCreated }: { pipelines: Pipeline[]; defaultPipelineId: string; routingDisabled?: boolean; onCancel: () => void; onCreated: (created: ApiWebhookEndpointCreated) => void | Promise<void> }) {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const defaultSlug = useMemo(() => `incoming-${Date.now().toString(36)}`, []);
+  const route = usePipelineStageSelection(pipelines, defaultPipelineId);
+  const selectedStage = route.stages.find((stage) => stage.id === route.stageId);
+  const routeReady = !routingDisabled && Boolean(route.selectedPipeline && selectedStage);
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const data = new FormData(event.currentTarget);
     setSaving(true);
     setError("");
     try {
-      const payload = { name: String(data.get("name")).trim(), slug: String(data.get("slug")).trim().toLocaleLowerCase(), pipeline_id: pipeline.id, stage_id: String(data.get("stage_id")), assignee_id: null, source_id: null, is_active: true };
+      if (!routeReady || !route.selectedPipeline || !selectedStage) throw new Error("Дождитесь загрузки воронок и выберите начальный этап.");
+      const payload = { name: String(data.get("name")).trim(), slug: String(data.get("slug")).trim().toLocaleLowerCase(), pipeline_id: route.selectedPipeline.id, stage_id: selectedStage.id, assignee_id: null, source_id: null, is_active: true };
       const created = remoteEnabled ? await api.post<ApiWebhookEndpointCreated>("/admin/integrations/webhooks", payload) : { ...demoWebhook(payload.name, payload.slug, payload.pipeline_id, payload.stage_id), secret: `demo_${crypto.randomUUID().replaceAll("-", "")}` };
       await onCreated(created);
     } catch (reason) {
@@ -665,25 +729,29 @@ function WebhookEditor({ pipeline, onCancel, onCreated }: { pipeline: Pipeline; 
     }
   }
   return (
-    <SettingsEditor title="Универсальный webhook" icon={<Webhook size={19} />} onCancel={onCancel}>
+    <SettingsEditor id="webhook-editor" title="Универсальный webhook" icon={<Webhook size={19} />} onCancel={onCancel}>
       <form onSubmit={(event) => void submit(event)}>
         <div className="settings-form-grid">
           <label className="field"><span>Название</span><input name="name" required maxLength={160} placeholder="Заказы с сайта" /></label>
           <label className="field"><span>Slug endpoint</span><input name="slug" required minLength={12} maxLength={100} pattern="[a-z0-9]+(?:-[a-z0-9]+)*" defaultValue={defaultSlug} /></label>
-          <label className="field"><span>Воронка</span><input value={pipeline.name} readOnly /></label>
-          <label className="field"><span>Начальный этап</span><select name="stage_id" required>{pipeline.stages.map((stage) => <option key={stage.id} value={stage.id}>{stage.name}</option>)}</select></label>
+          <label className="field"><span>Воронка</span><select name="pipeline_id" value={route.selectedPipeline?.id ?? ""} required disabled={routingDisabled || !pipelines.length} onChange={(event) => route.selectPipeline(event.target.value)}>{!pipelines.length ? <option value="">Воронки недоступны</option> : null}{pipelines.map((pipeline) => <option key={pipeline.id} value={pipeline.id}>{pipeline.name}</option>)}</select></label>
+          <label className="field"><span>Начальный этап</span><select name="stage_id" value={selectedStage?.id ?? ""} required disabled={routingDisabled || !route.stages.length} onChange={(event) => route.setStageId(event.target.value)}>{!route.stages.length ? <option value="">Рабочие этапы недоступны</option> : null}{route.stages.map((stage) => <option key={stage.id} value={stage.id}>{stage.name}</option>)}</select></label>
         </div>
         <p className="settings-form-help">Pulse создаст HMAC-SHA256 секрет и покажет его один раз. Входящие запросы должны передавать timestamp и Idempotency-Key.</p>
+        {!routeReady ? <p className="form-error" role="status">Создание webhook недоступно, пока не загружена активная воронка с рабочим этапом.</p> : null}
         {error ? <p className="form-error" role="alert">{error}</p> : null}
-        <EditorActions saving={saving} onCancel={onCancel} submitLabel="Создать endpoint" />
+        <EditorActions saving={saving} disabled={!routeReady} onCancel={onCancel} submitLabel="Создать endpoint" />
       </form>
     </SettingsEditor>
   );
 }
 
-function HtmlFormEditor({ pipeline, onCancel, onCreated }: { pipeline: Pipeline; onCancel: () => void; onCreated: (created: ApiHtmlForm) => void | Promise<void> }) {
+export function HtmlFormEditor({ pipelines, defaultPipelineId, routingDisabled = false, onCancel, onCreated }: { pipelines: Pipeline[]; defaultPipelineId: string; routingDisabled?: boolean; onCancel: () => void; onCreated: (created: ApiHtmlForm) => void | Promise<void> }) {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
+  const route = usePipelineStageSelection(pipelines, defaultPipelineId);
+  const selectedStage = route.stages.find((stage) => stage.id === route.stageId);
+  const routeReady = !routingDisabled && Boolean(route.selectedPipeline && selectedStage);
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const data = new FormData(event.currentTarget);
@@ -691,7 +759,8 @@ function HtmlFormEditor({ pipeline, onCancel, onCreated }: { pipeline: Pipeline;
     setSaving(true);
     setError("");
     try {
-      const payload = { title: String(data.get("title")).trim(), slug: String(data.get("slug")).trim().toLocaleLowerCase(), pipeline_id: pipeline.id, stage_id: String(data.get("stage_id")), assignee_id: null, source_id: null, fields_schema: [{ key: "name", type: "text", label: "Имя", required: true, max_length: 200 }, { key: "email", type: "email", label: "Email", required: false, max_length: 320 }, { key: "phone", type: "phone", label: "Телефон", required: false, max_length: 80 }, { key: "message", type: "textarea", label: "Сообщение", required: false, max_length: 2_000 }], allowed_origins: origins, honeypot_field: "company_website", success_message: "Спасибо! Мы свяжемся с вами.", is_active: true };
+      if (!routeReady || !route.selectedPipeline || !selectedStage) throw new Error("Дождитесь загрузки воронок и выберите начальный этап.");
+      const payload = { title: String(data.get("title")).trim(), slug: String(data.get("slug")).trim().toLocaleLowerCase(), pipeline_id: route.selectedPipeline.id, stage_id: selectedStage.id, assignee_id: null, source_id: null, fields_schema: [{ key: "name", type: "text", label: "Имя", required: true, max_length: 200 }, { key: "email", type: "email", label: "Email", required: false, max_length: 320 }, { key: "phone", type: "phone", label: "Телефон", required: false, max_length: 80 }, { key: "message", type: "textarea", label: "Сообщение", required: false, max_length: 2_000 }], allowed_origins: origins, honeypot_field: "company_website", success_message: "Спасибо! Мы свяжемся с вами.", is_active: true };
       const created = remoteEnabled ? await api.post<ApiHtmlForm>("/admin/integrations/forms", payload) : demoForm(payload.title, payload.slug, payload.pipeline_id, payload.stage_id, origins);
       await onCreated(created);
     } catch (reason) {
@@ -701,18 +770,19 @@ function HtmlFormEditor({ pipeline, onCancel, onCreated }: { pipeline: Pipeline;
     }
   }
   return (
-    <SettingsEditor title="HTML-форма для сайта" icon={<Globe2 size={19} />} onCancel={onCancel}>
+    <SettingsEditor id="html-form-editor" title="HTML-форма для сайта" icon={<Globe2 size={19} />} onCancel={onCancel}>
       <form onSubmit={(event) => void submit(event)}>
         <div className="settings-form-grid">
           <label className="field"><span>Название формы</span><input name="title" required maxLength={240} placeholder="Запрос предложения" /></label>
           <label className="field"><span>Slug</span><input name="slug" required minLength={4} maxLength={100} pattern="[a-z0-9]+(?:-[a-z0-9]+)*" placeholder="request-offer" /></label>
-          <label className="field"><span>Воронка</span><input value={pipeline.name} readOnly /></label>
-          <label className="field"><span>Начальный этап</span><select name="stage_id" required>{pipeline.stages.map((stage) => <option key={stage.id} value={stage.id}>{stage.name}</option>)}</select></label>
+          <label className="field"><span>Воронка</span><select name="pipeline_id" value={route.selectedPipeline?.id ?? ""} required disabled={routingDisabled || !pipelines.length} onChange={(event) => route.selectPipeline(event.target.value)}>{!pipelines.length ? <option value="">Воронки недоступны</option> : null}{pipelines.map((pipeline) => <option key={pipeline.id} value={pipeline.id}>{pipeline.name}</option>)}</select></label>
+          <label className="field"><span>Начальный этап</span><select name="stage_id" value={selectedStage?.id ?? ""} required disabled={routingDisabled || !route.stages.length} onChange={(event) => route.setStageId(event.target.value)}>{!route.stages.length ? <option value="">Рабочие этапы недоступны</option> : null}{route.stages.map((stage) => <option key={stage.id} value={stage.id}>{stage.name}</option>)}</select></label>
         </div>
         <label className="field"><span>Разрешённые origin, через запятую</span><input name="allowed_origins" placeholder="https://example.com, https://promo.example.com" /></label>
         <p className="settings-form-help">Будут созданы поля «Имя», email, телефон и сообщение, а также honeypot-защита. Готовая форма откроется по /forms/slug.</p>
+        {!routeReady ? <p className="form-error" role="status">Создание HTML-формы недоступно, пока не загружена активная воронка с рабочим этапом.</p> : null}
         {error ? <p className="form-error" role="alert">{error}</p> : null}
-        <EditorActions saving={saving} onCancel={onCancel} submitLabel="Создать форму" />
+        <EditorActions saving={saving} disabled={!routeReady} onCancel={onCancel} submitLabel="Создать форму" />
       </form>
     </SettingsEditor>
   );
@@ -724,7 +794,7 @@ function WebhookSecret({ result, onClose }: { result: ApiWebhookEndpointCreated;
   return <section className="settings-secret" role="status"><span><ShieldCheck size={20} /></span><div><strong>Сохраните секрет webhook сейчас</strong><small>После закрытия Pulse CRM больше не покажет это значение.</small><code>{result.secret}</code><p>Endpoint: <code>/hooks/v1/generic/{result.slug}</code></p></div><Button compact onClick={() => void copySecret()}><Copy size={15} /> {copied ? "Скопировано" : "Копировать"}</Button><button className="icon-button" type="button" aria-label="Закрыть" onClick={onClose}><X size={17} /></button></section>;
 }
 
-function NotificationsPanel({ pipeline }: { pipeline: Pipeline }) {
+function NotificationsPanel({ pipelines }: { pipelines: Pipeline[] }) {
   const { session } = useAuth();
   const [showEditor, setShowEditor] = useState(false);
   const [localRules, setLocalRules] = useState(demoRules);
@@ -733,10 +803,25 @@ function NotificationsPanel({ pipeline }: { pipeline: Pipeline }) {
   const rulesQuery = useQuery({ queryKey: ["settings", "notification-rules"], queryFn: () => api.get<ApiNotificationRule[]>("/admin/integrations/notification-rules"), enabled: remoteEnabled });
   const templatesQuery = useQuery({ queryKey: ["settings", "notification-templates"], queryFn: () => api.get<ApiNotificationTemplate[]>("/admin/integrations/notification-templates"), enabled: remoteEnabled });
   const rules = remoteEnabled ? rulesQuery.data ?? [] : localRules;
+  const returnFocusRef = useRef<HTMLButtonElement | null>(null);
+
+  function closeEditor() {
+    setShowEditor(false);
+    window.setTimeout(() => returnFocusRef.current?.focus(), 0);
+  }
+
+  function toggleEditor(event: ReactMouseEvent<HTMLButtonElement>) {
+    returnFocusRef.current = event.currentTarget;
+    if (showEditor) {
+      closeEditor();
+      return;
+    }
+    setShowEditor(true);
+  }
 
   async function createdRule(created: ApiNotificationRule) {
     if (remoteEnabled) await Promise.all([rulesQuery.refetch(), templatesQuery.refetch()]); else setLocalRules((items) => [created, ...items]);
-    setShowEditor(false);
+    closeEditor();
   }
   async function toggleRule(rule: ApiNotificationRule) {
     setSavingRuleId(rule.id);
@@ -752,9 +837,10 @@ function NotificationsPanel({ pipeline }: { pipeline: Pipeline }) {
   }
   return (
     <>
-      <SettingsHeading title="Правила оповещений" action="Новое правило" onAction={() => setShowEditor((value) => !value)} />
+      <SettingsHeading title="Правила оповещений" action="Новое правило" actionControls="notification-rule-editor" actionExpanded={showEditor} mobileFab onAction={toggleEditor} />
+      <button type="button" className="mobile-fab settings-panel__mobile-add" aria-label="Добавить правило оповещения" aria-controls="notification-rule-editor" aria-expanded={showEditor} hidden={showEditor} onClick={toggleEditor}><Plus size={26} aria-hidden="true" /></button>
       {rulesQuery.isError || templatesQuery.isError ? <SettingsNotice tone="error">Не удалось загрузить правила оповещений.</SettingsNotice> : null}
-      {showEditor ? <NotificationEditor pipeline={pipeline} currentUserId={session?.user.id ?? "demo-user"} onCancel={() => setShowEditor(false)} onCreated={createdRule} /> : null}
+      {showEditor ? <NotificationEditor pipelines={pipelines} currentUserId={session?.user.id ?? "demo-user"} onCancel={closeEditor} onCreated={createdRule} /> : null}
       {error ? <SettingsNotice tone="error">{error}</SettingsNotice> : null}
       <section className="rules-list" aria-label="Правила оповещений">
         {rules.map((rule) => <div key={rule.id}><button type="button" className={`rule-toggle${rule.is_enabled ? " is-on" : ""}`} aria-label={`${rule.is_enabled ? "Выключить" : "Включить"} правило ${rule.name}`} aria-pressed={rule.is_enabled} disabled={savingRuleId === rule.id} onClick={() => void toggleRule(rule)}><i /></button><strong>{rule.name}</strong><small>{rule.is_enabled ? "Включено" : "Выключено"} · {notificationChannelLabel(rule.channel)}</small><ChevronRight size={18} aria-hidden="true" /></div>)}
@@ -764,11 +850,13 @@ function NotificationsPanel({ pipeline }: { pipeline: Pipeline }) {
   );
 }
 
-function NotificationEditor({ pipeline, currentUserId, onCancel, onCreated }: { pipeline: Pipeline; currentUserId: string; onCancel: () => void; onCreated: (created: ApiNotificationRule) => void | Promise<void> }) {
+export function NotificationEditor({ pipelines, currentUserId, onCancel, onCreated }: { pipelines: Pipeline[]; currentUserId: string; onCancel: () => void; onCreated: (created: ApiNotificationRule) => void | Promise<void> }) {
   const [audience, setAudience] = useState<"employee" | "client">("employee");
   const [channel, setChannel] = useState<ApiNotificationChannel>("in_app");
   const [recipientAddress, setRecipientAddress] = useState("");
   const [contactId, setContactId] = useState("");
+  const [pipelineId, setPipelineId] = useState("");
+  const [stageId, setStageId] = useState("");
   const [enabled, setEnabled] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
@@ -776,6 +864,18 @@ function NotificationEditor({ pipeline, currentUserId, onCancel, onCreated }: { 
   const clientContacts = remoteEnabled
     ? (contactsQuery.data?.items ?? []).map((contact) => ({ id: contact.id, name: `${contact.first_name} ${contact.last_name}`.trim(), email: contact.primary_email ?? "" }))
     : demoContacts.map((contact) => ({ id: contact.id, name: contact.name, email: contact.email === "—" ? "" : contact.email }));
+  const selectedPipeline = pipelines.find((pipeline) => pipeline.id === pipelineId);
+
+  useEffect(() => {
+    if (!pipelineId || selectedPipeline) return;
+    setPipelineId("");
+    setStageId("");
+  }, [pipelineId, selectedPipeline]);
+
+  useEffect(() => {
+    if (!stageId || selectedPipeline?.stages.some((stage) => stage.id === stageId)) return;
+    setStageId("");
+  }, [selectedPipeline, stageId]);
 
   function changeAudience(value: "employee" | "client") {
     setAudience(value);
@@ -787,6 +887,11 @@ function NotificationEditor({ pipeline, currentUserId, onCancel, onCreated }: { 
     setContactId(value);
     const contact = clientContacts.find((item) => item.id === value);
     if (channel === "email" && contact?.email) setRecipientAddress(contact.email);
+  }
+
+  function changePipelineFilter(value: string) {
+    setPipelineId(value);
+    setStageId("");
   }
 
   async function submit(event: FormEvent<HTMLFormElement>) {
@@ -813,8 +918,8 @@ function NotificationEditor({ pipeline, currentUserId, onCancel, onCreated }: { 
       }
       const body = String(data.get("body")).trim();
       const template = remoteEnabled ? await api.post<ApiNotificationTemplate>("/admin/integrations/notification-templates", { name: `${name} — шаблон`, channel, subject_template: channel === "email" ? "Событие в Pulse CRM" : null, body_template: body, is_active: true }) : demoTemplate(`${name} — шаблон`, channel, body);
-      const payload = { template_id: template.id, name, event_type: String(data.get("event_type")), audience, channel, pipeline_id: data.get("pipeline_filter") === "on" ? pipeline.id : null, stage_id: null, source_id: null, filters: {}, recipients: [recipient], delay_seconds: Math.max(0, Number(data.get("delay_minutes")) || 0) * 60, require_client_consent: true, is_enabled: audience === "client" ? false : enabled };
-      const created = remoteEnabled ? await api.post<ApiNotificationRule>("/admin/integrations/notification-rules", payload) : { ...demoRule(payload.name, payload.event_type, channel, payload.is_enabled, audience), template_id: template.id, pipeline_id: payload.pipeline_id, recipients: payload.recipients, delay_seconds: payload.delay_seconds };
+      const payload = { template_id: template.id, name, event_type: String(data.get("event_type")), audience, channel, pipeline_id: pipelineId || null, stage_id: pipelineId && stageId ? stageId : null, source_id: null, filters: {}, recipients: [recipient], delay_seconds: Math.max(0, Number(data.get("delay_minutes")) || 0) * 60, require_client_consent: true, is_enabled: audience === "client" ? false : enabled };
+      const created = remoteEnabled ? await api.post<ApiNotificationRule>("/admin/integrations/notification-rules", payload) : { ...demoRule(payload.name, payload.event_type, channel, payload.is_enabled, audience), template_id: template.id, pipeline_id: payload.pipeline_id, stage_id: payload.stage_id, recipients: payload.recipients, delay_seconds: payload.delay_seconds };
       await onCreated(created);
     } catch (reason) {
       setError(errorMessage(reason, "Не удалось создать шаблон и правило."));
@@ -823,7 +928,7 @@ function NotificationEditor({ pipeline, currentUserId, onCancel, onCreated }: { 
     }
   }
   return (
-    <SettingsEditor title="Новое правило и шаблон" icon={<ShieldCheck size={19} />} onCancel={onCancel}>
+    <SettingsEditor id="notification-rule-editor" title="Новое правило и шаблон" icon={<ShieldCheck size={19} />} onCancel={onCancel}>
       <form onSubmit={(event) => void submit(event)}>
         <div className="settings-form-grid">
           <label className="field"><span>Название правила</span><input name="name" required maxLength={160} placeholder="Новый лид — владельцу" /></label>
@@ -833,10 +938,12 @@ function NotificationEditor({ pipeline, currentUserId, onCancel, onCreated }: { 
           {audience === "client" ? <label className="field"><span>Клиент</span><select aria-label="Клиент" name="contact_id" value={contactId} onChange={(event) => changeContact(event.target.value)} required><option value="">Выберите контакт</option>{clientContacts.map((contact) => <option key={contact.id} value={contact.id}>{contact.name}</option>)}</select></label> : null}
           {channel === "in_app" ? <label className="field"><span>Адрес</span><input value="Текущий администратор" readOnly /></label> : <label className="field"><span>{channel === "email" ? "Email" : "ID чата получателя"}</span><input name="recipient" value={recipientAddress} onChange={(event) => setRecipientAddress(event.target.value)} required placeholder={channel === "email" ? "client@example.com" : "ID чата получателя"} /></label>}
           <label className="field"><span>Задержка, минут</span><input name="delay_minutes" type="number" min="0" max="525600" defaultValue="0" /></label>
+          <label className="field"><span>Воронка</span><select name="pipeline_id" value={pipelineId} onChange={(event) => changePipelineFilter(event.target.value)}><option value="">Все воронки</option>{pipelines.map((pipeline) => <option key={pipeline.id} value={pipeline.id}>{pipeline.name}</option>)}</select></label>
+          <label className="field"><span>Этап</span><select name="stage_id" value={stageId} disabled={!selectedPipeline} onChange={(event) => setStageId(event.target.value)}><option value="">Все этапы</option>{selectedPipeline?.stages.map((stage) => <option key={stage.id} value={stage.id}>{stage.name}</option>)}</select></label>
         </div>
         {audience === "client" ? <><label className="field"><span>Основание согласия</span><textarea name="consent_evidence" required rows={2} placeholder="Например: checkbox формы заказа, 28.08.2026" /></label><div className="settings-checks"><label><input name="consent_confirmed" type="checkbox" required /> Подтверждаю, что согласие клиента получено и зафиксировано</label></div></> : null}
         <label className="field"><span>Текст шаблона</span><textarea name="body" required rows={3} defaultValue="В Pulse CRM произошло новое событие. Откройте карточку, чтобы увидеть детали." /></label>
-        <div className="settings-checks"><label><input name="pipeline_filter" type="checkbox" /> Только воронка «{pipeline.name}»</label><label><input name="is_enabled" type="checkbox" checked={enabled} disabled={audience === "client"} onChange={(event) => setEnabled(event.target.checked)} /> Включить сразу</label></div>
+        <div className="settings-checks"><label><input name="is_enabled" type="checkbox" checked={enabled} disabled={audience === "client"} onChange={(event) => setEnabled(event.target.checked)} /> Включить сразу</label></div>
         <p className="settings-form-help">Клиентское правило всегда создаётся выключенным. После проверки адреса и сохранённого согласия включите его в списке правил.</p>
         {contactsQuery.isError ? <p className="form-error" role="alert">Не удалось загрузить контакты для согласия.</p> : null}
         {error ? <p className="form-error" role="alert">{error}</p> : null}
@@ -1055,14 +1162,18 @@ function InviteUsersPanel() {
   return <><SettingsHeading title="Пользователи и роли" /><section className="members-panel"><div className="members-list">{members.map((member) => <div key={member.id}><span className="company-avatar">{member.full_name.slice(0, 1)}</span><span><strong>{member.full_name}</strong><small>{member.email}</small></span><em>{member.role === "owner" ? "Владелец" : member.role === "admin" ? "Администратор" : "Менеджер"}</em></div>)}</div><form className="invite-form" onSubmit={(event) => void submit(event)}><header><UserPlus size={19} /><div><strong>Пригласить сотрудника</strong><small>Ссылка действует 72 часа</small></div></header><label className="field"><span>Email</span><input name="email" type="email" required placeholder="manager@example.com" /></label><label className="field"><span>Роль</span><select name="role" defaultValue="manager"><option value="manager">Менеджер</option>{session?.user.role === "owner" ? <option value="admin">Администратор</option> : null}</select></label>{error ? <p className="form-error" role="alert">{error}</p> : null}<Button type="submit" variant="primary" disabled={saving}>{saving ? "Создаём…" : "Создать приглашение"}</Button>{invite ? <div className="invite-result" role="status"><strong>Приглашение готово</strong><code>{`${window.location.origin}/accept-invitation?token=${invite.token}`}</code></div> : null}</form></section></>;
 }
 
-function SettingsHeading({ title, action, onAction }: { title: string; action?: string; onAction?: () => void }) {
-  return <header className="settings-heading"><div><h2>{title}</h2><p>Изменения применяются ко всей компании.</p></div>{action ? <Button variant="primary" onClick={onAction}><Plus size={16} /> {action}</Button> : null}</header>;
+function SettingsHeading({ title, action, actionControls, actionExpanded, actionDisabled = false, mobileFab = false, onAction }: { title: string; action?: string; actionControls?: string; actionExpanded?: boolean; actionDisabled?: boolean; mobileFab?: boolean; onAction?: (event: ReactMouseEvent<HTMLButtonElement>) => void }) {
+  return <header className={`settings-heading${mobileFab ? " settings-heading--mobile-fab" : ""}`}><div><h2>{title}</h2><p>Изменения применяются ко всей компании.</p></div>{action ? <Button variant="primary" aria-controls={actionControls} aria-expanded={actionExpanded} disabled={actionDisabled} onClick={onAction}><Plus size={16} /> {action}</Button> : null}</header>;
 }
-function SettingsEditor({ title, icon, onCancel, children }: { title: string; icon: ReactNode; onCancel: () => void; children: ReactNode }) {
-  return <section className="settings-editor"><header><span>{icon}</span><strong>{title}</strong><button className="icon-button" type="button" aria-label="Закрыть форму" onClick={onCancel}><X size={18} /></button></header>{children}</section>;
+function SettingsEditor({ id, title, icon, onCancel, children }: { id?: string; title: string; icon: ReactNode; onCancel: () => void; children: ReactNode }) {
+  const generatedTitleId = useId();
+  const titleId = id ? `${id}-title` : `settings-editor-${generatedTitleId}`;
+  const editorRef = useRef<HTMLElement | null>(null);
+  useEffect(() => { editorRef.current?.focus(); }, []);
+  return <section className="settings-editor" id={id} ref={editorRef} tabIndex={-1} aria-labelledby={titleId}><header><span>{icon}</span><h3 id={titleId}>{title}</h3><button className="icon-button" type="button" aria-label="Закрыть форму" onClick={onCancel}><X size={18} /></button></header>{children}</section>;
 }
-function EditorActions({ saving, submitLabel, onCancel }: { saving: boolean; submitLabel: string; onCancel: () => void }) {
-  return <div className="settings-editor__actions"><Button type="button" onClick={onCancel}>Отмена</Button><Button type="submit" variant="primary" disabled={saving}>{saving ? "Сохраняем…" : submitLabel}</Button></div>;
+function EditorActions({ saving, disabled = false, submitLabel, onCancel }: { saving: boolean; disabled?: boolean; submitLabel: string; onCancel: () => void }) {
+  return <div className="settings-editor__actions"><Button type="button" onClick={onCancel}>Отмена</Button><Button type="submit" variant="primary" disabled={saving || disabled}>{saving ? "Сохраняем…" : submitLabel}</Button></div>;
 }
 function SettingsNotice({ tone, children }: { tone: "neutral" | "error"; children: ReactNode }) {
   return <div className={`settings-notice settings-notice--${tone}`} role={tone === "error" ? "alert" : "status"}>{children}</div>;
@@ -1077,7 +1188,11 @@ function StatusPill({ status }: { status: string }) {
 
 function channelLabel(kind: ApiChannelKind): string { return { email: "IMAP/SMTP", telegram: "Telegram Bot API", max: "MAX Bot API" }[kind]; }
 function notificationChannelLabel(channel: ApiNotificationChannel): string { return { in_app: "в приложении", email: "email", telegram: "Telegram", max: "MAX" }[channel]; }
-function routeLabel(stageId: string | null, pipeline: Pipeline): string { return pipeline.stages.find((stage) => stage.id === stageId)?.name ?? "маршрут не задан"; }
+function routeLabel(pipelineId: string | null, stageId: string | null, pipelines: Pipeline[]): string {
+  const pipeline = pipelines.find((item) => item.id === pipelineId);
+  const stage = pipeline?.stages.find((item) => item.id === stageId);
+  return pipeline && stage ? `${pipeline.name} · ${stage.name}` : "маршрут не задан";
+}
 function formatDate(value: string): string { return new Intl.DateTimeFormat("ru-RU", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" }).format(new Date(value)); }
 function errorMessage(reason: unknown, fallback: string): string {
   if (!(reason instanceof ApiError)) return reason instanceof Error && reason.message ? reason.message : fallback;
