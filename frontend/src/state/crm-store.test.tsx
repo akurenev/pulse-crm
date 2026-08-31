@@ -108,8 +108,10 @@ function StoreProbe() {
     loading,
     loadedStageIds,
     nextCursorByStage,
+    nextDealSearchCursor,
     loadStageDeals,
     loadMoreDeals,
+    loadMoreDealSearch,
     setDealSearch,
     selectPipeline,
     toggleTask,
@@ -136,6 +138,7 @@ function StoreProbe() {
     <output aria-label="Финальный этап">{loadedStageIds["stage-won"] ? "loaded" : "deferred"}</output>
     <button type="button" onClick={() => void loadStageDeals("stage-won")}>Загрузить финал</button>
     {nextCursorByStage["stage-won"] ? <button type="button" onClick={() => void loadMoreDeals("stage-won")}>Ещё финал</button> : null}
+    {nextDealSearchCursor ? <button type="button" onClick={() => void loadMoreDealSearch()}>Ещё результаты поиска</button> : null}
     <button type="button" onClick={() => setDealSearch("архив")}>Поиск в архиве</button>
     <button type="button" onClick={() => void selectPipeline("pipeline-service")}>Выбрать сервис</button>
     <button type="button" onClick={() => {
@@ -206,8 +209,11 @@ describe("CrmProvider deal stage loading", () => {
       if (path.includes("stage_id=stage-open")) {
         return Promise.resolve({ items: [deal("deal-open", "stage-open", "Активная сделка")], next_cursor: null } satisfies CursorPage<ApiDeal>);
       }
-      if (path.includes("stage_id=stage-won") && path.includes("search=%D0%B0%D1%80%D1%85%D0%B8%D0%B2")) {
-        return Promise.resolve({ items: [deal("deal-won-1", "stage-won", "Найдено в архиве")], next_cursor: null } satisfies CursorPage<ApiDeal>);
+      if (path === "/deals?limit=100&pipeline_id=pipeline-sales&search=%D0%B0%D1%80%D1%85%D0%B8%D0%B2") {
+        return Promise.resolve({ items: [deal("deal-won-1", "stage-won", "Закрытая сделка")], next_cursor: "search-next" } satisfies CursorPage<ApiDeal>);
+      }
+      if (path === "/deals?limit=100&pipeline_id=pipeline-sales&search=%D0%B0%D1%80%D1%85%D0%B8%D0%B2&cursor=search-next") {
+        return Promise.resolve({ items: [deal("deal-lost-search", "stage-lost", "Ещё одна закрытая")], next_cursor: null } satisfies CursorPage<ApiDeal>);
       }
       if (path.includes("stage_id=stage-won") && path.includes("cursor=won-next")) {
         return Promise.resolve({ items: [deal("deal-won-2", "stage-won", "Вторая закрытая")], next_cursor: null } satisfies CursorPage<ApiDeal>);
@@ -250,11 +256,16 @@ describe("CrmProvider deal stage loading", () => {
     expect(screen.getByLabelText("Сделки")).toHaveTextContent("Первая закрытая");
 
     fireEvent.click(screen.getByRole("button", { name: "Поиск в архиве" }));
-    await waitFor(() => expect(screen.getByLabelText("Сделки")).toHaveTextContent("Найдено в архиве"));
+    await waitFor(() => expect(screen.getByLabelText("Сделки")).toHaveTextContent("Закрытая сделка"));
     expect(screen.getByLabelText("Состояния задач")).toHaveTextContent("done");
     expect(apiMocks.get.mock.calls.map(([path]) => String(path))).toContain(
-      "/deals?limit=100&pipeline_id=pipeline-sales&stage_id=stage-won&search=%D0%B0%D1%80%D1%85%D0%B8%D0%B2",
+      "/deals?limit=100&pipeline_id=pipeline-sales&search=%D0%B0%D1%80%D1%85%D0%B8%D0%B2",
     );
+    expect(apiMocks.get.mock.calls.map(([path]) => String(path)).filter((path) => path.includes("search=%D0%B0%D1%80%D1%85%D0%B8%D0%B2"))).toHaveLength(1);
+
+    fireEvent.click(screen.getByRole("button", { name: "Ещё результаты поиска" }));
+    await waitFor(() => expect(screen.getByLabelText("Сделки")).toHaveTextContent("Ещё одна закрытая"));
+    expect(screen.getByLabelText("Сделки")).toHaveTextContent("Закрытая сделка");
   });
 
   it("переключает воронку без повторной загрузки метаданных и задач", async () => {
@@ -484,14 +495,14 @@ describe("CrmProvider deal stage loading", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Загрузить финал" }));
     fireEvent.click(screen.getByRole("button", { name: "Поиск в архиве" }));
-    await waitFor(() => expect(screen.getByLabelText("Сделки")).toHaveTextContent("Найдено в архиве"));
+    await waitFor(() => expect(screen.getByLabelText("Сделки")).toHaveTextContent("Закрытая сделка"));
 
     await act(async () => resolveStale({
       items: [deal("deal-won-stale", "stage-won", "Устаревшая закрытая")],
       next_cursor: null,
     }));
     expect(screen.getByLabelText("Сделки")).not.toHaveTextContent("Устаревшая закрытая");
-    expect(screen.getByLabelText("Сделки")).toHaveTextContent("Найдено в архиве");
+    expect(screen.getByLabelText("Сделки")).toHaveTextContent("Закрытая сделка");
   });
 
   it("сбрасывает старый cursor сразу после изменения поиска", async () => {

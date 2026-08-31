@@ -8,6 +8,10 @@ describe("deep links", () => {
     expect(normalizeInternalAppPath("/deals/deal-123", origin)).toBe("/deals?deal=deal-123");
     expect(normalizeInternalAppPath("https://crm.example.test/tasks?task=task_456&ignored=true", origin))
       .toBe("/tasks?task=task_456");
+    expect(normalizeInternalAppPath("/contacts?contact=contact-789&ignored=true", origin))
+      .toBe("/contacts?contact=contact-789");
+    expect(normalizeInternalAppPath("/contacts?company=company_789", origin))
+      .toBe("/contacts?company=company_789");
     expect(normalizeInternalAppPath("/contacts?unused=true", origin)).toBe("/contacts");
   });
 
@@ -21,5 +25,7 @@ describe("deep links", () => {
     expect(normalizeInternalAppPath("/deals/%", origin)).toBeNull();
     expect(normalizeInternalAppPath("/deals/%2e%2e/settings", origin)).toBeNull();
     expect(deepLinkEntityId(new URLSearchParams("deal=../../settings"), "deal")).toBeNull();
+    expect(deepLinkEntityId(new URLSearchParams("contact=../../settings"), "contact")).toBeNull();
+    expect(normalizeInternalAppPath("/contacts?company=../../settings", origin)).toBe("/contacts");
   });
 });

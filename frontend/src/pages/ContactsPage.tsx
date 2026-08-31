@@ -1,12 +1,14 @@
 import * as Dialog from "@radix-ui/react-dialog";
 import { keepPreviousData, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Building2, ChevronLeft, ChevronRight, Pencil, Plus, RefreshCw, Search, Trash2, Users, X } from "lucide-react";
+import { Building2, ChevronLeft, ChevronRight, ExternalLink, Pencil, Plus, RefreshCw, Search, Trash2, Users, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
+import { Link, useSearchParams } from "react-router-dom";
 
 import { Avatar } from "../components/Avatar";
 import { Button } from "../components/Button";
 import { contacts, users } from "../data/demo";
 import { ApiError, api, remoteEnabled } from "../lib/api";
+import { deepLinkEntityId } from "../lib/deep-links";
 import { parseDealTags } from "../lib/deal-tags";
 import { formatLongDate, formatMoney } from "../lib/format";
 import { useCrm } from "../state/crm-store";
@@ -70,6 +72,7 @@ function replacePrimaryContactPoint(values: string[], previous: string | null, n
 export default function ContactsPage() {
   const { currentUser, isEmployee } = useCrm();
   const queryClient = useQueryClient();
+  const [routeSearchParams, setRouteSearchParams] = useSearchParams();
   const [demoContacts, setDemoContacts] = useState<Contact[]>(contacts);
   const [demoCompanies, setDemoCompanies] = useState<ApiCompany[]>(() => Array.from(new Set(contacts.map((contact) => contact.company).filter((name) => name !== "—"))).map((name, index) => ({
     id: `demo-company-${index}`,
@@ -90,6 +93,7 @@ export default function ContactsPage() {
   const [selectedApiContact, setSelectedApiContact] = useState<ApiContact | null>(null);
   const [selectedCompany, setSelectedCompany] = useState<ApiCompany | null>(null);
   const [contactEditing, setContactEditing] = useState(false);
+  const [companyEditing, setCompanyEditing] = useState(false);
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState("");
@@ -106,6 +110,8 @@ export default function ContactsPage() {
   const debouncedSearch = useDebouncedValue(normalizedSearch, CLIENT_SEARCH_DELAY_MS);
   const contactCursor = contactCursors.at(-1) ?? null;
   const companyCursor = companyCursors.at(-1) ?? null;
+  const routedContactId = deepLinkEntityId(routeSearchParams, "contact");
+  const routedCompanyId = deepLinkEntityId(routeSearchParams, "company");
   const remoteContacts = useQuery({
     queryKey: ["contacts", debouncedSearch, contactCursor, accessRevision],
     queryFn: ({ signal }) => api.get<CursorPage<ApiContact>>(
@@ -131,6 +137,18 @@ export default function ContactsPage() {
     placeholderData: accessRevision > 0 ? undefined : keepPreviousData,
     staleTime: 30_000,
   });
+  const routedContactFromPage = remoteContacts.data?.items.find((contact) => contact.id === routedContactId) ?? null;
+  const routedCompanyFromPage = remoteCompanies.data?.items.find((company) => company.id === routedCompanyId) ?? null;
+  const routedContactQuery = useQuery({
+    queryKey: ["contact-detail", routedContactId],
+    queryFn: ({ signal }) => api.get<ApiContact>(`/contacts/${encodeURIComponent(routedContactId ?? "")}`, { signal }),
+    enabled: remoteEnabled && Boolean(routedContactId && !routedContactFromPage && selectedApiContact?.id !== routedContactId),
+  });
+  const routedCompanyQuery = useQuery({
+    queryKey: ["company-detail", routedCompanyId],
+    queryFn: ({ signal }) => api.get<ApiCompany>(`/companies/${encodeURIComponent(routedCompanyId ?? "")}`, { signal }),
+    enabled: remoteEnabled && !isEmployee && Boolean(routedCompanyId && !routedCompanyFromPage && selectedCompany?.id !== routedCompanyId),
+  });
   const sourceContacts = useMemo<Contact[]>(() => {
     if (!remoteEnabled) return demoContacts;
     const usersById = new Map((remoteUsers.data ?? []).map((user) => [user.id, apiUserSummary(user)]));
@@ -146,7 +164,9 @@ export default function ContactsPage() {
     return demoCompanies;
   }, [demoCompanies, remoteCompanies.data]);
   const visibleCompanies = useMemo(
-    () => sourceCompanies.filter((company) => `${company.name} ${company.email ?? ""} ${company.phone ?? ""} ${company.tags.join(" ")}`.toLocaleLowerCase("ru").includes(normalizedSearch)),
+    () => remoteEnabled
+      ? sourceCompanies
+      : sourceCompanies.filter((company) => `${company.name} ${company.email ?? ""} ${company.phone ?? ""} ${company.tags.join(" ")}`.toLocaleLowerCase("ru").includes(normalizedSearch)),
     [normalizedSearch, sourceCompanies],
   );
   const loading = view === "contacts" ? remoteContacts.isLoading || remoteUsers.isLoading : remoteCompanies.isLoading;
@@ -175,6 +195,28 @@ export default function ContactsPage() {
     ),
     enabled: remoteEnabled && Boolean(selectedContact?.id),
   });
+  const contactDealsQuery = useQuery({
+    queryKey: ["contact-deals", selectedContact?.id],
+    queryFn: ({ signal }) => api.get<CursorPage<ApiDeal>>(
+      `/contacts/${selectedContact?.id}/deals?limit=100`,
+      { signal },
+    ),
+    enabled: remoteEnabled && Boolean(selectedContact?.id),
+  });
+  const selectedContactCompanyId = selectedApiContact?.company_id ?? null;
+  const selectedContactCompanyQuery = useQuery({
+    queryKey: ["company-detail", selectedContactCompanyId],
+    queryFn: ({ signal }) => api.get<ApiCompany>(`/companies/${selectedContactCompanyId}`, { signal }),
+    enabled: remoteEnabled && !isEmployee && Boolean(selectedContact && selectedContactCompanyId),
+  });
+  const companyContactsQuery = useQuery({
+    queryKey: ["company-contacts", selectedCompany?.id],
+    queryFn: ({ signal }) => api.get<CursorPage<ApiContact>>(
+      `/companies/${selectedCompany?.id}/contacts?limit=100`,
+      { signal },
+    ),
+    enabled: remoteEnabled && !isEmployee && Boolean(selectedCompany?.id),
+  });
   const selectedPurchases = purchasesQuery.data?.items ?? [];
   const selectedRevenue = selectedPurchases.reduce((sum, deal) => sum + Number(deal.amount ?? 0), 0);
   const selectedDemoNames = selectedContact ? demoContactNames(selectedContact) : { firstName: "", lastName: "" };
@@ -183,6 +225,17 @@ export default function ContactsPage() {
     const candidates = remoteEnabled ? remote : Object.values(users);
     return candidates.some((user) => user.id === currentUser.id) ? candidates : [currentUser, ...candidates];
   }, [currentUser, remoteUsers.data]);
+  const selectedContactCompany = selectedContactCompanyQuery.data
+    ?? (!remoteEnabled && selectedContact
+      ? demoCompanies.find((company) => company.name === selectedContact.company) ?? null
+      : null);
+  const companyContacts = useMemo<Contact[]>(() => {
+    if (!selectedCompany) return [];
+    if (!remoteEnabled) return demoContacts.filter((contact) => contact.company === selectedCompany.name);
+    const usersById = new Map(availableAssignees.map((user) => [user.id, user]));
+    return (companyContactsQuery.data?.items ?? []).map((contact) => contactFromApi(contact, usersById));
+  }, [availableAssignees, companyContactsQuery.data, demoContacts, selectedCompany]);
+  const selectedContactDeals = remoteEnabled ? contactDealsQuery.data?.items ?? [] : [];
 
   useEffect(() => {
     if (!isEmployee || view === "contacts") return;
@@ -190,6 +243,46 @@ export default function ContactsPage() {
     setSelectedCompany(null);
     setDialogOpen(false);
   }, [isEmployee, view]);
+
+  useEffect(() => {
+    if (!routedContactId) return;
+    if (remoteEnabled) {
+      const apiContact = routedContactFromPage ?? routedContactQuery.data;
+      if (!apiContact) return;
+      const usersById = new Map(availableAssignees.map((user) => [user.id, user]));
+      const mappedContact = contactFromApi(apiContact, usersById);
+      setSelectedContact(mappedContact);
+      setSelectedApiContact(apiContact);
+      setSelectedCompany(null);
+      setContactEditing(false);
+      setCompanyEditing(false);
+      setSaveError("");
+      return;
+    }
+    const demoContact = demoContacts.find((contact) => contact.id === routedContactId);
+    if (demoContact) {
+      setSelectedContact(demoContact);
+      setSelectedApiContact(null);
+      setSelectedCompany(null);
+      setContactEditing(false);
+      setCompanyEditing(false);
+      setSaveError("");
+    }
+  }, [availableAssignees, demoContacts, routedContactFromPage, routedContactId, routedContactQuery.data]);
+
+  useEffect(() => {
+    if (routedContactId || !routedCompanyId || isEmployee) return;
+    const company = remoteEnabled
+      ? routedCompanyFromPage ?? routedCompanyQuery.data
+      : demoCompanies.find((item) => item.id === routedCompanyId);
+    if (!company) return;
+    setSelectedContact(null);
+    setSelectedApiContact(null);
+    setSelectedCompany(company);
+    setContactEditing(false);
+    setCompanyEditing(false);
+    setSaveError("");
+  }, [demoCompanies, isEmployee, routedCompanyFromPage, routedCompanyId, routedCompanyQuery.data, routedContactId]);
 
   useEffect(() => {
     if (!remoteEnabled) return;
@@ -201,21 +294,33 @@ export default function ContactsPage() {
       }
       if (contactId) {
         queryClient.removeQueries({ queryKey: ["contact-purchases", contactId] });
+        queryClient.removeQueries({ queryKey: ["contact-deals", contactId] });
       }
+      queryClient.removeQueries({ queryKey: ["contact-detail"] });
+      queryClient.removeQueries({ queryKey: ["company-detail"] });
+      queryClient.removeQueries({ queryKey: ["company-contacts"] });
+      setRouteSearchParams((current) => {
+        const next = new URLSearchParams(current);
+        next.delete("contact");
+        next.delete("company");
+        return next;
+      }, { replace: true });
       setSelectedContact(null);
       setSelectedApiContact(null);
       setSelectedCompany(null);
       setDialogOpen(false);
       setContactEditing(false);
+      setCompanyEditing(false);
       setDeleteConfirmOpen(false);
       setDeleteError("");
       setSaveError("");
       setContactCursors([null]);
+      setCompanyCursors([null]);
       setAccessRevision((value) => value + 1);
     };
     window.addEventListener("pulse:access-changed", handleAccessChanged);
     return () => window.removeEventListener("pulse:access-changed", handleAccessChanged);
-  }, [queryClient, selectedContact?.id, selectedEntityId, selectedEntityType]);
+  }, [queryClient, selectedContact?.id, selectedEntityId, selectedEntityType, setRouteSearchParams]);
 
   async function createEntity(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -297,19 +402,43 @@ export default function ContactsPage() {
     }
   }
 
-  function openContact(contact: Contact) {
+  function routeToRecord(kind: "contact" | "company", id: string) {
+    const next = new URLSearchParams(routeSearchParams);
+    next.delete(kind === "contact" ? "company" : "contact");
+    next.set(kind, id);
+    setRouteSearchParams(next);
+  }
+
+  function openContact(contact: Contact, apiContact?: ApiContact | null) {
     setSelectedContact(contact);
-    setSelectedApiContact(remoteContacts.data?.items.find((item) => item.id === contact.id) ?? null);
+    setSelectedApiContact(apiContact ?? remoteContacts.data?.items.find((item) => item.id === contact.id) ?? null);
     setSelectedCompany(null);
     setContactEditing(false);
+    setCompanyEditing(false);
     setSaveError("");
+    routeToRecord("contact", contact.id);
+  }
+
+  function openCompany(company: ApiCompany) {
+    setSelectedContact(null);
+    setSelectedApiContact(null);
+    setSelectedCompany(company);
+    setContactEditing(false);
+    setCompanyEditing(false);
+    setSaveError("");
+    routeToRecord("company", company.id);
   }
 
   function closeRecord() {
+    const next = new URLSearchParams(routeSearchParams);
+    next.delete("contact");
+    next.delete("company");
+    setRouteSearchParams(next);
     setSelectedContact(null);
     setSelectedApiContact(null);
     setSelectedCompany(null);
     setContactEditing(false);
+    setCompanyEditing(false);
     setSaveError("");
   }
 
@@ -318,6 +447,14 @@ export default function ContactsPage() {
       ...page,
       items: page.items.map((contact) => contact.id === updated.id ? updated : contact),
     } : page);
+  }
+
+  function updateCompanyQueryCache(updated: ApiCompany) {
+    queryClient.setQueriesData<CursorPage<ApiCompany>>({ queryKey: ["companies"] }, (page) => page ? {
+      ...page,
+      items: page.items.map((company) => company.id === updated.id ? updated : company),
+    } : page);
+    queryClient.setQueryData(["company-detail", updated.id], updated);
   }
 
   function removeContactFromQueryCache(contactId: string) {
@@ -383,6 +520,55 @@ export default function ContactsPage() {
       setNotice("Контакт обновлён");
     } catch {
       setSaveError("Не удалось обновить контакт. Возможно, запись уже была изменена.");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function updateCompany(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!selectedCompany || isEmployee) return;
+    const data = new FormData(event.currentTarget);
+    const name = String(data.get("name") ?? "").trim();
+    const email = String(data.get("email") ?? "").trim();
+    const phone = String(data.get("phone") ?? "").trim();
+    const website = String(data.get("website") ?? "").trim();
+    const tags = parseDealTags(String(data.get("tags") ?? ""));
+    const mutationGeneration = accessGeneration.current;
+    setSaving(true);
+    setSaveError("");
+    try {
+      if (remoteEnabled) {
+        const updated = await api.patch<ApiCompany>(`/companies/${selectedCompany.id}`, {
+          expected_version: selectedCompany.version,
+          name,
+          email: email || null,
+          phone: phone || null,
+          website: website || null,
+          tags,
+        });
+        if (mutationGeneration !== accessGeneration.current) return;
+        updateCompanyQueryCache(updated);
+        setSelectedCompany(updated);
+        await queryClient.invalidateQueries({ queryKey: ["companies"] });
+      } else {
+        const updated: ApiCompany = {
+          ...selectedCompany,
+          name,
+          email: email || null,
+          phone: phone || null,
+          website: website || null,
+          tags,
+          version: selectedCompany.version + 1,
+          updated_at: new Date().toISOString(),
+        };
+        setDemoCompanies((items) => items.map((company) => company.id === updated.id ? updated : company));
+        setSelectedCompany(updated);
+      }
+      setCompanyEditing(false);
+      setNotice("Компания обновлена");
+    } catch {
+      setSaveError("Не удалось обновить компанию. Возможно, запись уже была изменена.");
     } finally {
       setSaving(false);
     }
@@ -509,7 +695,7 @@ export default function ContactsPage() {
       {!isEmployee && !loading && !failed && view === "companies" ? <section className="data-table" role="region" aria-label="Список компаний">
         <div className="data-table__header"><span>Компания</span><span>Контакты</span><span>Теги</span><span>Сайт</span><span>Обновлено</span></div>
         {visibleCompanies.map((company) => (
-          <button className="data-row" type="button" key={company.id} onClick={() => setSelectedCompany(company)}>
+          <button className="data-row" type="button" key={company.id} onClick={() => openCompany(company)}>
             <span className="data-row__primary"><span className="company-avatar">{company.name.slice(0, 1)}</span><span><strong>{company.name}</strong><small>Компания</small></span></span>
             <span className="data-row__contact"><strong>{company.phone ?? "—"}</strong><small>{company.email ?? "—"}</small></span>
             <span><strong>{company.tags.length}</strong><small>тегов</small></span>
@@ -574,7 +760,10 @@ export default function ContactsPage() {
                   <Button compact aria-label="Редактировать контакт" onClick={() => { setSaveError(""); setContactEditing(true); }}><Pencil size={15} /><span className="record-dialog__action-label">Редактировать</span></Button>
                   {!isEmployee ? <button type="button" className="icon-button record-delete-button" aria-label="Удалить контакт" title="Удалить контакт" onClick={() => { setDeleteError(""); setDeleteConfirmOpen(true); }}><Trash2 size={16} aria-hidden="true" /></button> : null}
                 </> : null}
-                {selectedCompany && !isEmployee ? <button type="button" className="icon-button record-delete-button" aria-label="Удалить компанию" title="Удалить компанию" onClick={() => { setDeleteError(""); setDeleteConfirmOpen(true); }}><Trash2 size={16} aria-hidden="true" /></button> : null}
+                {selectedCompany && !companyEditing && !isEmployee ? <>
+                  <Button compact aria-label="Редактировать компанию" onClick={() => { setSaveError(""); setCompanyEditing(true); }}><Pencil size={15} /><span className="record-dialog__action-label">Редактировать</span></Button>
+                  <button type="button" className="icon-button record-delete-button" aria-label="Удалить компанию" title="Удалить компанию" onClick={() => { setDeleteError(""); setDeleteConfirmOpen(true); }}><Trash2 size={16} aria-hidden="true" /></button>
+                </> : null}
                 <Dialog.Close className="icon-button" aria-label="Закрыть"><X size={20} /></Dialog.Close>
               </div>
             </div>
@@ -590,17 +779,28 @@ export default function ContactsPage() {
               {saveError ? <p className="form-error" role="alert">{saveError}</p> : null}
               <div className="dialog-actions"><Button type="button" onClick={() => { setSaveError(""); setContactEditing(false); }}>Отмена</Button><Button type="submit" variant="primary" disabled={saving}>{saving ? "Сохраняем…" : "Сохранить"}</Button></div>
             </form> : null}
+            {selectedCompany && companyEditing ? <form className="form-stack contact-edit-form" onSubmit={(event) => void updateCompany(event)}>
+              <label className="field"><span>Название</span><input name="name" required autoFocus defaultValue={selectedCompany.name} /></label>
+              <label className="field"><span>Email</span><input name="email" type="email" defaultValue={selectedCompany.email ?? ""} /></label>
+              <label className="field"><span>Телефон</span><input name="phone" type="tel" defaultValue={selectedCompany.phone ?? ""} /></label>
+              <label className="field"><span>Сайт</span><input name="website" type="url" defaultValue={selectedCompany.website ?? ""} placeholder="https://" /></label>
+              <label className="field"><span>Теги</span><input name="tags" defaultValue={selectedCompany.tags.join(", ")} placeholder="Например: партнёр, поставщик" /></label>
+              {saveError ? <p className="form-error" role="alert">{saveError}</p> : null}
+              <div className="dialog-actions"><Button type="button" onClick={() => { setSaveError(""); setCompanyEditing(false); }}>Отмена</Button><Button type="submit" variant="primary" disabled={saving}>{saving ? "Сохраняем…" : "Сохранить"}</Button></div>
+            </form> : null}
             {selectedContact && !contactEditing ? <div className="record-detail-grid">
               <div><small>Телефон</small><strong>{selectedContact.phone}</strong></div>
               <div><small>Email</small><strong>{selectedContact.email}</strong></div>
-              {!isEmployee ? <div><small>Компания</small><strong>{selectedContact.company}</strong></div> : null}
+              {!isEmployee ? <div><small>Компания</small>{selectedContactCompany
+                ? <button className="record-entity-link" type="button" onClick={() => openCompany(selectedContactCompany)}><strong>{selectedContactCompany.name}</strong><ExternalLink size={14} aria-hidden="true" /></button>
+                : <strong>{selectedContactCompanyQuery.isLoading ? "Загружаем…" : selectedContact.company}</strong>}</div> : null}
               <div><small>Ответственный</small><strong>{selectedContact.assignee?.name ?? "Не назначен"}</strong></div>
               <div className="record-detail-grid__wide"><small>Теги</small><strong>{selectedContact.tags.length ? selectedContact.tags.join(", ") : "Нет тегов"}</strong></div>
               <div><small>Покупок</small><strong>{remoteEnabled ? selectedPurchases.length : selectedContact.deals}</strong></div>
               <div><small>Покупок на сумму</small><strong>{formatMoney(remoteEnabled ? selectedRevenue : selectedContact.revenue)}</strong></div>
               <div className="record-detail-grid__wide"><small>Следующая покупка</small><strong>{selectedContact.nextPurchaseAt ? formatLongDate(selectedContact.nextPurchaseAt) : "Не запланирована"}</strong></div>
             </div> : null}
-            {selectedCompany && !contactEditing ? <div className="record-detail-grid">
+            {selectedCompany && !companyEditing ? <div className="record-detail-grid">
               <div><small>Телефон</small><strong>{selectedCompany.phone ?? "—"}</strong></div>
               <div><small>Email</small><strong>{selectedCompany.email ?? "—"}</strong></div>
               <div className="record-detail-grid__wide"><small>Сайт</small><strong>{selectedCompany.website ?? "Не указан"}</strong></div>
@@ -608,12 +808,18 @@ export default function ContactsPage() {
               <div><small>Обновлено</small><strong>{formatLongDate(selectedCompany.updated_at)}</strong></div>
             </div> : null}
             {selectedContact && !contactEditing ? <section className="record-purchases">
-              <h3>История покупок</h3>
-              {purchasesQuery.isLoading ? <p className="empty-copy">Загружаем покупки…</p> : null}
-              {selectedPurchases.map((deal) => <article key={deal.id}><span><strong>{deal.title}</strong><small>{formatLongDate(deal.updated_at)}</small></span><b>{formatMoney(Number(deal.amount ?? 0))}</b></article>)}
-              {!remoteEnabled || (!purchasesQuery.isLoading && !selectedPurchases.length) ? <p className="empty-copy">Выигранные сделки появятся здесь как покупки.</p> : null}
+              <h3>Сделки</h3>
+              {contactDealsQuery.isLoading ? <p className="empty-copy">Загружаем сделки…</p> : null}
+              {selectedContactDeals.map((deal) => <Link className="record-related-row" key={deal.id} to={`/deals?deal=${encodeURIComponent(deal.id)}`} aria-label={`Открыть сделку ${deal.title}`}><span><strong>{deal.title}</strong><small>{formatLongDate(deal.updated_at)}</small></span><span className="record-related-row__value"><b>{formatMoney(Number(deal.amount ?? 0))}</b><ExternalLink size={14} aria-hidden="true" /></span></Link>)}
+              {!remoteEnabled || (!contactDealsQuery.isLoading && !selectedContactDeals.length) ? <p className="empty-copy">Связанные сделки появятся здесь.</p> : null}
             </section> : null}
-            {!contactEditing ? <section className="record-timeline">
+            {selectedCompany && !companyEditing ? <section className="record-purchases">
+              <h3>Контакты компании</h3>
+              {companyContactsQuery.isLoading ? <p className="empty-copy">Загружаем контакты…</p> : null}
+              {companyContacts.map((contact) => <button className="record-related-row" type="button" key={contact.id} onClick={() => openContact(contact, companyContactsQuery.data?.items.find((item) => item.id === contact.id) ?? null)} aria-label={`Открыть контакт ${contact.name}`}><span><strong>{contact.name}</strong><small>{[contact.phone, contact.email].filter((value) => value !== "—").join(" · ") || "Контакты не указаны"}</small></span><ExternalLink size={14} aria-hidden="true" /></button>)}
+              {!companyContactsQuery.isLoading && !companyContacts.length ? <p className="empty-copy">У компании пока нет связанных контактов.</p> : null}
+            </section> : null}
+            {!contactEditing && !companyEditing ? <section className="record-timeline">
               <h3>История</h3>
               <form className="note-composer record-note-composer" onSubmit={(event) => void createNote(event)}>
                 <textarea name="note" rows={2} maxLength={10_000} placeholder="Добавить заметку" aria-label="Текст заметки" />

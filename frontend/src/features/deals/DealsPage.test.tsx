@@ -224,8 +224,8 @@ describe("DealsPage", () => {
     const user = userEvent.setup();
     renderPage();
 
-    const search = screen.getByPlaceholderText("Поиск по сделкам");
-    await user.type(search, "Север");
+    const search = screen.getByPlaceholderText("Название, контакт или компания");
+    await user.type(search, "Ирина Белова");
 
     expect(screen.getByText("ООО Север")).toBeInTheDocument();
     expect(screen.queryByText("Ресторан Парк")).not.toBeInTheDocument();
@@ -309,6 +309,27 @@ describe("DealsPage", () => {
 
     expect(within(ownerRow as HTMLElement).getByText("Елена Крылова")).toBeInTheDocument();
     expect(within(ownerRow as HTMLElement).queryByText("Алексей Кузнецов")).not.toBeInTheDocument();
+  });
+
+  it("opens linked contact and company records from deal details", async () => {
+    const user = userEvent.setup();
+    const onOpenContact = vi.fn();
+    const onOpenCompany = vi.fn();
+    const linkedDeal = {
+      ...initialDeals[0],
+      contactIds: ["contact-linked"],
+      contactName: "Тестовый контакт",
+      companyId: "company-linked",
+      companyName: "Тестовая компания",
+    };
+    renderDrawer({ deal: linkedDeal, onOpenContact, onOpenCompany });
+
+    const dialog = await screen.findByRole("dialog", { name: linkedDeal.title });
+    await user.click(within(dialog).getByRole("button", { name: "Открыть контакт Тестовый контакт" }));
+    await user.click(within(dialog).getByRole("button", { name: "Открыть компанию Тестовая компания" }));
+
+    expect(onOpenContact).toHaveBeenCalledWith("contact-linked");
+    expect(onOpenCompany).toHaveBeenCalledWith("company-linked");
   });
 
   it("hides destructive, company and assignee mutation controls from employees", async () => {

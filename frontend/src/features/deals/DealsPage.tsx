@@ -10,7 +10,7 @@ import {
 import { sortableKeyboardCoordinates } from "@dnd-kit/sortable";
 import { Columns3, Filter, List, Plus, Search } from "lucide-react";
 import { useCallback, useDeferredValue, useEffect, useId, useMemo, useRef, useState } from "react";
-import { useSearchParams } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 
 import { Avatar } from "../../components/Avatar";
 import { Button } from "../../components/Button";
@@ -47,11 +47,14 @@ export function DealsPage() {
     setDealSearch,
     setDealCustomFields,
     nextCursorByStage,
+    nextDealSearchCursor,
     loadedStageIds,
     stageLoadErrorByStage,
     loadingStageId,
+    loadingMoreDealSearch,
     loadStageDeals,
     loadMoreDeals,
+    loadMoreDealSearch,
     addDeal,
     deleteDeal,
     sendMessage,
@@ -67,6 +70,7 @@ export function DealsPage() {
   const [createOpen, setCreateOpen] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [searchParams, setSearchParams] = useSearchParams();
+  const navigate = useNavigate();
   const routedDealId = deepLinkEntityId(searchParams, "deal");
   const accessGenerationRef = useRef(0);
   const mountedRef = useRef(false);
@@ -156,8 +160,10 @@ export function DealsPage() {
   const visibleDeals = useMemo(() => {
     return deals.filter((deal) => {
       const matchesSource = sourceFilter === "all" || deal.source === sourceFilter;
-      const matchesSearch = !deferredSearch
-        || `${deal.title} ${deal.subtitle} ${deal.sourceLabel} ${deal.tags.join(" ")}`.toLocaleLowerCase("ru").includes(deferredSearch);
+      const matchesSearch = remoteEnabled || !deferredSearch
+        || `${deal.title} ${deal.subtitle} ${deal.sourceLabel} ${deal.contactName ?? ""} ${deal.companyName ?? ""} ${deal.phone ?? ""} ${deal.email ?? ""} ${deal.tags.join(" ")}`
+          .toLocaleLowerCase("ru")
+          .includes(deferredSearch);
       return matchesSource && matchesSearch;
     });
   }, [deals, deferredSearch, sourceFilter]);
@@ -220,7 +226,7 @@ export function DealsPage() {
         </label>
         <label className="search-control">
           <Search size={18} aria-hidden="true" />
-          <input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Поиск по сделкам" />
+          <input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Название, контакт или компания" />
         </label>
         <label className={`select-control deals-source-filter${filtersOpen ? " is-open" : ""}`}>
           <span className="sr-only">Источник сделки</span>
@@ -258,11 +264,11 @@ export function DealsPage() {
               selectedDealId={selectedDealId}
               onSelect={handleSelectDeal}
               onAdd={() => setCreateOpen(true)}
-              deferred={!loadedStageIds[stage.id] && (stage.stageType === "won" || stage.stageType === "lost")}
+              deferred={!deferredSearch && !loadedStageIds[stage.id] && (stage.stageType === "won" || stage.stageType === "lost")}
               loadError={stageLoadErrorByStage[stage.id]}
-              hasMore={Boolean(nextCursorByStage[stage.id])}
+              hasMore={!deferredSearch && Boolean(nextCursorByStage[stage.id])}
               loadingMore={loadingStageId === stage.id}
-              requestsBusy={Boolean(loadingStageId)}
+              requestsBusy={Boolean(loadingStageId) || loadingMoreDealSearch}
               onLoadDeferred={() => loadStageDeals(stage.id)}
               onLoadMore={() => loadMoreDeals(stage.id)}
             />
@@ -313,6 +319,15 @@ export function DealsPage() {
         {!visibleDeals.length ? <p className="empty-copy">Сделки не найдены</p> : null}
       </section> : null}
 
+      {!loading && !error && deferredSearch && nextDealSearchCursor ? <div className="list-pagination deal-search-pagination">
+        <Button
+          compact
+          className="list-pagination__button"
+          disabled={loadingMoreDealSearch}
+          onClick={() => void loadMoreDealSearch().catch(() => setNotice("Не удалось загрузить остальные результаты поиска."))}
+        >{loadingMoreDealSearch ? "Загружаем…" : "Показать ещё результаты"}</Button>
+      </div> : null}
+
       <NewDealDialog
         open={createOpen}
         onOpenChange={setCreateOpen}
@@ -343,6 +358,8 @@ export function DealsPage() {
         onRetryMessage={retryMessage}
         onToggleTask={toggleTask}
         onDelete={deleteDeal}
+        onOpenContact={(contactId) => navigate(`/contacts?contact=${encodeURIComponent(contactId)}`)}
+        onOpenCompany={(companyId) => navigate(`/contacts?company=${encodeURIComponent(companyId)}`)}
       />
     </div>
   );

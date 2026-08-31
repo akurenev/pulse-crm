@@ -703,6 +703,54 @@ async def test_employee_crm_access_is_owner_scoped_and_idor_safe(
             own_deal["id"],
             own_won_deal["id"],
         }
+        visible_deal_search = await employee.get(
+            "/api/v1/deals",
+            params={
+                "limit": 100,
+                "pipeline_id": pipeline["id"],
+                "search": "Linked",
+            },
+        )
+        assert visible_deal_search.status_code == 200, visible_deal_search.text
+        assert {item["id"] for item in visible_deal_search.json()["items"]} == {
+            own_deal["id"],
+            own_won_deal["id"],
+        }
+        hidden_deal_search = await employee.get(
+            "/api/v1/deals",
+            params={
+                "limit": 100,
+                "pipeline_id": pipeline["id"],
+                "search": "Foreign",
+            },
+        )
+        assert hidden_deal_search.status_code == 200, hidden_deal_search.text
+        assert hidden_deal_search.json()["items"] == []
+        linked_company_contacts = await employee.get(
+            f"/api/v1/companies/{linked_company['id']}/contacts",
+            params={"limit": 100},
+        )
+        assert linked_company_contacts.status_code == 200, linked_company_contacts.text
+        assert [
+            item["id"] for item in linked_company_contacts.json()["items"]
+        ] == [linked_contact["id"]]
+        linked_contact_deals = await employee.get(
+            f"/api/v1/contacts/{linked_contact['id']}/deals",
+            params={"limit": 100},
+        )
+        assert linked_contact_deals.status_code == 200, linked_contact_deals.text
+        assert {item["id"] for item in linked_contact_deals.json()["items"]} == {
+            own_deal["id"],
+            own_won_deal["id"],
+        }
+        assert (
+            await employee.get(
+                f"/api/v1/companies/{foreign_company['id']}/contacts"
+            )
+        ).status_code == 404
+        assert (
+            await employee.get(f"/api/v1/contacts/{foreign_contact['id']}/deals")
+        ).status_code == 404
         loaded_own_deal = await employee.get(f"/api/v1/deals/{own_deal['id']}")
         assert loaded_own_deal.status_code == 200, loaded_own_deal.text
         assert loaded_own_deal.json()["contact_ids"] == [linked_contact["id"]]

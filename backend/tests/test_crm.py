@@ -106,6 +106,163 @@ async def test_contact_company_and_task_crud(
 
 
 @pytest.mark.asyncio
+async def test_company_contacts_contact_deals_and_global_deal_search(
+    client: httpx.AsyncClient, owner_auth: dict[str, object]
+) -> None:
+    headers = csrf(owner_auth)
+    company_response = await client.post(
+        "/api/v1/companies",
+        headers=headers,
+        json={
+            "name": "Example Industries",
+            "website": "https://example.test",
+            "phone": "+1 202 555 0147",
+            "email": "accounts@example.com",
+            "custom_fields": {"registration_code": "ORG-SEARCH-42"},
+        },
+    )
+    assert company_response.status_code == 201, company_response.text
+    company = company_response.json()
+    contact_response = await client.post(
+        "/api/v1/contacts",
+        headers=headers,
+        json={
+            "first_name": "Taylor",
+            "last_name": "Example",
+            "company_id": company["id"],
+            "primary_email": "taylor@example.com",
+            "primary_phone": "+1 202 555 0188",
+            "emails": ["team@example.com"],
+            "phones": ["+1 202 555 0199"],
+        },
+    )
+    assert contact_response.status_code == 201, contact_response.text
+    contact = contact_response.json()
+    unrelated_contact = await client.post(
+        "/api/v1/contacts",
+        headers=headers,
+        json={"first_name": "Unrelated", "company_id": None},
+    )
+    assert unrelated_contact.status_code == 201, unrelated_contact.text
+
+    pipeline = (await client.get("/api/v1/pipelines")).json()[0]
+    open_stage = next(stage for stage in pipeline["stages"] if stage["stage_type"] == "open")
+    won_stage = next(stage for stage in pipeline["stages"] if stage["stage_type"] == "won")
+    lost_stage = next(stage for stage in pipeline["stages"] if stage["stage_type"] == "lost")
+    open_deal_response = await client.post(
+        "/api/v1/deals",
+        headers=headers,
+        json={
+            "title": "Initial consultation",
+            "pipeline_id": pipeline["id"],
+            "stage_id": open_stage["id"],
+            "company_id": company["id"],
+            "contact_ids": [contact["id"]],
+        },
+    )
+    won_deal_response = await client.post(
+        "/api/v1/deals",
+        headers=headers,
+        json={
+            "title": "Completed installation",
+            "pipeline_id": pipeline["id"],
+            "stage_id": won_stage["id"],
+            "company_id": company["id"],
+            "contact_ids": [contact["id"]],
+        },
+    )
+    lost_deal_response = await client.post(
+        "/api/v1/deals",
+        headers=headers,
+        json={
+            "title": "Archived proposal",
+            "pipeline_id": pipeline["id"],
+            "stage_id": lost_stage["id"],
+            "company_id": company["id"],
+            "contact_ids": [contact["id"]],
+        },
+    )
+    assert open_deal_response.status_code == 201, open_deal_response.text
+    assert won_deal_response.status_code == 201, won_deal_response.text
+    assert lost_deal_response.status_code == 201, lost_deal_response.text
+    expected_deal_ids = {
+        open_deal_response.json()["id"],
+        won_deal_response.json()["id"],
+        lost_deal_response.json()["id"],
+    }
+
+    company_contacts = await client.get(
+        f"/api/v1/companies/{company['id']}/contacts", params={"limit": 100}
+    )
+    assert company_contacts.status_code == 200, company_contacts.text
+    assert [item["id"] for item in company_contacts.json()["items"]] == [contact["id"]]
+
+    contact_deals = await client.get(
+        f"/api/v1/contacts/{contact['id']}/deals", params={"limit": 100}
+    )
+    assert contact_deals.status_code == 200, contact_deals.text
+    assert {item["id"] for item in contact_deals.json()["items"]} == expected_deal_ids
+    assert all(item["company"]["id"] == company["id"] for item in contact_deals.json()["items"])
+    assert all(
+        item["primary_contact"]["id"] == contact["id"]
+        for item in contact_deals.json()["items"]
+    )
+
+    for term in (
+        "Taylor Example",
+        "taylor@example.com",
+        "+1 202 555 0188",
+        "team@example.com",
+        "+1 202 555 0199",
+        "Example Industries",
+        "accounts@example.com",
+        "+1 202 555 0147",
+    ):
+        searched = await client.get(
+            "/api/v1/deals",
+            params={"limit": 100, "pipeline_id": pipeline["id"], "search": term},
+        )
+        assert searched.status_code == 200, (term, searched.text)
+        assert {item["id"] for item in searched.json()["items"]} == expected_deal_ids
+
+    for term in ("accounts@example.com", "+1 202 555 0147", "ORG-SEARCH-42"):
+        searched_companies = await client.get(
+            "/api/v1/companies", params={"search": term}
+        )
+        assert searched_companies.status_code == 200, searched_companies.text
+        assert [item["id"] for item in searched_companies.json()["items"]] == [
+            company["id"]
+        ]
+
+    updated_company = await client.patch(
+        f"/api/v1/companies/{company['id']}",
+        headers=headers,
+        json={
+            "expected_version": company["version"],
+            "name": "Example Industries Updated",
+            "phone": None,
+        },
+    )
+    assert updated_company.status_code == 200, updated_company.text
+    assert updated_company.json()["name"] == "Example Industries Updated"
+    assert updated_company.json()["phone"] is None
+    assert updated_company.json()["version"] == company["version"] + 1
+    for required_field in ("name", "tags", "custom_fields"):
+        invalid_update = await client.patch(
+            f"/api/v1/companies/{company['id']}",
+            headers=headers,
+            json={
+                "expected_version": updated_company.json()["version"],
+                required_field: None,
+            },
+        )
+        assert invalid_update.status_code == 422, (
+            required_field,
+            invalid_update.text,
+        )
+
+
+@pytest.mark.asyncio
 async def test_contact_update_and_soft_delete_are_versioned(
     client: httpx.AsyncClient, owner_auth: dict[str, object]
 ) -> None:

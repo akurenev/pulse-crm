@@ -2,6 +2,7 @@ import * as Dialog from "@radix-ui/react-dialog";
 import * as Tabs from "@radix-ui/react-tabs";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
+  ArrowUpRight,
   CalendarDays,
   Building2,
   Check,
@@ -53,9 +54,11 @@ interface DealDrawerProps {
   onRetryMessage: (dealId: string, messageId: string) => Promise<void>;
   onToggleTask: (dealId: string, taskId: string) => Promise<void>;
   onDelete: (dealId: string) => Promise<void>;
+  onOpenContact?: (contactId: string) => void;
+  onOpenCompany?: (companyId: string) => void;
 }
 
-export function DealDrawer({ deal, pipeline, assignees, canAccessCompanies = true, canDelete = true, canManageAssignee = true, mutationPending, onClose, onMove, onSetNextPurchase, onSetContact, onSetCompany, onSetAssignee, onSetTags, onSetCustomFields, onSendMessage, onRetryMessage, onToggleTask, onDelete }: DealDrawerProps) {
+export function DealDrawer({ deal, pipeline, assignees, canAccessCompanies = true, canDelete = true, canManageAssignee = true, mutationPending, onClose, onMove, onSetNextPurchase, onSetContact, onSetCompany, onSetAssignee, onSetTags, onSetCustomFields, onSendMessage, onRetryMessage, onToggleTask, onDelete, onOpenContact, onOpenCompany }: DealDrawerProps) {
   const queryClient = useQueryClient();
   const overlayModal = useMediaQuery("(max-width: 1100px)");
   const [tab, setTab] = useState("details");
@@ -256,13 +259,13 @@ export function DealDrawer({ deal, pipeline, assignees, canAccessCompanies = tru
                 <dl className="details-list deal-details">
                   <div className="deal-details__row deal-details__row--contact">
                     <dt className="deal-details__label"><UserRound size={17} aria-hidden="true" /><span className="deal-details__label-text">Контакт</span></dt>
-                    <dd className="deal-details__value"><ContactPicker deal={deal} disabled={mutationPending} onSave={onSetContact} /></dd>
+                    <dd className="deal-details__value"><ContactPicker deal={deal} disabled={mutationPending} onSave={onSetContact} onOpen={onOpenContact} /></dd>
                   </div>
                   {deal.phone ? <div className="deal-details__row deal-details__row--phone"><dt className="deal-details__label"><Phone size={17} aria-hidden="true" /><span className="deal-details__label-text">Телефон</span></dt><dd className="deal-details__value"><a href={`tel:${deal.phone}`}>{deal.phone}</a></dd></div> : null}
                   {deal.email ? <div className="deal-details__row deal-details__row--email"><dt className="deal-details__label"><Mail size={17} aria-hidden="true" /><span className="deal-details__label-text">Email</span></dt><dd className="deal-details__value"><a href={`mailto:${deal.email}`}>{deal.email}</a></dd></div> : null}
                   {canAccessCompanies ? <div className="deal-details__row deal-details__row--company">
                     <dt className="deal-details__label"><Building2 size={17} aria-hidden="true" /><span className="deal-details__label-text">Компания</span></dt>
-                    <dd className="deal-details__value"><CompanyPicker deal={deal} disabled={mutationPending} onSave={onSetCompany} /></dd>
+                    <dd className="deal-details__value"><CompanyPicker deal={deal} disabled={mutationPending} onSave={onSetCompany} onOpen={onOpenCompany} /></dd>
                   </div> : null}
                   <div className="deal-details__row deal-details__row--owner">
                     <dt className="deal-details__label"><UserRoundCheck size={17} aria-hidden="true" /><span className="deal-details__label-text">Ответственный</span></dt>
@@ -526,7 +529,7 @@ function AssigneePicker({ deal, assignees, disabled, onSave }: {
   </form>;
 }
 
-function ContactPicker({ deal, disabled, onSave }: { deal: Deal; disabled: boolean; onSave: DealDrawerProps["onSetContact"] }) {
+function ContactPicker({ deal, disabled, onSave, onOpen }: { deal: Deal; disabled: boolean; onSave: DealDrawerProps["onSetContact"]; onOpen?: DealDrawerProps["onOpenContact"] }) {
   const [editing, setEditing] = useState(false);
   const [search, setSearch] = useState("");
   const [saving, setSaving] = useState(false);
@@ -561,7 +564,14 @@ function ContactPicker({ deal, disabled, onSave }: { deal: Deal; disabled: boole
   }
 
   if (!editing) {
-    return <span className="relation-value"><span>{deal.contactName ?? "Не указан"}</span>{remoteEnabled ? <EditFieldButton label="Изменить контакт сделки" disabled={disabled} onClick={() => setEditing(true)} /> : null}</span>;
+    const contactId = deal.contactIds?.[0];
+    const contactName = deal.contactName ?? "Не указан";
+    return <span className="relation-value">
+      {contactId && onOpen
+        ? <button type="button" className="deal-relation-link" aria-label={`Открыть контакт ${contactName}`} onClick={() => onOpen(contactId)}><span>{contactName}</span><ArrowUpRight size={14} aria-hidden="true" /></button>
+        : <span>{contactName}</span>}
+      {remoteEnabled ? <EditFieldButton label="Изменить контакт сделки" disabled={disabled} onClick={() => setEditing(true)} /> : null}
+    </span>;
   }
   return <span className="relation-picker">
     <input autoFocus aria-label="Поиск контакта" value={search} disabled={disabled} onChange={(event) => setSearch(event.target.value)} placeholder="Имя, телефон или email" />
@@ -573,7 +583,7 @@ function ContactPicker({ deal, disabled, onSave }: { deal: Deal; disabled: boole
   </span>;
 }
 
-function CompanyPicker({ deal, disabled, onSave }: { deal: Deal; disabled: boolean; onSave: DealDrawerProps["onSetCompany"] }) {
+function CompanyPicker({ deal, disabled, onSave, onOpen }: { deal: Deal; disabled: boolean; onSave: DealDrawerProps["onSetCompany"]; onOpen?: DealDrawerProps["onOpenCompany"] }) {
   const [editing, setEditing] = useState(false);
   const [search, setSearch] = useState("");
   const [saving, setSaving] = useState(false);
@@ -603,7 +613,14 @@ function CompanyPicker({ deal, disabled, onSave }: { deal: Deal; disabled: boole
   }
 
   if (!editing) {
-    return <span className="relation-value"><span>{deal.companyName ?? "Не указана"}</span>{remoteEnabled ? <EditFieldButton label="Изменить компанию сделки" disabled={disabled} onClick={() => setEditing(true)} /> : null}</span>;
+    const companyId = deal.companyId;
+    const companyName = deal.companyName ?? "Не указана";
+    return <span className="relation-value">
+      {companyId && onOpen
+        ? <button type="button" className="deal-relation-link" aria-label={`Открыть компанию ${companyName}`} onClick={() => onOpen(companyId)}><span>{companyName}</span><ArrowUpRight size={14} aria-hidden="true" /></button>
+        : <span>{companyName}</span>}
+      {remoteEnabled ? <EditFieldButton label="Изменить компанию сделки" disabled={disabled} onClick={() => setEditing(true)} /> : null}
+    </span>;
   }
   return <span className="relation-picker">
     <input autoFocus aria-label="Поиск компании" value={search} disabled={disabled} onChange={(event) => setSearch(event.target.value)} placeholder="Название, телефон или email" />

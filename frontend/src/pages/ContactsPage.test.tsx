@@ -2,8 +2,9 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { MemoryRouter } from "react-router-dom";
 
-import type { ApiCompany, ApiContact, ApiUser, CursorPage } from "../types/api";
+import type { ApiCompany, ApiContact, ApiDeal, ApiUser, CursorPage } from "../types/api";
 import ContactsPage from "./ContactsPage";
 
 const { deleteMock, getMock, patchMock, postMock, permissionState } = vi.hoisted(() => ({
@@ -73,12 +74,36 @@ const company = (id: string, name: string): ApiCompany => ({
   updated_at: "2026-08-29T10:00:00Z",
 });
 
-function renderPage() {
+const deal = (id: string, title: string): ApiDeal => ({
+  id,
+  title,
+  pipeline_id: "pipeline-1",
+  stage_id: "stage-1",
+  company_id: null,
+  company: null,
+  contact_ids: [],
+  primary_contact: null,
+  assignee_id: null,
+  source_id: null,
+  amount: "12500",
+  currency: "RUB",
+  tags: [],
+  custom_fields: {},
+  next_purchase_at: null,
+  last_activity_at: "2026-08-29T10:00:00Z",
+  version: 1,
+  created_at: "2026-08-29T10:00:00Z",
+  updated_at: "2026-08-29T10:00:00Z",
+});
+
+function renderPage(initialEntry = "/contacts") {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const rendered = render(
-    <QueryClientProvider client={queryClient}>
-      <ContactsPage />
-    </QueryClientProvider>,
+    <MemoryRouter initialEntries={[initialEntry]}>
+      <QueryClientProvider client={queryClient}>
+        <ContactsPage />
+      </QueryClientProvider>
+    </MemoryRouter>,
   );
   return { ...rendered, queryClient };
 }
@@ -111,7 +136,11 @@ beforeEach(() => {
         : { items: [company("company-1", "Первая компания")], next_cursor: "companies-page-2" };
       return Promise.resolve(page);
     }
-    if (pathname === "/activity" || (pathname.startsWith("/contacts/") && pathname.endsWith("/purchases"))) {
+    if (
+      pathname === "/activity"
+      || (pathname.startsWith("/contacts/") && (pathname.endsWith("/purchases") || pathname.endsWith("/deals")))
+      || (pathname.startsWith("/companies/") && pathname.endsWith("/contacts"))
+    ) {
       return Promise.resolve({ items: [], next_cursor: null });
     }
     return Promise.reject(new Error(`Unexpected GET ${path}`));
@@ -208,6 +237,95 @@ describe("ContactsPage pagination", () => {
   });
 });
 
+describe("ContactsPage linked records", () => {
+  it("opens a contact company and its deals, then navigates back from the company contact list", async () => {
+    const user = userEvent.setup();
+    const linkedCompany = company("company-linked", "Связанная компания");
+    const linkedContact = { ...contact("contact-linked", "Связанный"), company_id: linkedCompany.id };
+    const linkedDeal = deal("deal-linked", "Связанная сделка");
+    getMock.mockImplementation((path: string) => {
+      if (path === "/users") return Promise.resolve([responsibleUser]);
+      const pathname = path.split("?")[0];
+      if (pathname === "/contacts") return Promise.resolve({ items: [linkedContact], next_cursor: null });
+      if (pathname === `/companies/${linkedCompany.id}`) return Promise.resolve(linkedCompany);
+      if (pathname === `/contacts/${linkedContact.id}/deals`) return Promise.resolve({ items: [linkedDeal], next_cursor: null });
+      if (pathname === `/contacts/${linkedContact.id}/purchases`) return Promise.resolve({ items: [linkedDeal], next_cursor: null });
+      if (pathname === `/companies/${linkedCompany.id}/contacts`) return Promise.resolve({ items: [linkedContact], next_cursor: null });
+      if (pathname === "/activity") return Promise.resolve({ items: [], next_cursor: null });
+      return Promise.reject(new Error(`Unexpected GET ${path}`));
+    });
+    renderPage();
+
+    await user.click(await screen.findByText("Связанный Контакт"));
+    const contactDetail = await screen.findByRole("dialog", { name: "Связанный Контакт" });
+    const dealLink = await within(contactDetail).findByRole("link", { name: "Открыть сделку Связанная сделка" });
+    expect(dealLink).toHaveAttribute("href", "/deals?deal=deal-linked");
+    await user.click(await within(contactDetail).findByRole("button", { name: "Связанная компания" }));
+
+    const companyDetail = await screen.findByRole("dialog", { name: "Связанная компания" });
+    expect(within(companyDetail).queryByText("У компании пока нет связанных контактов.")).not.toBeInTheDocument();
+    await user.click(await within(companyDetail).findByRole("button", { name: "Открыть контакт Связанный Контакт" }));
+    expect(await screen.findByRole("dialog", { name: "Связанный Контакт" })).toBeInTheDocument();
+  });
+
+  it("opens contact and company deep links even when records are outside the current page", async () => {
+    const deepContact = contact("contact-deep", "Глубокий");
+    getMock.mockImplementation((path: string) => {
+      if (path === "/users") return Promise.resolve([responsibleUser]);
+      if (path === "/contacts?limit=25") return Promise.resolve({ items: [], next_cursor: null });
+      if (path === `/contacts/${deepContact.id}`) return Promise.resolve(deepContact);
+      const pathname = path.split("?")[0];
+      if (pathname === "/activity" || pathname.endsWith("/purchases") || pathname.endsWith("/deals")) {
+        return Promise.resolve({ items: [], next_cursor: null });
+      }
+      return Promise.reject(new Error(`Unexpected GET ${path}`));
+    });
+
+    renderPage(`/contacts?contact=${deepContact.id}`);
+
+    expect(await screen.findByRole("dialog", { name: "Глубокий Контакт" })).toBeInTheDocument();
+    expect(getMock).toHaveBeenCalledWith(`/contacts/${deepContact.id}`, expect.objectContaining({ signal: expect.any(AbortSignal) }));
+  });
+
+  it("opens a company deep link outside the current company page", async () => {
+    const deepCompany = company("company-deep", "Глубокая компания");
+    getMock.mockImplementation((path: string) => {
+      if (path === "/users") return Promise.resolve([responsibleUser]);
+      if (path === "/contacts?limit=25") return Promise.resolve({ items: [], next_cursor: null });
+      if (path === `/companies/${deepCompany.id}`) return Promise.resolve(deepCompany);
+      const pathname = path.split("?")[0];
+      if (pathname === "/activity" || pathname.endsWith("/contacts")) {
+        return Promise.resolve({ items: [], next_cursor: null });
+      }
+      return Promise.reject(new Error(`Unexpected GET ${path}`));
+    });
+
+    renderPage(`/contacts?company=${deepCompany.id}`);
+
+    expect(await screen.findByRole("dialog", { name: "Глубокая компания" })).toBeInTheDocument();
+    expect(getMock).toHaveBeenCalledWith(`/companies/${deepCompany.id}`, expect.objectContaining({ signal: expect.any(AbortSignal) }));
+  });
+
+  it("keeps server-matched company search results visible for normalized phone queries", async () => {
+    const user = userEvent.setup();
+    const matchedCompany = { ...company("company-phone", "Телефонная компания"), phone: "+7 (000) 123-45-67" };
+    getMock.mockImplementation((path: string) => {
+      if (path === "/users") return Promise.resolve([responsibleUser]);
+      if (path.startsWith("/contacts?")) return Promise.resolve({ items: [], next_cursor: null });
+      if (path === "/companies?limit=25") return Promise.resolve({ items: [], next_cursor: null });
+      if (path.includes("/companies?limit=25&search=70001234567")) return Promise.resolve({ items: [matchedCompany], next_cursor: null });
+      return Promise.reject(new Error(`Unexpected GET ${path}`));
+    });
+    renderPage();
+
+    await user.click(screen.getByRole("button", { name: "Компании" }));
+    await user.type(screen.getByPlaceholderText("Имя, компания, тег, телефон или email"), "70001234567");
+
+    expect(await screen.findByText("Телефонная компания")).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByText("Телефонная компания")).toBeVisible());
+  });
+});
+
 describe("ContactsPage contact management", () => {
   it("edits a contact with its current version and refreshes the list cache", async () => {
     const user = userEvent.setup();
@@ -216,7 +334,7 @@ describe("ContactsPage contact management", () => {
       if (path === "/users") return Promise.resolve([responsibleUser]);
       const pathname = path.split("?")[0];
       if (pathname === "/contacts") return Promise.resolve({ items: [storedContact], next_cursor: null });
-      if (pathname === "/activity" || pathname.endsWith("/purchases")) return Promise.resolve({ items: [], next_cursor: null });
+      if (pathname === "/activity" || pathname.endsWith("/purchases") || pathname.endsWith("/deals")) return Promise.resolve({ items: [], next_cursor: null });
       return Promise.reject(new Error(`Unexpected GET ${path}`));
     });
     patchMock.mockImplementation((_path: string, payload: Record<string, unknown>) => {
@@ -273,6 +391,59 @@ describe("ContactsPage contact management", () => {
     expect(await screen.findByText("Мария Новая")).toBeInTheDocument();
   });
 
+  it("edits a company with optimistic versioning and refreshes the visible record", async () => {
+    const user = userEvent.setup();
+    let storedCompany: ApiCompany = { ...company("company-edit", "Старая компания"), phone: "+7 000 000-00-00" };
+    getMock.mockImplementation((path: string) => {
+      if (path === "/users") return Promise.resolve([responsibleUser]);
+      const pathname = path.split("?")[0];
+      if (pathname === "/contacts") return Promise.resolve({ items: [], next_cursor: null });
+      if (pathname === "/companies") return Promise.resolve({ items: [storedCompany], next_cursor: null });
+      if (pathname === "/activity" || pathname.endsWith("/contacts")) return Promise.resolve({ items: [], next_cursor: null });
+      return Promise.reject(new Error(`Unexpected GET ${path}`));
+    });
+    patchMock.mockImplementation((_path: string, payload: Record<string, unknown>) => {
+      storedCompany = {
+        ...storedCompany,
+        name: String(payload.name),
+        email: payload.email as string | null,
+        phone: payload.phone as string | null,
+        website: payload.website as string | null,
+        tags: payload.tags as string[],
+        version: 2,
+      };
+      return Promise.resolve(storedCompany);
+    });
+    renderPage();
+
+    await user.click(screen.getByRole("button", { name: "Компании" }));
+    await user.click(await screen.findByText("Старая компания"));
+    const detail = await screen.findByRole("dialog", { name: "Старая компания" });
+    await user.click(within(detail).getByRole("button", { name: "Редактировать компанию" }));
+    await user.clear(within(detail).getByLabelText("Название"));
+    await user.type(within(detail).getByLabelText("Название"), "Новая компания");
+    await user.clear(within(detail).getByLabelText("Email"));
+    await user.type(within(detail).getByLabelText("Email"), "new-company@example.com");
+    await user.clear(within(detail).getByLabelText("Телефон"));
+    await user.type(within(detail).getByLabelText("Телефон"), "+7 000 111-22-33");
+    await user.type(within(detail).getByLabelText("Сайт"), "https://company.example.com");
+    await user.type(within(detail).getByLabelText("Теги"), " Партнёр, VIP, партнёр ");
+    await user.click(within(detail).getByRole("button", { name: "Сохранить" }));
+
+    await waitFor(() => expect(patchMock).toHaveBeenCalledWith("/companies/company-edit", {
+      expected_version: 1,
+      name: "Новая компания",
+      email: "new-company@example.com",
+      phone: "+7 000 111-22-33",
+      website: "https://company.example.com",
+      tags: ["Партнёр", "VIP"],
+    }));
+    expect(await within(detail).findByRole("heading", { name: "Новая компания" })).toBeInTheDocument();
+    expect(screen.getByText("Компания обновлена")).toBeInTheDocument();
+    await user.click(within(detail).getByRole("button", { name: "Закрыть" }));
+    expect(await within(screen.getByRole("region", { name: "Список компаний" })).findByText("Новая компания")).toBeInTheDocument();
+  });
+
   it("restricts employee contacts to the current assignee and removes company and delete actions", async () => {
     permissionState.isEmployee = true;
     postMock.mockResolvedValue(contact("contact-created", "Новый", currentUser.id));
@@ -310,7 +481,7 @@ describe("ContactsPage contact management", () => {
           ? Promise.resolve({ items: [contact("contact-1", "Первый", currentUser.id)], next_cursor: null })
           : pendingRefresh;
       }
-      if (path.startsWith("/activity?") || path.endsWith("/purchases?limit=100")) {
+      if (path.startsWith("/activity?") || path.endsWith("/purchases?limit=100") || path.endsWith("/deals?limit=100")) {
         return Promise.resolve({ items: [], next_cursor: null });
       }
       return Promise.reject(new Error(`Unexpected GET ${path}`));
@@ -322,12 +493,14 @@ describe("ContactsPage contact management", () => {
     expect(await screen.findByRole("dialog", { name: "Первый Контакт" })).toBeInTheDocument();
     await waitFor(() => expect(queryClient.getQueryData(["activity", "contact", "contact-1"])).toBeDefined());
     await waitFor(() => expect(queryClient.getQueryData(["contact-purchases", "contact-1"])).toBeDefined());
+    await waitFor(() => expect(queryClient.getQueryData(["contact-deals", "contact-1"])).toBeDefined());
 
     act(() => window.dispatchEvent(new Event("pulse:access-changed")));
 
     expect(screen.queryByRole("dialog", { name: "Первый Контакт" })).not.toBeInTheDocument();
     expect(queryClient.getQueryData(["activity", "contact", "contact-1"])).toBeUndefined();
     expect(queryClient.getQueryData(["contact-purchases", "contact-1"])).toBeUndefined();
+    expect(queryClient.getQueryData(["contact-deals", "contact-1"])).toBeUndefined();
     expect(screen.queryByText("Первый Контакт")).not.toBeInTheDocument();
     await waitFor(() => expect(contactRequests).toBe(2));
   });
@@ -340,7 +513,7 @@ describe("ContactsPage contact management", () => {
       if (path === "/users") return Promise.resolve([responsibleUser]);
       const pathname = path.split("?")[0];
       if (pathname === "/contacts") return Promise.resolve({ items: deleted ? [] : [storedContact], next_cursor: null });
-      if (pathname === "/activity" || pathname.endsWith("/purchases")) return Promise.resolve({ items: [], next_cursor: null });
+      if (pathname === "/activity" || pathname.endsWith("/purchases") || pathname.endsWith("/deals")) return Promise.resolve({ items: [], next_cursor: null });
       return Promise.reject(new Error(`Unexpected GET ${path}`));
     });
     deleteMock.mockImplementation(() => {
@@ -375,7 +548,7 @@ describe("ContactsPage contact management", () => {
       const pathname = path.split("?")[0];
       if (pathname === "/contacts") return Promise.resolve({ items: [], next_cursor: null });
       if (pathname === "/companies") return Promise.resolve({ items: deleted ? [] : [storedCompany], next_cursor: null });
-      if (pathname === "/activity") return Promise.resolve({ items: [], next_cursor: null });
+      if (pathname === "/activity" || pathname.endsWith("/contacts")) return Promise.resolve({ items: [], next_cursor: null });
       return Promise.reject(new Error(`Unexpected GET ${path}`));
     });
     deleteMock.mockImplementation(() => {

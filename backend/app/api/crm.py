@@ -9,6 +9,7 @@ import sqlalchemy as sa
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from app.db import get_session
 from app.integrations.identity import IdentityNormalizationError, sync_contact_points
@@ -383,10 +384,18 @@ async def list_companies(
         company_access_condition(context),
     )
     if search and (term := search.strip()):
+        dialect_name = db.get_bind().dialect.name
+        literal_pattern = _literal_contains_pattern(term)
         query = query.where(
             sa.or_(
-                Company.name.ilike(f"%{term}%"),
-                _tags_search_condition(Company.tags, term, db.get_bind().dialect.name),
+                Company.name.ilike(literal_pattern, escape="\\"),
+                Company.email.ilike(literal_pattern, escape="\\"),
+                Company.phone.ilike(literal_pattern, escape="\\"),
+                Company.website.ilike(literal_pattern, escape="\\"),
+                _tags_search_condition(Company.tags, term, dialect_name),
+                _json_object_values_search_condition(
+                    Company.custom_fields, term, dialect_name
+                ),
             )
         )
     if (condition := _cursor_condition(Company, cursor)) is not None:
@@ -433,6 +442,44 @@ async def get_company(
     return await ensure_company_access(db, context, company_id)
 
 
+@router.get("/companies/{company_id}/contacts", response_model=ContactPage)
+async def list_company_contacts(
+    company_id: uuid.UUID,
+    context: CurrentUser,
+    db: AsyncSession = Depends(get_session),
+    cursor: str | None = None,
+    limit: int = Query(default=50, ge=1, le=100),
+) -> ContactPage:
+    await enforce_cursor_page_budget(
+        db,
+        workspace_id=context.workspace_id,
+        user_id=context.user_id,
+        resource="company_contacts",
+        cursor=cursor,
+    )
+    await ensure_company_access(db, context, company_id)
+    query = sa.select(Contact).where(
+        Contact.workspace_id == context.workspace_id,
+        Contact.company_id == company_id,
+        Contact.deleted_at.is_(None),
+        contact_access_condition(context),
+    )
+    if (condition := _cursor_condition(Contact, cursor)) is not None:
+        query = query.where(condition)
+    items = list(
+        (
+            await db.scalars(
+                query.order_by(Contact.created_at.desc(), Contact.id.desc()).limit(limit + 1)
+            )
+        ).all()
+    )
+    items, next_cursor = _next_cursor(items, limit)
+    return ContactPage(
+        items=[ContactRead.model_validate(item) for item in items],
+        next_cursor=next_cursor,
+    )
+
+
 @router.patch("/companies/{company_id}", response_model=CompanyRead)
 async def update_company(
     company_id: uuid.UUID,
@@ -441,6 +488,12 @@ async def update_company(
     db: AsyncSession = Depends(get_session),
 ) -> Company:
     forbid_employee(context)
+    for required_field in ("name", "tags", "custom_fields"):
+        if required_field in payload.model_fields_set and getattr(payload, required_field) is None:
+            raise HTTPException(
+                status_code=422,
+                detail=f"{required_field} cannot be null",
+            )
     values = payload.model_dump(exclude_unset=True, exclude={"expected_version"}, mode="json")
     values.update(version=payload.expected_version + 1, updated_at=datetime.now(UTC))
     company = (
@@ -1833,6 +1886,46 @@ async def _deal_read(db: AsyncSession, deal: Deal, context: AuthContext) -> Deal
     return (await _deal_reads(db, [deal], context))[0]
 
 
+@router.get("/contacts/{contact_id}/deals", response_model=DealPage)
+async def list_contact_deals(
+    contact_id: uuid.UUID,
+    context: CurrentUser,
+    db: AsyncSession = Depends(get_session),
+    cursor: str | None = None,
+    limit: int = Query(default=50, ge=1, le=100),
+) -> DealPage:
+    await enforce_cursor_page_budget(
+        db,
+        workspace_id=context.workspace_id,
+        user_id=context.user_id,
+        resource="contact_deals",
+        cursor=cursor,
+    )
+    await ensure_contact_access(db, context, contact_id)
+    query = (
+        sa.select(Deal)
+        .join(DealContact, DealContact.deal_id == Deal.id)
+        .where(
+            Deal.workspace_id == context.workspace_id,
+            Deal.deleted_at.is_(None),
+            DealContact.workspace_id == context.workspace_id,
+            DealContact.contact_id == contact_id,
+            deal_access_condition(context),
+        )
+    )
+    if (condition := _cursor_condition(Deal, cursor)) is not None:
+        query = query.where(condition)
+    items = list(
+        (
+            await db.scalars(
+                query.order_by(Deal.created_at.desc(), Deal.id.desc()).limit(limit + 1)
+            )
+        ).all()
+    )
+    items, next_cursor = _next_cursor(items, limit)
+    return DealPage(items=await _deal_reads(db, items, context), next_cursor=next_cursor)
+
+
 @router.get("/contacts/{contact_id}/purchases", response_model=DealPage)
 async def list_contact_purchases(
     contact_id: uuid.UUID,
@@ -1908,6 +2001,47 @@ async def list_deals(
         custom_fields_match = _json_object_values_search_condition(
             Deal.custom_fields, term, dialect_name
         )
+        search_deal_contact = aliased(DealContact)
+        search_contact = aliased(Contact)
+        contact_match = sa.exists(
+            sa.select(1)
+            .select_from(search_deal_contact)
+            .join(search_contact, search_contact.id == search_deal_contact.contact_id)
+            .where(
+                search_deal_contact.deal_id == Deal.id,
+                search_deal_contact.workspace_id == context.workspace_id,
+                search_contact.workspace_id == context.workspace_id,
+                search_contact.deleted_at.is_(None),
+                contact_access_condition(context, search_contact),
+                sa.or_(
+                    search_contact.first_name.ilike(literal_pattern, escape="\\"),
+                    search_contact.last_name.ilike(literal_pattern, escape="\\"),
+                    (
+                        sa.func.coalesce(search_contact.first_name, "")
+                        + " "
+                        + sa.func.coalesce(search_contact.last_name, "")
+                    ).ilike(literal_pattern, escape="\\"),
+                    search_contact.primary_email.ilike(literal_pattern, escape="\\"),
+                    search_contact.primary_phone.ilike(literal_pattern, escape="\\"),
+                    _tags_search_condition(search_contact.emails, term, dialect_name),
+                    _tags_search_condition(search_contact.phones, term, dialect_name),
+                ),
+            )
+        )
+        search_company = aliased(Company)
+        company_match = sa.exists(
+            sa.select(1).where(
+                search_company.id == Deal.company_id,
+                search_company.workspace_id == context.workspace_id,
+                search_company.deleted_at.is_(None),
+                company_access_condition(context, search_company),
+                sa.or_(
+                    search_company.name.ilike(literal_pattern, escape="\\"),
+                    search_company.email.ilike(literal_pattern, escape="\\"),
+                    search_company.phone.ilike(literal_pattern, escape="\\"),
+                ),
+            )
+        )
         source_match = sa.exists(
             sa.select(1).where(
                 Source.id == Deal.source_id,
@@ -1921,6 +2055,7 @@ async def list_deals(
         if dialect_name == "postgresql":
             query = query.where(
                 sa.or_(
+                    Deal.title.ilike(literal_pattern, escape="\\"),
                     sa.func.to_tsvector(
                         sa.text("'simple'"), sa.func.coalesce(Deal.title, "")
                     ).op("@@")(
@@ -1928,6 +2063,8 @@ async def list_deals(
                     ),
                     tags_match,
                     custom_fields_match,
+                    contact_match,
+                    company_match,
                     source_match,
                 )
             )
@@ -1937,6 +2074,8 @@ async def list_deals(
                     Deal.title.ilike(literal_pattern, escape="\\"),
                     tags_match,
                     custom_fields_match,
+                    contact_match,
+                    company_match,
                     source_match,
                 )
             )

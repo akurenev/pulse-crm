@@ -2,7 +2,7 @@ const ENTITY_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 
 const SIMPLE_APP_PATHS = new Set(["/", "/deals", "/tasks", "/contacts", "/activity", "/settings"]);
 
-export type DeepLinkEntity = "deal" | "task";
+export type DeepLinkEntity = "deal" | "task" | "contact" | "company";
 
 export function safeEntityId(value: string | null | undefined): string | null {
   if (!value || !ENTITY_ID_PATTERN.test(value)) return null;
@@ -61,6 +61,12 @@ export function normalizeInternalAppPath(candidate: unknown, origin?: string): s
     const key = pathname === "/deals" ? "deal" : "task";
     const id = safeEntityId(parsed.searchParams.get(key));
     return id ? entityDeepLink(pathname, id) : pathname;
+  }
+  if (pathname === "/contacts") {
+    const contactId = safeEntityId(parsed.searchParams.get("contact"));
+    if (contactId) return `/contacts?contact=${encodeURIComponent(contactId)}`;
+    const companyId = safeEntityId(parsed.searchParams.get("company"));
+    return companyId ? `/contacts?company=${encodeURIComponent(companyId)}` : pathname;
   }
   return pathname;
 }

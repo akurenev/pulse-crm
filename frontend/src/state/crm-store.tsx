@@ -49,11 +49,14 @@ interface CrmStore {
   setDealSearch: (query: string) => void;
   setDealCustomFields: (dealId: string, fields: Record<string, unknown>) => Promise<void>;
   nextCursorByStage: Record<string, string | null>;
+  nextDealSearchCursor: string | null;
   loadedStageIds: Record<string, boolean>;
   stageLoadErrorByStage: Record<string, string | null>;
   loadingStageId: string | null;
+  loadingMoreDealSearch: boolean;
   loadStageDeals: (stageId: string) => Promise<void>;
   loadMoreDeals: (stageId: string) => Promise<void>;
+  loadMoreDealSearch: () => Promise<void>;
   addDeal: (input: NewDealInput) => Promise<Deal>;
   deleteDeal: (dealId: string) => Promise<void>;
   sendMessage: (dealId: string, body: string, attachment?: File) => Promise<void>;
@@ -192,6 +195,7 @@ export function CrmProvider({ children, currentUser = demoUsers.ak, userRole = "
   const [sources, setSources] = useState<ApiSource[]>([]);
   const [users, setUsers] = useState<ApiUser[]>([]);
   const [nextCursorByStage, setNextCursorByStage] = useState<Record<string, string | null>>({});
+  const [nextDealSearchCursor, setNextDealSearchCursor] = useState<string | null>(null);
   const [loadedStageIds, setLoadedStageIds] = useState<Record<string, boolean>>(() => remoteEnabled
     ? {}
     : Object.fromEntries(
@@ -201,6 +205,7 @@ export function CrmProvider({ children, currentUser = demoUsers.ak, userRole = "
     ));
   const [stageLoadErrorByStage, setStageLoadErrorByStage] = useState<Record<string, string | null>>({});
   const [loadingStageId, setLoadingStageId] = useState<string | null>(null);
+  const [loadingMoreDealSearch, setLoadingMoreDealSearch] = useState(false);
   const [selectedDealId, setSelectedDealId] = useState<string | null>(null);
   const [dealSearch, setDealSearchQuery] = useState("");
   const [refreshTick, setRefreshTick] = useState(0);
@@ -239,6 +244,7 @@ export function CrmProvider({ children, currentUser = demoUsers.ak, userRole = "
     const refresh = () => {
       dealRequestGeneration.current += 1;
       setLoadingStageId(null);
+      setLoadingMoreDealSearch(false);
       setRefreshTick((value) => value + 1);
     };
     window.addEventListener("pulse:refresh", refresh);
@@ -257,9 +263,11 @@ export function CrmProvider({ children, currentUser = demoUsers.ak, userRole = "
       setDeals([]);
       setSelectedDealId(null);
       setNextCursorByStage({});
+      setNextDealSearchCursor(null);
       setLoadedStageIds({});
       setStageLoadErrorByStage({});
       setLoadingStageId(null);
+      setLoadingMoreDealSearch(false);
       setLoading(true);
     };
     window.addEventListener("pulse:access-changed", purgeRevokedAccess);
@@ -317,11 +325,15 @@ export function CrmProvider({ children, currentUser = demoUsers.ak, userRole = "
     const stagesToLoad = pipeline.stages.filter((stage) =>
       stage.stageType === "open" || requestedFinalStageIds.current.has(stage.id),
     );
-    const searchQuery = dealSearch ? `&search=${encodeURIComponent(dealSearch)}` : "";
     if (!hasLoaded.current) setLoading(true);
-    void Promise.all(stagesToLoad.map((stage) =>
-      api.get<CursorPage<ApiDeal>>(`/deals?limit=100&pipeline_id=${requestedPipelineId}&stage_id=${stage.id}${searchQuery}`),
-    )).then((dealPages) => {
+    const dealPagesRequest = dealSearch
+      ? api.get<CursorPage<ApiDeal>>(
+        `/deals?limit=100&pipeline_id=${requestedPipelineId}&search=${encodeURIComponent(dealSearch)}`,
+      ).then((page) => [page])
+      : Promise.all(stagesToLoad.map((stage) =>
+        api.get<CursorPage<ApiDeal>>(`/deals?limit=100&pipeline_id=${requestedPipelineId}&stage_id=${stage.id}`),
+      ));
+    void dealPagesRequest.then((dealPages) => {
       if (!active || generation !== dealRequestGeneration.current || activePipelineId.current !== requestedPipelineId) return;
       const mappedDeals = dealPages.flatMap((page) => page.items)
         .filter((deal) => deal.pipeline_id === requestedPipelineId)
@@ -332,10 +344,13 @@ export function CrmProvider({ children, currentUser = demoUsers.ak, userRole = "
           sources,
           tasksByDealRef.current.get(deal.id) ?? [],
         ));
-      setNextCursorByStage(Object.fromEntries(
+      setNextCursorByStage(dealSearch ? {} : Object.fromEntries(
         stagesToLoad.map((stage, index) => [stage.id, dealPages[index]?.next_cursor ?? null]),
       ));
-      setLoadedStageIds(Object.fromEntries(stagesToLoad.map((stage) => [stage.id, true])));
+      setNextDealSearchCursor(dealSearch ? dealPages[0]?.next_cursor ?? null : null);
+      setLoadedStageIds(Object.fromEntries(
+        (dealSearch ? pipeline.stages : stagesToLoad).map((stage) => [stage.id, true]),
+      ));
       setStageLoadErrorByStage({});
       setDeals((current) => {
         const selected = current.find((deal) => deal.id === selectedDealIdRef.current);
@@ -503,7 +518,13 @@ export function CrmProvider({ children, currentUser = demoUsers.ak, userRole = "
     activeDealSearch.current = normalized;
     dealRequestGeneration.current += 1;
     setLoadingStageId(null);
+    setLoadingMoreDealSearch(false);
     setNextCursorByStage({});
+    setNextDealSearchCursor(null);
+    if (remoteEnabled) {
+      setError(null);
+      setLoading(true);
+    }
     setDealSearchQuery(normalized);
   }, []);
 
@@ -517,9 +538,11 @@ export function CrmProvider({ children, currentUser = demoUsers.ak, userRole = "
     setPipeline(next);
     setDeals([]);
     setNextCursorByStage({});
+    setNextDealSearchCursor(null);
     setLoadedStageIds({});
     setStageLoadErrorByStage({});
     setLoadingStageId(null);
+    setLoadingMoreDealSearch(false);
     selectedDealIdRef.current = null;
     openDealGeneration.current += 1;
     setSelectedDealId(null);
@@ -658,6 +681,46 @@ export function CrmProvider({ children, currentUser = demoUsers.ak, userRole = "
       if (generation === dealRequestGeneration.current) setLoadingStageId(null);
     }
   }, [dealSearch, loadingStageId, nextCursorByStage, pipeline, sources, users]);
+
+  const loadMoreDealSearch = useCallback(async () => {
+    const cursor = nextDealSearchCursor;
+    if (!remoteEnabled || !dealSearch || !cursor || loadingMoreDealSearch) return;
+    const generation = dealRequestGeneration.current;
+    const requestedPipelineId = pipeline.id;
+    setLoadingMoreDealSearch(true);
+    try {
+      const page = await api.get<CursorPage<ApiDeal>>(
+        `/deals?limit=100&pipeline_id=${requestedPipelineId}&search=${encodeURIComponent(dealSearch)}&cursor=${encodeURIComponent(cursor)}`,
+      );
+      if (generation !== dealRequestGeneration.current || activePipelineId.current !== requestedPipelineId) return;
+      const mapped = page.items
+        .filter((deal) => deal.pipeline_id === requestedPipelineId)
+        .map((deal) => mapRemoteDeal(
+          deal,
+          pipeline.stages,
+          users,
+          sources,
+          tasksByDealRef.current.get(deal.id) ?? [],
+        ));
+      setDeals((current) => {
+        const nextById = new Map(current.map((deal) => [deal.id, deal]));
+        for (const deal of mapped) {
+          const existing = nextById.get(deal.id);
+          nextById.set(deal.id, existing
+            ? { ...deal, messages: existing.messages, tasks: existing.tasks }
+            : deal);
+        }
+        return [...nextById.values()];
+      });
+      setNextDealSearchCursor(page.next_cursor);
+    } catch (reason) {
+      if (generation !== dealRequestGeneration.current) return;
+      console.error("Pulse CRM deal search pagination failed", reason);
+      throw reason;
+    } finally {
+      if (generation === dealRequestGeneration.current) setLoadingMoreDealSearch(false);
+    }
+  }, [dealSearch, loadingMoreDealSearch, nextDealSearchCursor, pipeline, sources, users]);
 
   const moveDeal = useCallback(async (dealId: string, stageId: string) => {
     const current = deals.find((deal) => deal.id === dealId);
@@ -1025,18 +1088,21 @@ export function CrmProvider({ children, currentUser = demoUsers.ak, userRole = "
       setDealSearch,
       setDealCustomFields,
       nextCursorByStage,
+      nextDealSearchCursor,
       loadedStageIds,
       stageLoadErrorByStage,
       loadingStageId,
+      loadingMoreDealSearch,
       loadStageDeals,
       loadMoreDeals,
+      loadMoreDealSearch,
       addDeal,
       deleteDeal,
       sendMessage,
       retryMessage,
       toggleTask,
     }),
-    [addDeal, currentUser, dealAssignees, deals, deleteDeal, error, isEmployee, loadMoreDeals, loadStageDeals, loadedStageIds, loading, loadingStageId, moveDeal, nextCursorByStage, openDeal, pipeline, pipelines, retryMessage, selectDeal, selectPipeline, selectedDeal, selectedDealId, selectedDealMutationPending, sendMessage, setDealAssignee, setDealCompany, setDealContact, setDealCustomFields, setDealSearch, setDealTags, setNextPurchase, stageLoadErrorByStage, toggleTask],
+    [addDeal, currentUser, dealAssignees, deals, deleteDeal, error, isEmployee, loadMoreDealSearch, loadMoreDeals, loadStageDeals, loadedStageIds, loading, loadingMoreDealSearch, loadingStageId, moveDeal, nextCursorByStage, nextDealSearchCursor, openDeal, pipeline, pipelines, retryMessage, selectDeal, selectPipeline, selectedDeal, selectedDealId, selectedDealMutationPending, sendMessage, setDealAssignee, setDealCompany, setDealContact, setDealCustomFields, setDealSearch, setDealTags, setNextPurchase, stageLoadErrorByStage, toggleTask],
   );
 
   return <CrmContext.Provider value={value}>{children}</CrmContext.Provider>;
