@@ -389,6 +389,7 @@ async def list_companies(
         query = query.where(
             sa.or_(
                 Company.name.ilike(literal_pattern, escape="\\"),
+                Company.inn.ilike(literal_pattern, escape="\\"),
                 Company.email.ilike(literal_pattern, escape="\\"),
                 Company.phone.ilike(literal_pattern, escape="\\"),
                 Company.website.ilike(literal_pattern, escape="\\"),
@@ -2037,6 +2038,7 @@ async def list_deals(
                 company_access_condition(context, search_company),
                 sa.or_(
                     search_company.name.ilike(literal_pattern, escape="\\"),
+                    search_company.inn.ilike(literal_pattern, escape="\\"),
                     search_company.email.ilike(literal_pattern, escape="\\"),
                     search_company.phone.ilike(literal_pattern, escape="\\"),
                 ),

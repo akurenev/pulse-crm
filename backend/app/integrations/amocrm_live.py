@@ -821,6 +821,7 @@ class PulseAmoWriter(ImportEntityWriter):
             session, workspace_id, "company", entity.data.get("custom_fields_values")
         )
         model.name = _required_text(entity.data.get("name"), "Компания amoCRM")[:240]
+        model.inn = _amo_company_inn(entity.data)
         model.phone = _first_amo_field_value(entity.data, "PHONE", max_length=64)
         model.email = _first_amo_field_value(entity.data, "EMAIL", max_length=320)
         model.website = _first_amo_field_value(entity.data, "WEB", max_length=512)
@@ -1545,6 +1546,30 @@ def _first_amo_field_value(
 ) -> str | None:
     values = _all_amo_field_values(data, field_code, max_length=max_length)
     return values[0] if values else None
+
+
+def _amo_company_inn(data: Mapping[str, Any]) -> str | None:
+    """Read INN from a simple custom field or amoCRM's legal-entity field."""
+
+    for row in _amo_custom_rows(data):
+        field_code = str(row.get("field_code") or "").strip().upper()
+        field_name = str(row.get("field_name") or "").strip().casefold()
+        values = row.get("values", [])
+        if not isinstance(values, list):
+            continue
+        for item in values:
+            if not isinstance(item, Mapping):
+                continue
+            value = item.get("value")
+            candidate = value.get("vat_id") if isinstance(value, Mapping) else None
+            if candidate is None and (field_code == "INN" or field_name == "инн"):
+                candidate = value
+            if candidate is None or isinstance(candidate, (Mapping, list, bool)):
+                continue
+            normalized = "".join(str(candidate).split()).replace("-", "")
+            if len(normalized) in {10, 12} and all("0" <= char <= "9" for char in normalized):
+                return normalized
+    return None
 
 
 async def _custom_field_values(

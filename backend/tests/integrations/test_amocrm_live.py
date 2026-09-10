@@ -16,6 +16,7 @@ from app.integrations.amocrm_live import (
     AmoImportDependencyError,
     AmoV4Client,
     PulseAmoWriter,
+    _amo_company_inn,
     _tags,
     make_amo_import_handler,
     make_amo_import_report_handler,
@@ -359,17 +360,24 @@ async def test_workspace_writer_imports_full_domain_and_reruns_without_duplicate
                 )
             ],
         )
+        company_data = {
+            "id": 20,
+            "name": "ООО Слой",
+            "custom_fields_values": [
+                {
+                    "field_name": "Юр. лицо",
+                    "values": [{"value": {"vat_id": "0000000000"}}],
+                }
+            ],
+            "_embedded": {"tags": [{"id": 1, "name": "Партнёр"}]},
+        }
         await apply(
             "companies",
             [
                 AmoEntity(
                     "companies",
                     "20",
-                    {
-                        "id": 20,
-                        "name": "ООО Слой",
-                        "_embedded": {"tags": [{"id": 1, "name": "Партнёр"}]},
-                    },
+                    company_data,
                 )
             ],
         )
@@ -465,6 +473,7 @@ async def test_workspace_writer_imports_full_domain_and_reruns_without_duplicate
         assert company is not None and contact is not None and deal is not None
         assert task is not None and note is not None
         assert company.tags == ["Партнёр"]
+        assert company.inn == "0000000000"
         assert contact.company_id == company.id
         assert contact.primary_email == "anna@example.com"
         assert contact.assignee_id == owner.id
@@ -477,6 +486,33 @@ async def test_workspace_writer_imports_full_domain_and_reruns_without_duplicate
         assert task.deal_id == deal.id
         assert note.entity_id == deal.id
         assert await db.scalar(sa.select(sa.func.count()).select_from(DealContact)) == 1
+
+        company_mapping = await db.scalar(
+            sa.select(ExternalEntityMap).where(
+                ExternalEntityMap.workspace_id == workspace.id,
+                ExternalEntityMap.entity_type == "companies",
+                ExternalEntityMap.external_id == "20",
+            )
+        )
+        assert company_mapping is not None
+        legacy_company_payload = json.dumps(
+            company_data,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+        company_mapping.fingerprint = hashlib.sha256(legacy_company_payload).hexdigest()
+        company.inn = None
+        await db.commit()
+
+        company_backfill = await apply(
+            "companies", [AmoEntity("companies", "20", company_data)]
+        )
+        await db.commit()
+        assert company_backfill.updated == 1
+        await db.refresh(company)
+        assert company.inn == "0000000000"
 
         updated_data = {
             **deal_data,
@@ -1233,6 +1269,33 @@ def test_amo_tags_are_normalized_deduplicated_and_bounded() -> None:
     assert tags[:2] == ["VIP", "x" * 100]
     assert len(tags) == 100
     assert tags[-1] == "tag-97"
+
+
+@pytest.mark.parametrize(
+    ("custom_field", "expected"),
+    [
+        (
+            {"field_code": "INN", "values": [{"value": "00000-00000"}]},
+            "0000000000",
+        ),
+        (
+            {"field_name": "ИНН", "values": [{"value": "000000000000"}]},
+            "000000000000",
+        ),
+        (
+            {
+                "field_name": "Юр. лицо",
+                "values": [{"value": {"vat_id": "0000000000"}}],
+            },
+            "0000000000",
+        ),
+        ({"field_name": "ИНН", "values": [{"value": "12345"}]}, None),
+    ],
+)
+def test_amo_company_inn_supports_simple_and_legal_entity_fields(
+    custom_field: dict[str, Any], expected: str | None
+) -> None:
+    assert _amo_company_inn({"custom_fields_values": [custom_field]}) == expected
 
 
 @pytest.mark.asyncio

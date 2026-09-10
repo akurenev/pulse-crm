@@ -77,6 +77,7 @@ export default function ContactsPage() {
   const [demoCompanies, setDemoCompanies] = useState<ApiCompany[]>(() => Array.from(new Set(contacts.map((contact) => contact.company).filter((name) => name !== "—"))).map((name, index) => ({
     id: `demo-company-${index}`,
     name,
+    inn: index === 0 ? "0000000000" : null,
     website: null,
     phone: contacts.find((contact) => contact.company === name)?.phone ?? null,
     email: contacts.find((contact) => contact.company === name)?.email ?? null,
@@ -166,7 +167,7 @@ export default function ContactsPage() {
   const visibleCompanies = useMemo(
     () => remoteEnabled
       ? sourceCompanies
-      : sourceCompanies.filter((company) => `${company.name} ${company.email ?? ""} ${company.phone ?? ""} ${company.tags.join(" ")}`.toLocaleLowerCase("ru").includes(normalizedSearch)),
+      : sourceCompanies.filter((company) => `${company.name} ${company.inn ?? ""} ${company.email ?? ""} ${company.phone ?? ""} ${company.tags.join(" ")}`.toLocaleLowerCase("ru").includes(normalizedSearch)),
     [normalizedSearch, sourceCompanies],
   );
   const loading = view === "contacts" ? remoteContacts.isLoading || remoteUsers.isLoading : remoteCompanies.isLoading;
@@ -351,8 +352,10 @@ export default function ContactsPage() {
           const email = String(data.get("email") ?? "").trim();
           const phone = String(data.get("phone") ?? "").trim();
           const website = String(data.get("website") ?? "").trim();
+          const inn = String(data.get("inn") ?? "").replace(/[\s-]+/g, "");
           await api.post<ApiCompany>("/companies", {
             name: String(data.get("name") ?? "").trim(),
+            inn: inn || null,
             email: email || null,
             phone: phone || null,
             website: website || null,
@@ -383,6 +386,7 @@ export default function ContactsPage() {
         setDemoCompanies((items) => [{
           id: `company-${crypto.randomUUID()}`,
           name: String(data.get("name") ?? "").trim(),
+          inn: String(data.get("inn") ?? "").replace(/[\s-]+/g, "") || null,
           email: String(data.get("email") ?? "").trim() || null,
           phone: String(data.get("phone") ?? "").trim() || null,
           website: String(data.get("website") ?? "").trim() || null,
@@ -530,6 +534,7 @@ export default function ContactsPage() {
     if (!selectedCompany || isEmployee) return;
     const data = new FormData(event.currentTarget);
     const name = String(data.get("name") ?? "").trim();
+    const inn = String(data.get("inn") ?? "").replace(/[\s-]+/g, "");
     const email = String(data.get("email") ?? "").trim();
     const phone = String(data.get("phone") ?? "").trim();
     const website = String(data.get("website") ?? "").trim();
@@ -542,6 +547,7 @@ export default function ContactsPage() {
         const updated = await api.patch<ApiCompany>(`/companies/${selectedCompany.id}`, {
           expected_version: selectedCompany.version,
           name,
+          inn: inn || null,
           email: email || null,
           phone: phone || null,
           website: website || null,
@@ -555,6 +561,7 @@ export default function ContactsPage() {
         const updated: ApiCompany = {
           ...selectedCompany,
           name,
+          inn: inn || null,
           email: email || null,
           phone: phone || null,
           website: website || null,
@@ -671,7 +678,7 @@ export default function ContactsPage() {
         <Button className="contacts-page__desktop-add" variant="primary" aria-controls="new-client-dialog" onClick={() => setDialogOpen(true)}><Plus size={17} /> {isEmployee || view === "contacts" ? "Новый контакт" : "Новая компания"}</Button>
       </header>
       <div className="content-toolbar">
-        <label className="search-control"><Search size={18} /><input value={search} onChange={(event) => updateSearch(event.target.value)} placeholder={isEmployee ? "Имя, тег, телефон или email" : "Имя, компания, тег, телефон или email"} /></label>
+        <label className="search-control"><Search size={18} /><input value={search} onChange={(event) => updateSearch(event.target.value)} placeholder={isEmployee ? "Имя, тег, телефон или email" : "Имя, компания, ИНН, тег, телефон или email"} /></label>
         {!isEmployee ? <div className="view-switch" aria-label="Тип клиентов"><button className={view === "contacts" ? "is-active" : ""} type="button" aria-label="Контакты" onClick={() => setView("contacts")}><Users size={18} /></button><button className={view === "companies" ? "is-active" : ""} type="button" aria-label="Компании" onClick={() => setView("companies")}><Building2 size={18} /></button></div> : null}
       </div>
 
@@ -725,7 +732,7 @@ export default function ContactsPage() {
           <Dialog.Content id="new-client-dialog" className="dialog-content">
             <div className="dialog-header"><div><Dialog.Title>{isEmployee || view === "contacts" ? "Новый контакт" : "Новая компания"}</Dialog.Title><Dialog.Description>Запись будет доступна всей команде.</Dialog.Description></div><Dialog.Close className="icon-button" aria-label="Закрыть"><X size={20} /></Dialog.Close></div>
             <form className="form-stack" onSubmit={(event) => void createEntity(event)}>
-              {view === "contacts" ? <><label className="field"><span>Имя</span><input name="first_name" required autoFocus /></label><label className="field"><span>Фамилия</span><input name="last_name" /></label></> : <label className="field"><span>Название</span><input name="name" required autoFocus /></label>}
+              {view === "contacts" ? <><label className="field"><span>Имя</span><input name="first_name" required autoFocus /></label><label className="field"><span>Фамилия</span><input name="last_name" /></label></> : <><label className="field"><span>Название</span><input name="name" required autoFocus /></label><label className="field"><span>ИНН</span><input name="inn" inputMode="numeric" pattern="(?:[0-9]{10}|[0-9]{12})" maxLength={12} /></label></>}
               <label className="field"><span>Email</span><input name="email" type="email" /></label>
               <label className="field"><span>Телефон</span><input name="phone" type="tel" /></label>
               {view === "contacts" ? (isEmployee
@@ -781,6 +788,7 @@ export default function ContactsPage() {
             </form> : null}
             {selectedCompany && companyEditing ? <form className="form-stack contact-edit-form" onSubmit={(event) => void updateCompany(event)}>
               <label className="field"><span>Название</span><input name="name" required autoFocus defaultValue={selectedCompany.name} /></label>
+              <label className="field"><span>ИНН</span><input name="inn" inputMode="numeric" pattern="(?:[0-9]{10}|[0-9]{12})" maxLength={12} defaultValue={selectedCompany.inn ?? ""} /></label>
               <label className="field"><span>Email</span><input name="email" type="email" defaultValue={selectedCompany.email ?? ""} /></label>
               <label className="field"><span>Телефон</span><input name="phone" type="tel" defaultValue={selectedCompany.phone ?? ""} /></label>
               <label className="field"><span>Сайт</span><input name="website" type="url" defaultValue={selectedCompany.website ?? ""} placeholder="https://" /></label>
@@ -801,6 +809,7 @@ export default function ContactsPage() {
               <div className="record-detail-grid__wide"><small>Следующая покупка</small><strong>{selectedContact.nextPurchaseAt ? formatLongDate(selectedContact.nextPurchaseAt) : "Не запланирована"}</strong></div>
             </div> : null}
             {selectedCompany && !companyEditing ? <div className="record-detail-grid">
+              <div><small>ИНН</small><strong>{selectedCompany.inn ?? "Не указан"}</strong></div>
               <div><small>Телефон</small><strong>{selectedCompany.phone ?? "—"}</strong></div>
               <div><small>Email</small><strong>{selectedCompany.email ?? "—"}</strong></div>
               <div className="record-detail-grid__wide"><small>Сайт</small><strong>{selectedCompany.website ?? "Не указан"}</strong></div>

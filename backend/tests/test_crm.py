@@ -115,6 +115,7 @@ async def test_company_contacts_contact_deals_and_global_deal_search(
         headers=headers,
         json={
             "name": "Example Industries",
+            "inn": "00000 00000",
             "website": "https://example.test",
             "phone": "+1 202 555 0147",
             "email": "accounts@example.com",
@@ -123,6 +124,7 @@ async def test_company_contacts_contact_deals_and_global_deal_search(
     )
     assert company_response.status_code == 201, company_response.text
     company = company_response.json()
+    assert company["inn"] == "0000000000"
     contact_response = await client.post(
         "/api/v1/contacts",
         headers=headers,
@@ -215,6 +217,7 @@ async def test_company_contacts_contact_deals_and_global_deal_search(
         "team@example.com",
         "+1 202 555 0199",
         "Example Industries",
+        "0000000000",
         "accounts@example.com",
         "+1 202 555 0147",
     ):
@@ -225,7 +228,7 @@ async def test_company_contacts_contact_deals_and_global_deal_search(
         assert searched.status_code == 200, (term, searched.text)
         assert {item["id"] for item in searched.json()["items"]} == expected_deal_ids
 
-    for term in ("accounts@example.com", "+1 202 555 0147", "ORG-SEARCH-42"):
+    for term in ("0000000000", "accounts@example.com", "+1 202 555 0147", "ORG-SEARCH-42"):
         searched_companies = await client.get(
             "/api/v1/companies", params={"search": term}
         )
@@ -240,11 +243,13 @@ async def test_company_contacts_contact_deals_and_global_deal_search(
         json={
             "expected_version": company["version"],
             "name": "Example Industries Updated",
+            "inn": "000000000000",
             "phone": None,
         },
     )
     assert updated_company.status_code == 200, updated_company.text
     assert updated_company.json()["name"] == "Example Industries Updated"
+    assert updated_company.json()["inn"] == "000000000000"
     assert updated_company.json()["phone"] is None
     assert updated_company.json()["version"] == company["version"] + 1
     for required_field in ("name", "tags", "custom_fields"):
@@ -260,6 +265,13 @@ async def test_company_contacts_contact_deals_and_global_deal_search(
             required_field,
             invalid_update.text,
         )
+
+    invalid_inn = await client.patch(
+        f"/api/v1/companies/{company['id']}",
+        headers=headers,
+        json={"expected_version": updated_company.json()["version"], "inn": "12345"},
+    )
+    assert invalid_inn.status_code == 422, invalid_inn.text
 
 
 @pytest.mark.asyncio

@@ -184,6 +184,7 @@ class Company(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         UUID_TYPE, sa.ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False, index=True
     )
     name: Mapped[str] = mapped_column(sa.String(240), nullable=False)
+    inn: Mapped[str | None] = mapped_column(sa.String(12))
     website: Mapped[str | None] = mapped_column(sa.String(512))
     phone: Mapped[str | None] = mapped_column(sa.String(64))
     email: Mapped[str | None] = mapped_column(sa.String(320))

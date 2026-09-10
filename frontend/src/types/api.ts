@@ -131,6 +131,7 @@ export interface ApiContact {
 export interface ApiCompany {
   id: string;
   name: string;
+  inn: string | null;
   website: string | null;
   phone: string | null;
   email: string | null;

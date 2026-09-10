@@ -18,6 +18,13 @@ class VersionedUpdate(BaseModel):
     expected_version: int = Field(ge=1)
 
 
+def _normalize_inn(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    normalized = "".join(value.split()).replace("-", "")
+    return normalized or None
+
+
 class WorkspaceRead(ORMModel):
     id: uuid.UUID
     name: str
@@ -106,25 +113,38 @@ class InvitationAccept(BaseModel):
 
 class CompanyCreate(BaseModel):
     name: str = Field(min_length=1, max_length=240)
+    inn: str | None = Field(default=None, pattern=r"^(?:[0-9]{10}|[0-9]{12})$")
     website: str | None = Field(default=None, max_length=512)
     phone: str | None = Field(default=None, max_length=64)
     email: EmailStr | None = None
     tags: list[str] = Field(default_factory=list, max_length=100)
     custom_fields: dict[str, Any] = Field(default_factory=dict)
 
+    @field_validator("inn", mode="before")
+    @classmethod
+    def normalize_inn(cls, value: Any) -> Any:
+        return _normalize_inn(value)
+
 
 class CompanyUpdate(VersionedUpdate):
     name: str | None = Field(default=None, min_length=1, max_length=240)
+    inn: str | None = Field(default=None, pattern=r"^(?:[0-9]{10}|[0-9]{12})$")
     website: str | None = Field(default=None, max_length=512)
     phone: str | None = Field(default=None, max_length=64)
     email: EmailStr | None = None
     tags: list[str] | None = Field(default=None, max_length=100)
     custom_fields: dict[str, Any] | None = None
 
+    @field_validator("inn", mode="before")
+    @classmethod
+    def normalize_inn(cls, value: Any) -> Any:
+        return _normalize_inn(value)
+
 
 class CompanyRead(ORMModel):
     id: uuid.UUID
     name: str
+    inn: str | None
     website: str | None
     phone: str | None
     email: str | None

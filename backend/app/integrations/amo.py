@@ -30,11 +30,11 @@ AMO_RESOURCE_ENTITY_TYPES = frozenset(AMO_IMPORT_SEQUENCE)
 AMO_ENTITY_TYPES = AMO_RESOURCE_ENTITY_TYPES | {"all"}
 MAX_IMPORT_PAGE_SIZE = 250
 
-# Fingerprints written before deal tags were persisted used the unversioned
-# entity payload hash. Prefixing only deal fingerprints with schema v2 makes
-# one subsequent import revisit existing deals and backfill their tags. Future
-# writer-shape changes can bump the affected entity version independently.
-AMO_FINGERPRINT_SCHEMA_VERSIONS = {"deals": 2}
+# Fingerprints written before company INN and deal tags were persisted used the
+# unversioned entity payload hash. Schema v2 makes one subsequent import revisit
+# those records and backfill the new values. Future writer-shape changes can
+# bump the affected entity version independently.
+AMO_FINGERPRINT_SCHEMA_VERSIONS = {"companies": 2, "deals": 2}
 
 
 class AmoImportError(RuntimeError):

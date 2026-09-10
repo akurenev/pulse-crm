@@ -64,6 +64,7 @@ const contact = (id: string, firstName: string, assigneeId: string | null = null
 const company = (id: string, name: string): ApiCompany => ({
   id,
   name,
+  inn: null,
   website: null,
   phone: null,
   email: `${id}@example.com`,
@@ -180,7 +181,7 @@ describe("ContactsPage pagination", () => {
     expect(await screen.findByText("Второй Контакт")).toBeInTheDocument();
     expect(screen.getByText("Страница 2")).toBeInTheDocument();
 
-    await user.type(screen.getByPlaceholderText("Имя, компания, тег, телефон или email"), "Первый");
+    await user.type(screen.getByPlaceholderText("Имя, компания, ИНН, тег, телефон или email"), "Первый");
     expect(screen.queryByText("Страница 2")).not.toBeInTheDocument();
     expect(await screen.findByText("Первый найденный Контакт")).toBeInTheDocument();
     await waitFor(() => {
@@ -319,7 +320,7 @@ describe("ContactsPage linked records", () => {
     renderPage();
 
     await user.click(screen.getByRole("button", { name: "Компании" }));
-    await user.type(screen.getByPlaceholderText("Имя, компания, тег, телефон или email"), "70001234567");
+    await user.type(screen.getByPlaceholderText("Имя, компания, ИНН, тег, телефон или email"), "70001234567");
 
     expect(await screen.findByText("Телефонная компания")).toBeInTheDocument();
     await waitFor(() => expect(screen.getByText("Телефонная компания")).toBeVisible());
@@ -393,7 +394,7 @@ describe("ContactsPage contact management", () => {
 
   it("edits a company with optimistic versioning and refreshes the visible record", async () => {
     const user = userEvent.setup();
-    let storedCompany: ApiCompany = { ...company("company-edit", "Старая компания"), phone: "+7 000 000-00-00" };
+    let storedCompany: ApiCompany = { ...company("company-edit", "Старая компания"), inn: "0000000000", phone: "+7 000 000-00-00" };
     getMock.mockImplementation((path: string) => {
       if (path === "/users") return Promise.resolve([responsibleUser]);
       const pathname = path.split("?")[0];
@@ -406,6 +407,7 @@ describe("ContactsPage contact management", () => {
       storedCompany = {
         ...storedCompany,
         name: String(payload.name),
+        inn: payload.inn as string | null,
         email: payload.email as string | null,
         phone: payload.phone as string | null,
         website: payload.website as string | null,
@@ -422,6 +424,8 @@ describe("ContactsPage contact management", () => {
     await user.click(within(detail).getByRole("button", { name: "Редактировать компанию" }));
     await user.clear(within(detail).getByLabelText("Название"));
     await user.type(within(detail).getByLabelText("Название"), "Новая компания");
+    await user.clear(within(detail).getByLabelText("ИНН"));
+    await user.type(within(detail).getByLabelText("ИНН"), "000000000000");
     await user.clear(within(detail).getByLabelText("Email"));
     await user.type(within(detail).getByLabelText("Email"), "new-company@example.com");
     await user.clear(within(detail).getByLabelText("Телефон"));
@@ -433,6 +437,7 @@ describe("ContactsPage contact management", () => {
     await waitFor(() => expect(patchMock).toHaveBeenCalledWith("/companies/company-edit", {
       expected_version: 1,
       name: "Новая компания",
+      inn: "000000000000",
       email: "new-company@example.com",
       phone: "+7 000 111-22-33",
       website: "https://company.example.com",
