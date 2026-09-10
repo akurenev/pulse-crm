@@ -102,6 +102,9 @@ const demoRules: ApiNotificationRule[] = [
   demoRule("Следующая покупка через 7 дней → клиенту по email", "purchase.due_soon", "email", false, "client"),
 ];
 
+const defaultNotificationSubjectTemplate = "{event_title}";
+const defaultNotificationBodyTemplate = "{event_summary}";
+
 function demoRule(name: string, eventType: string, channel: ApiNotificationChannel, enabled: boolean, audience: "employee" | "client" = "employee"): ApiNotificationRule {
   return { id: `demo-rule-${eventType}-${channel}`, template_id: `demo-template-${channel}`, name, event_type: eventType, audience, channel, pipeline_id: null, stage_id: null, source_id: null, filters: {}, recipients: [], delay_seconds: 0, require_client_consent: audience === "client", is_enabled: enabled, version: 1, created_at: DEMO_NOW, updated_at: DEMO_NOW };
 }
@@ -869,7 +872,7 @@ function NotificationsPanel({ pipelines }: { pipelines: Pipeline[] }) {
   const [showEditor, setShowEditor] = useState(false);
   const [editingRule, setEditingRule] = useState<ApiNotificationRule | null>(null);
   const [localRules, setLocalRules] = useState(demoRules);
-  const [localTemplates, setLocalTemplates] = useState<ApiNotificationTemplate[]>(() => Array.from(new Map(demoRules.map((rule) => [rule.template_id, { ...demoTemplate(`${rule.name} — шаблон`, rule.channel, "В Pulse CRM произошло новое событие. Откройте карточку, чтобы увидеть детали."), id: rule.template_id }])).values()));
+  const [localTemplates, setLocalTemplates] = useState<ApiNotificationTemplate[]>(() => Array.from(new Map(demoRules.map((rule) => [rule.template_id, { ...demoTemplate(`${rule.name} — шаблон`, rule.channel, defaultNotificationBodyTemplate), subject_template: defaultNotificationSubjectTemplate, id: rule.template_id }])).values()));
   const [savingRuleId, setSavingRuleId] = useState<string | null>(null);
   const [error, setError] = useState("");
   const rulesQuery = useQuery({ queryKey: ["settings", "notification-rules"], queryFn: () => api.get<ApiNotificationRule[]>("/admin/integrations/notification-rules"), enabled: remoteEnabled });
@@ -1032,7 +1035,7 @@ export function NotificationEditor({ rule, template, pipelines, currentUserId, c
       const body = String(data.get("body")).trim();
       if (rule && !template) throw new Error("Шаблон правила ещё не загружен. Обновите страницу и повторите.");
       const templateName = `${name} — шаблон`;
-      const subjectTemplate = channel === "email" ? "Событие в Pulse CRM" : null;
+      const subjectTemplate = channel === "email" ? "Событие в Pulse CRM" : defaultNotificationSubjectTemplate;
       let savedTemplate: ApiNotificationTemplate;
       if (remoteEnabled) {
         if (rule && template && template.channel === channel) {
@@ -1080,7 +1083,8 @@ export function NotificationEditor({ rule, template, pipelines, currentUserId, c
           <label className="field"><span>Этап</span><select name="stage_id" value={stageId} disabled={!selectedPipeline} onChange={(event) => setStageId(event.target.value)}><option value="">Все этапы</option>{selectedPipeline?.stages.map((stage) => <option key={stage.id} value={stage.id}>{stage.name}</option>)}</select></label>
         </div>
         {clientRequiresReapproval ? <><label className="field"><span>Основание согласия</span><textarea name="consent_evidence" required rows={2} placeholder="Например: checkbox формы заказа, 28.08.2026" /></label><div className="settings-checks"><label><input name="consent_confirmed" type="checkbox" required /> Подтверждаю, что согласие клиента получено и зафиксировано</label></div></> : null}
-        <label className="field"><span>Текст шаблона</span><textarea name="body" required rows={3} defaultValue={template?.body_template ?? "В Pulse CRM произошло новое событие. Откройте карточку, чтобы увидеть детали."} /></label>
+        <label className="field"><span>Текст шаблона</span><textarea name="body" required rows={3} defaultValue={template?.body_template ?? defaultNotificationBodyTemplate} /></label>
+        <p className="settings-form-help">Для понятного push оставьте <code>{"{event_summary}"}</code>: он подставит описание выбранного события. Заголовок push показывает его название.</p>
         <div className="settings-checks"><label><input name="is_enabled" type="checkbox" checked={enabled} disabled={audience === "client"} onChange={(event) => setEnabled(event.target.checked)} /> Включить сразу</label></div>
         <p className="settings-form-help">{audience === "employee" ? "Выбранный сотрудник получит внутреннее уведомление в Pulse CRM. Значение — конкретный пользователь, а не технический адрес." : clientRequiresReapproval ? "После изменения канала или получателя правило сохранится выключенным. Проверьте адрес и согласие, затем включите его в списке." : "Имя, текст и фильтры можно менять без отключения уже проверенного клиентского правила."}</p>
         {contactsQuery.isError ? <p className="form-error" role="alert">Не удалось загрузить контакты для согласия.</p> : null}

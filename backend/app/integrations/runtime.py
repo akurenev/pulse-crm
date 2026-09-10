@@ -134,6 +134,33 @@ DIRECT_NOTIFICATION_TARGETS = {
     "task.overdue": "task",
 }
 
+# These values are deliberately static: unlike an outbox payload, they do not
+# expose a contact, deal, or secondary object that may have become unavailable
+# before a delayed notification is delivered.
+NOTIFICATION_EVENT_PRESENTATION = {
+    "lead.created": ("Новый лид", "Поступил новый лид."),
+    "deal.assigned": ("Сделка назначена", "Вам назначена сделка."),
+    "deal.stage_changed": ("Сделка сменила этап", "Проверьте новый этап сделки."),
+    "deal.inactive": (
+        "Нет активности по сделке",
+        "По сделке не было активности более семи дней.",
+    ),
+    "task.due_soon": ("Напоминание о задаче", "Срок задачи наступает."),
+    "task.overdue": ("Задача просрочена", "Срок задачи уже истёк."),
+    "purchase.due_soon": (
+        "Следующая покупка",
+        "Пора связаться с клиентом по следующей покупке.",
+    ),
+    "message.inbound.received": (
+        "Новое входящее сообщение",
+        "Поступило новое сообщение от клиента.",
+    ),
+}
+DEFAULT_NOTIFICATION_EVENT_PRESENTATION = (
+    "Событие в Pulse CRM",
+    "Откройте карточку, чтобы увидеть детали.",
+)
+
 RUNTIME_JOB_TYPES = frozenset(
     {
         JOB_OUTBOX_DISPATCH,
@@ -343,6 +370,16 @@ def _restricted_notification_variables(
         }
     )
     return variables
+
+
+def _notification_event_variables(event_type: str) -> dict[str, str]:
+    """Return safe, human-readable event text for notification templates."""
+
+    event_title, event_summary = NOTIFICATION_EVENT_PRESENTATION.get(
+        event_type,
+        DEFAULT_NOTIFICATION_EVENT_PRESENTATION,
+    )
+    return {"event_title": event_title, "event_summary": event_summary}
 
 
 def _optional_int(value: Any) -> int | None:
@@ -863,6 +900,7 @@ class RuntimeHandlers:
             default_variables = {
                 "event_type": event.event_type,
                 "entity_id": str(event.aggregate_id),
+                **_notification_event_variables(event.event_type),
                 **event.payload,
             }
             for index, recipient in enumerate(rule.recipients):
@@ -919,6 +957,7 @@ class RuntimeHandlers:
                             target_entity_type=target_entity_type,
                             target_entity_id=target_entity_id,
                         )
+                        variables.update(_notification_event_variables(event.event_type))
                 try:
                     await queue_notification(
                         session,

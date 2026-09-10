@@ -708,6 +708,11 @@ UUID этого участника. Email, Telegram и MAX для внутрен
 `/api/v1/admin/integrations/notification-rules`. Для отправки email/Telegram/MAX
 в workspace должно быть активное подключение соответствующего типа.
 
+Для стандартного понятного текста используйте в шаблоне `{event_title}` для
+заголовка и `{event_summary}` для текста. Runtime подставляет безопасное
+название и краткое описание поддерживаемого события; эти значения не зависят от
+данных карточки и подходят также для ограниченной роли `employee`.
+
 Существующие сущности меняются versioned-запросами
 `PATCH /api/v1/admin/integrations/notification-templates/{id}` и
 `PATCH /api/v1/admin/integrations/notification-rules/{id}`. В списке отдельная

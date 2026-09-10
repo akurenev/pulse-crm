@@ -512,6 +512,67 @@ async def test_static_notification_expansion_materializes_tenant_owned_target(
 
 
 @pytest.mark.asyncio
+async def test_static_notification_renders_descriptive_event_text(
+    db: AsyncSession,
+    integration_domain: dict[str, Any],
+) -> None:
+    workspace = integration_domain["workspace"]
+    user = integration_domain["user"]
+    deal = integration_domain["deal"]
+    template = NotificationTemplate(
+        workspace_id=workspace.id,
+        name="Descriptive push template",
+        channel="in_app",
+        subject_template="{event_title}",
+        body_template="{event_summary}",
+        is_active=True,
+    )
+    db.add(template)
+    await db.flush()
+    rule = NotificationRule(
+        workspace_id=workspace.id,
+        template_id=template.id,
+        name="New lead notification",
+        event_type="lead.created",
+        audience=NotificationAudience.employee,
+        channel="in_app",
+        recipients=[{"address": str(user.id), "recipient_id": str(user.id)}],
+        delay_seconds=0,
+        require_client_consent=False,
+        is_enabled=True,
+    )
+    event = OutboxEvent(
+        workspace_id=workspace.id,
+        event_type="lead.created",
+        aggregate_type="deal",
+        aggregate_id=deal.id,
+        payload={},
+        available_at=FIXED_NOW,
+    )
+    db.add_all([rule, event])
+    await db.commit()
+
+    handlers = RuntimeHandlers(session_factory=SessionLocal, now=lambda: FIXED_NOW)
+    await handlers.expand_notification(
+        claimed_job(
+            JOB_NOTIFICATION_EXPAND,
+            {"outbox_event_id": str(event.id)},
+            workspace_id=workspace.id,
+        )
+    )
+
+    delivery = await db.scalar(
+        sa.select(NotificationDelivery).where(
+            NotificationDelivery.workspace_id == workspace.id,
+            NotificationDelivery.dedupe_key.like(f"%:event:{event.id}:recipient:%"),
+        )
+    )
+    assert delivery is not None
+    assert delivery.subject == "Новый лид"
+    assert delivery.body == "Поступил новый лид."
+
+
+@pytest.mark.asyncio
 async def test_static_notification_skips_foreign_target_for_restricted_employee(
     db: AsyncSession,
     integration_domain: dict[str, Any],
