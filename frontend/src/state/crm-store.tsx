@@ -41,6 +41,7 @@ interface CrmStore {
   openDeal: (dealId: string, signal?: AbortSignal) => Promise<void>;
   selectPipeline: (pipelineId: string) => Promise<void>;
   moveDeal: (dealId: string, stageId: string) => Promise<void>;
+  setDealDetails: (dealId: string, details: { title: string; amount: number }) => Promise<void>;
   setNextPurchase: (dealId: string, date: string | null) => Promise<void>;
   setDealContact: (dealId: string, contact: { id: string; name: string; phone?: string; email?: string } | null) => Promise<void>;
   setDealCompany: (dealId: string, company: { id: string; name: string } | null) => Promise<void>;
@@ -745,6 +746,21 @@ export function CrmProvider({ children, currentUser = demoUsers.ak, userRole = "
     });
   }, [deals, mergeRemoteDeal, recoverVersionedDeal, runDealMutation]);
 
+  const setDealDetails = useCallback(async (dealId: string, details: { title: string; amount: number }) => {
+    const current = deals.find((deal) => deal.id === dealId);
+    if (!current) return;
+    const title = details.title.trim();
+    await runDealMutation(dealId, async () => {
+      if (!remoteEnabled) {
+        setDeals((items) => items.map((deal) => deal.id === dealId
+          ? { ...deal, title, amount: details.amount, version: deal.version + 1 }
+          : deal));
+        return;
+      }
+      await persistDealPatch(dealId, current.version, { title, amount: details.amount });
+    });
+  }, [deals, persistDealPatch, runDealMutation]);
+
   const setNextPurchase = useCallback(async (dealId: string, date: string | null) => {
     const current = deals.find((deal) => deal.id === dealId);
     if (!current) return;
@@ -1080,6 +1096,7 @@ export function CrmProvider({ children, currentUser = demoUsers.ak, userRole = "
       openDeal,
       selectPipeline,
       moveDeal,
+      setDealDetails,
       setNextPurchase,
       setDealContact,
       setDealCompany,
@@ -1102,7 +1119,7 @@ export function CrmProvider({ children, currentUser = demoUsers.ak, userRole = "
       retryMessage,
       toggleTask,
     }),
-    [addDeal, currentUser, dealAssignees, deals, deleteDeal, error, isEmployee, loadMoreDealSearch, loadMoreDeals, loadStageDeals, loadedStageIds, loading, loadingMoreDealSearch, loadingStageId, moveDeal, nextCursorByStage, nextDealSearchCursor, openDeal, pipeline, pipelines, retryMessage, selectDeal, selectPipeline, selectedDeal, selectedDealId, selectedDealMutationPending, sendMessage, setDealAssignee, setDealCompany, setDealContact, setDealCustomFields, setDealSearch, setDealTags, setNextPurchase, stageLoadErrorByStage, toggleTask],
+    [addDeal, currentUser, dealAssignees, deals, deleteDeal, error, isEmployee, loadMoreDealSearch, loadMoreDeals, loadStageDeals, loadedStageIds, loading, loadingMoreDealSearch, loadingStageId, moveDeal, nextCursorByStage, nextDealSearchCursor, openDeal, pipeline, pipelines, retryMessage, selectDeal, selectPipeline, selectedDeal, selectedDealId, selectedDealMutationPending, sendMessage, setDealAssignee, setDealCompany, setDealContact, setDealCustomFields, setDealDetails, setDealSearch, setDealTags, setNextPurchase, stageLoadErrorByStage, toggleTask],
   );
 
   return <CrmContext.Provider value={value}>{children}</CrmContext.Provider>;

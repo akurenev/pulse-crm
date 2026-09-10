@@ -39,6 +39,7 @@ export function DealsPage() {
     openDeal,
     selectPipeline,
     moveDeal,
+    setDealDetails,
     setNextPurchase,
     setDealContact,
     setDealCompany,
@@ -348,6 +349,7 @@ export function DealsPage() {
         mutationPending={selectedDealMutationPending}
         onClose={handleCloseDeal}
         onMove={moveDeal}
+        onSetDetails={setDealDetails}
         onSetNextPurchase={setNextPurchase}
         onSetContact={setDealContact}
         onSetCompany={setDealCompany}

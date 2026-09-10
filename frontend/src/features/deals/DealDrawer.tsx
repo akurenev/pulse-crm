@@ -44,6 +44,7 @@ interface DealDrawerProps {
   mutationPending: boolean;
   onClose: () => void;
   onMove: (dealId: string, stageId: string) => Promise<void>;
+  onSetDetails: (dealId: string, details: { title: string; amount: number }) => Promise<void>;
   onSetNextPurchase: (dealId: string, date: string | null) => Promise<void>;
   onSetContact: (dealId: string, contact: { id: string; name: string; phone?: string; email?: string } | null) => Promise<void>;
   onSetCompany: (dealId: string, company: { id: string; name: string } | null) => Promise<void>;
@@ -58,7 +59,7 @@ interface DealDrawerProps {
   onOpenCompany?: (companyId: string) => void;
 }
 
-export function DealDrawer({ deal, pipeline, assignees, canAccessCompanies = true, canDelete = true, canManageAssignee = true, mutationPending, onClose, onMove, onSetNextPurchase, onSetContact, onSetCompany, onSetAssignee, onSetTags, onSetCustomFields, onSendMessage, onRetryMessage, onToggleTask, onDelete, onOpenContact, onOpenCompany }: DealDrawerProps) {
+export function DealDrawer({ deal, pipeline, assignees, canAccessCompanies = true, canDelete = true, canManageAssignee = true, mutationPending, onClose, onMove, onSetDetails, onSetNextPurchase, onSetContact, onSetCompany, onSetAssignee, onSetTags, onSetCustomFields, onSendMessage, onRetryMessage, onToggleTask, onDelete, onOpenContact, onOpenCompany }: DealDrawerProps) {
   const queryClient = useQueryClient();
   const overlayModal = useMediaQuery("(max-width: 1100px)");
   const [tab, setTab] = useState("details");
@@ -217,10 +218,7 @@ export function DealDrawer({ deal, pipeline, assignees, canAccessCompanies = tru
         <Dialog.Overlay className="drawer-overlay" />
         <Dialog.Content className="deal-drawer" aria-describedby={undefined} aria-busy={mutationPending}>
           <header className="deal-drawer__header">
-            <div className="deal-drawer__identity">
-              <Dialog.Title>{deal.title}</Dialog.Title>
-              <strong>{formatMoney(deal.amount)}</strong>
-            </div>
+            <DealIdentityEditor deal={deal} disabled={mutationPending} onSave={onSetDetails} />
             <label className="stage-select deal-drawer__stage">
               <span className="sr-only">Этап сделки</span>
               <select value={deal.stageId} disabled={mutationPending} onChange={(event) => void handleMove(event.target.value)}>
@@ -478,6 +476,88 @@ function dealMutationErrorMessage(reason: unknown, fallback: string) {
     return fields.length ? `Заполните обязательные поля: ${fields.join(", ")}.` : "Заполните обязательные поля этапа.";
   }
   return fallback;
+}
+
+function DealIdentityEditor({ deal, disabled, onSave }: {
+  deal: Deal;
+  disabled: boolean;
+  onSave: DealDrawerProps["onSetDetails"];
+}) {
+  const [editing, setEditing] = useState(false);
+  const [title, setTitle] = useState(deal.title);
+  const [amount, setAmount] = useState(String(deal.amount));
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    if (!editing) {
+      setTitle(deal.title);
+      setAmount(String(deal.amount));
+    }
+  }, [deal.amount, deal.title, editing]);
+
+  function startEditing() {
+    setTitle(deal.title);
+    setAmount(String(deal.amount));
+    setError("");
+    setEditing(true);
+  }
+
+  function cancelEditing() {
+    setEditing(false);
+    setError("");
+  }
+
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const normalizedTitle = title.trim();
+    const normalizedAmount = Number(amount);
+    if (!normalizedTitle) {
+      setError("Укажите название сделки.");
+      return;
+    }
+    if (!Number.isFinite(normalizedAmount) || normalizedAmount < 0 || normalizedAmount > 999_999_999_999.99) {
+      setError("Укажите сумму от 0 до 999 999 999 999,99 ₽.");
+      return;
+    }
+    setSaving(true);
+    setError("");
+    try {
+      await onSave(deal.id, { title: normalizedTitle, amount: normalizedAmount });
+      setEditing(false);
+    } catch (reason) {
+      setError(dealMutationErrorMessage(reason, "Не удалось сохранить название и сумму сделки."));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  if (!editing) {
+    return <div className="deal-drawer__identity">
+      <div className="deal-drawer__identity-display">
+        <Dialog.Title>{deal.title}</Dialog.Title>
+        <button type="button" className="icon-button deal-drawer__identity-edit" aria-label="Изменить название и сумму сделки" title="Изменить название и сумму" disabled={disabled} onClick={startEditing}><Pencil size={16} aria-hidden="true" /></button>
+        <strong>{formatMoney(deal.amount)}</strong>
+      </div>
+    </div>;
+  }
+
+  return <form className="deal-drawer__identity deal-identity-editor" onSubmit={(event) => void submit(event)}>
+    <Dialog.Title className="sr-only">{deal.title}</Dialog.Title>
+    <div className="deal-identity-editor__fields">
+      <label>Название сделки
+        <textarea aria-label="Название сделки" value={title} maxLength={240} rows={2} required disabled={saving || disabled} onChange={(event) => setTitle(event.target.value)} autoFocus />
+      </label>
+      <label>Сумма, ₽
+        <input aria-label="Сумма сделки, ₽" type="number" inputMode="decimal" min="0" max="999999999999.99" step="0.01" value={amount} required disabled={saving || disabled} onChange={(event) => setAmount(event.target.value)} />
+      </label>
+    </div>
+    <span className="deal-identity-editor__actions">
+      <button type="button" disabled={saving} onClick={cancelEditing}>Отмена</button>
+      <button type="submit" disabled={saving || disabled}>{saving ? "Сохраняем…" : "Сохранить"}</button>
+    </span>
+    {error ? <small className="message-error" role="alert">{error}</small> : null}
+  </form>;
 }
 
 function AssigneePicker({ deal, assignees, disabled, onSave }: {

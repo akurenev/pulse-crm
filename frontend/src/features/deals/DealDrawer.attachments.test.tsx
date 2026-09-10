@@ -68,6 +68,7 @@ function renderDrawer() {
     mutationPending: false,
     onClose: vi.fn(),
     onMove: vi.fn().mockResolvedValue(undefined),
+    onSetDetails: vi.fn().mockResolvedValue(undefined),
     onSetNextPurchase: vi.fn().mockResolvedValue(undefined),
     onSetContact: vi.fn().mockResolvedValue(undefined),
     onSetCompany: vi.fn().mockResolvedValue(undefined),

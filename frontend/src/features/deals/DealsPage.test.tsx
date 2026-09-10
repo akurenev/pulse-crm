@@ -50,6 +50,7 @@ function renderDrawer(overrides: Partial<ComponentProps<typeof DealDrawer>> = {}
     mutationPending: false,
     onClose: vi.fn(),
     onMove: vi.fn().mockResolvedValue(undefined),
+    onSetDetails: vi.fn().mockResolvedValue(undefined),
     onSetNextPurchase: vi.fn().mockResolvedValue(undefined),
     onSetContact: vi.fn().mockResolvedValue(undefined),
     onSetCompany: vi.fn().mockResolvedValue(undefined),
@@ -82,6 +83,26 @@ describe("DealsPage", () => {
     await user.click(within(dialog).getByRole("button", { name: "Закрыть карточку" }));
     await waitFor(() => expect(screen.queryByRole("dialog", { name: deal.title })).not.toBeInTheDocument());
     expect(screen.getByRole("status", { name: "Текущий адрес" })).toHaveTextContent("/deals?view=compact");
+  });
+
+  it("saves an updated deal title and amount from the drawer header", async () => {
+    const user = userEvent.setup();
+    const onSetDetails = vi.fn().mockResolvedValue(undefined);
+    renderDrawer({ onSetDetails });
+
+    await user.click(screen.getByRole("button", { name: "Изменить название и сумму сделки" }));
+    const dialog = screen.getByRole("dialog", { name: initialDeals[0].title });
+    const editor = within(dialog.querySelector(".deal-identity-editor")!);
+    await user.clear(within(dialog).getByRole("textbox", { name: "Название сделки" }));
+    await user.type(within(dialog).getByRole("textbox", { name: "Название сделки" }), "Продление договора");
+    await user.clear(within(dialog).getByRole("spinbutton", { name: "Сумма сделки, ₽" }));
+    await user.type(within(dialog).getByRole("spinbutton", { name: "Сумма сделки, ₽" }), "12500.50");
+    await user.click(editor.getByRole("button", { name: "Сохранить" }));
+
+    await waitFor(() => expect(onSetDetails).toHaveBeenCalledWith(initialDeals[0].id, {
+      title: "Продление договора",
+      amount: 12500.5,
+    }));
   });
 
   it("closes the selected deal when browser history removes its query parameter", async () => {
