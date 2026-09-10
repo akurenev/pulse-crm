@@ -1296,7 +1296,7 @@ class PulseAmoWriter(ImportEntityWriter):
         existing_internal_id: uuid.UUID | None,
         user_mapping: Mapping[str, str],
     ) -> uuid.UUID:
-        del existing_internal_id, user_mapping
+        del user_mapping
         parent = str(entity.data.get("pulse_parent_entity") or "")
         mapped_type = {
             "leads": "deals",
@@ -1321,20 +1321,24 @@ class PulseAmoWriter(ImportEntityWriter):
         )
         params = entity.data.get("params", {})
         text = params.get("text") if isinstance(params, Mapping) else None
-        model = ActivityEvent(
-            workspace_id=workspace_id,
-            event_type="amo_import.note",
-            entity_type=singular_type,
-            entity_id=parent_id or uuid.uuid4(),
-            payload={
-                "text": str(text or "")[:20_000],
-                "amo_note_id": entity.external_id,
-                "amo_parent_id": str(parent_external_id or ""),
-            },
+        model = await _scoped_existing(
+            session, ActivityEvent, workspace_id, existing_internal_id, for_update=True
         )
+        if model is None:
+            model = ActivityEvent(workspace_id=workspace_id)
+            session.add(model)
+        model.event_type = f"{singular_type}.note.created"
+        model.entity_type = singular_type
+        model.entity_id = parent_id or uuid.uuid4()
+        model.actor_id = None
+        model.payload = {
+            "body": str(text or "")[:20_000],
+            "source": "amocrm",
+            "amo_note_id": entity.external_id,
+            "amo_parent_id": str(parent_external_id or ""),
+        }
         if entity.source_updated_at is not None:
             model.occurred_at = entity.source_updated_at
-        session.add(model)
         await session.flush()
         return model.id
 

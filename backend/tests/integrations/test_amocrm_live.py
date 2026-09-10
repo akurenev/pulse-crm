@@ -442,6 +442,7 @@ async def test_workspace_writer_imports_full_domain_and_reruns_without_duplicate
                 )
             ],
         )
+        note_text = "CODE-TEST-001\nCODE-TEST-002\nCODE-TEST-003"
         await apply(
             "notes",
             [
@@ -453,7 +454,7 @@ async def test_workspace_writer_imports_full_domain_and_reruns_without_duplicate
                         "pulse_parent_entity": "leads",
                         "entity_id": 40,
                         "note_type": "common",
-                        "params": {"text": "Клиент ждёт КП"},
+                        "params": {"text": note_text},
                     },
                 )
             ],
@@ -468,7 +469,7 @@ async def test_workspace_writer_imports_full_domain_and_reruns_without_duplicate
         deal = await db.scalar(sa.select(Deal))
         task = await db.scalar(sa.select(Task))
         note = await db.scalar(
-            sa.select(ActivityEvent).where(ActivityEvent.event_type == "amo_import.note")
+            sa.select(ActivityEvent).where(ActivityEvent.event_type == "deal.note.created")
         )
         assert company is not None and contact is not None and deal is not None
         assert task is not None and note is not None
@@ -485,7 +486,54 @@ async def test_workspace_writer_imports_full_domain_and_reruns_without_duplicate
         assert deal.custom_fields == {"amo_501": "A-001"}
         assert task.deal_id == deal.id
         assert note.entity_id == deal.id
+        assert note.payload["body"] == note_text
+        assert note.payload["source"] == "amocrm"
         assert await db.scalar(sa.select(sa.func.count()).select_from(DealContact)) == 1
+
+        note_mapping = await db.scalar(
+            sa.select(ExternalEntityMap).where(
+                ExternalEntityMap.workspace_id == workspace.id,
+                ExternalEntityMap.entity_type == "notes",
+                ExternalEntityMap.external_id == "leads:60",
+            )
+        )
+        assert note_mapping is not None
+        note_data = {
+            "id": 60,
+            "pulse_parent_entity": "leads",
+            "entity_id": 40,
+            "note_type": "common",
+            "params": {"text": note_text},
+        }
+        legacy_note_payload = json.dumps(
+            note_data,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+        note_mapping.fingerprint = hashlib.sha256(legacy_note_payload).hexdigest()
+        note.event_type = "amo_import.note"
+        note.payload = {"text": note_text}
+        original_note_id = note.id
+        await db.commit()
+
+        note_backfill = await apply("notes", [AmoEntity("notes", "leads:60", note_data)])
+        await db.commit()
+        assert note_backfill.updated == 1
+        await db.refresh(note)
+        assert note.id == original_note_id
+        assert note.event_type == "deal.note.created"
+        assert note.payload["body"] == note_text
+        imported_note_count = await db.scalar(
+            sa.select(sa.func.count())
+            .select_from(ActivityEvent)
+            .where(
+                ActivityEvent.event_type.in_(["amo_import.note", "deal.note.created"]),
+                ActivityEvent.entity_id == deal.id,
+            )
+        )
+        assert imported_note_count == 1
 
         company_mapping = await db.scalar(
             sa.select(ExternalEntityMap).where(
