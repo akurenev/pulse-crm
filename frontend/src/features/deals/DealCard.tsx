@@ -38,12 +38,12 @@ export function DealCard({ deal, selected, onSelect }: DealCardProps) {
       <button
         type="button"
         className="deal-card__content"
-        aria-label={`Открыть сделку ${deal.title}. ${deal.subtitle}. Сумма ${formatMoney(deal.amount)}. Источник ${deal.sourceLabel}. Срок ${formatShortDate(deal.dueDate)}. Ответственный ${deal.assignee.name}`}
+        aria-label={`Открыть сделку ${deal.title}. Организация: ${deal.companyName ?? "не указана"}. Сумма ${formatMoney(deal.amount)}. Источник ${deal.sourceLabel}. Срок ${formatShortDate(deal.dueDate)}. Ответственный ${deal.assignee.name}`}
         aria-current={selected ? "true" : undefined}
         onClick={() => onSelect(deal.id)}
       >
         <span className="deal-card__title" title={deal.title}>{deal.title}</span>
-        <span className="deal-card__subtitle" title={deal.subtitle}>{deal.subtitle}</span>
+        <span className="deal-card__subtitle" title={deal.companyName ?? "Организация не указана"}>{deal.companyName ?? "Организация не указана"}</span>
         {deal.tags.length ? <span className="deal-card__tags" aria-label={`Теги: ${deal.tags.join(", ")}`}>{deal.tags.slice(0, 2).map((tag) => <span key={tag}>{tag}</span>)}{deal.tags.length > 2 ? <em>+{deal.tags.length - 2}</em> : null}</span> : null}
         <strong className="deal-card__amount">{formatMoney(deal.amount)}</strong>
         <span className="deal-card__meta deal-card__footer">

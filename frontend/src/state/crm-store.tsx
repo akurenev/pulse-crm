@@ -20,9 +20,10 @@ import type { Deal, Message, Pipeline, SourceCode, Stage, UserSummary } from "..
 
 interface NewDealInput {
   title: string;
-  subtitle: string;
   amount: number;
   source: SourceCode;
+  company?: { id?: string; name: string };
+  contact?: { id?: string; name: string; phone?: string; email?: string };
 }
 
 interface CrmStore {
@@ -138,7 +139,7 @@ function mapRemoteDeal(
   return {
     id: deal.id,
     title: deal.title,
-    subtitle: stringField(customFields, "subtitle") ?? "Без описания",
+    subtitle: stringField(customFields, "subtitle") ?? "",
     amount: Number(deal.amount ?? 0),
     currency: "RUB",
     source: code,
@@ -152,7 +153,7 @@ function mapRemoteDeal(
     phone: primaryContact?.primary_phone ?? primaryContact?.phones[0] ?? stringField(customFields, "phone"),
     email: primaryContact?.primary_email ?? primaryContact?.emails[0] ?? stringField(customFields, "email"),
     companyId: deal.company_id ?? undefined,
-    companyName: deal.company?.name,
+    companyName: deal.company?.name ?? stringField(customFields, "company_name"),
     tags: deal.tags,
     customFields,
     nextPurchaseAt: deal.next_purchase_at ?? undefined,
@@ -880,7 +881,7 @@ export function CrmProvider({ children, currentUser = demoUsers.ak, userRole = "
     const optimistic: Deal = {
       id: `deal-${crypto.randomUUID()}`,
       title: input.title,
-      subtitle: input.subtitle,
+      subtitle: "",
       amount: input.amount,
       currency: "RUB",
       source: input.source,
@@ -889,9 +890,17 @@ export function CrmProvider({ children, currentUser = demoUsers.ak, userRole = "
       dueDate: new Date(Date.now() + 86_400_000).toISOString().slice(0, 10),
       stageId: pipeline.stages[0]?.id ?? demoPipeline.stages[0].id,
       status: "open",
-      contactName: input.title,
+      contactIds: input.contact?.id ? [input.contact.id] : [],
+      contactName: input.contact?.name,
+      phone: input.contact?.phone,
+      email: input.contact?.email,
+      companyId: input.company?.id,
+      companyName: input.company?.name,
       tags: [],
-      customFields: { subtitle: input.subtitle },
+      customFields: {
+        ...(input.company?.id ? {} : input.company?.name ? { company_name: input.company.name } : {}),
+        ...(input.contact?.id ? {} : input.contact?.name ? { contact_name: input.contact.name } : {}),
+      },
       version: 1,
       messages: [],
       tasks: [],
@@ -916,7 +925,12 @@ export function CrmProvider({ children, currentUser = demoUsers.ak, userRole = "
         currency: "RUB",
         source_id: sourceId,
         tags: [],
-        custom_fields: { subtitle: input.subtitle },
+        company_id: input.company?.id ?? null,
+        contact_ids: input.contact?.id ? [input.contact.id] : [],
+        custom_fields: {
+          ...(input.company?.id ? {} : input.company?.name ? { company_name: input.company.name } : {}),
+          ...(input.contact?.id ? {} : input.contact?.name ? { contact_name: input.contact.name } : {}),
+        },
         ...(isEmployee ? { assignee_id: currentUser.id } : {}),
       });
       const persisted = { ...optimistic, id: created.id, tags: created.tags, version: created.version };

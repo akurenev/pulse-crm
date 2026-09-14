@@ -235,9 +235,11 @@ export function DealDrawer({ deal, pipeline, assignees, canAccessCompanies = tru
                 onClick={() => { setDeleteError(""); setDeleteConfirmOpen(true); }}
               >
                 <Trash2 size={18} aria-hidden="true" />
+                <span className="deal-drawer__action-label">Удалить</span>
               </button> : null}
               <Dialog.Close className="icon-button deal-drawer__close" aria-label="Закрыть карточку">
                 <X size={19} />
+                <span className="deal-drawer__action-label">Закрыть</span>
               </Dialog.Close>
             </div>
           </header>

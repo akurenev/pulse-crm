@@ -126,11 +126,14 @@ describe("DealsPage", () => {
     await user.click(screen.getAllByRole("button", { name: "Новая сделка" })[0]);
     const createDialog = await screen.findByRole("dialog", { name: "Новая сделка" });
     await user.type(within(createDialog).getByRole("textbox", { name: "Название" }), "Тестовая сделка");
-    await user.type(within(createDialog).getByRole("textbox", { name: "Потребность" }), "Тестовая потребность");
+    await user.type(within(createDialog).getByRole("textbox", { name: "Организация" }), "ООО Тест");
+    await user.type(within(createDialog).getByRole("textbox", { name: "Контакт" }), "Тестовый контакт");
     await user.type(within(createDialog).getByRole("spinbutton", { name: "Сумма, ₽" }), "1000");
     await user.click(within(createDialog).getByRole("button", { name: "Создать сделку" }));
 
-    expect(await screen.findByRole("dialog", { name: "Тестовая сделка" })).toBeInTheDocument();
+    const dealDialog = await screen.findByRole("dialog", { name: "Тестовая сделка" });
+    expect(dealDialog).toHaveTextContent("ООО Тест");
+    expect(dealDialog).toHaveTextContent("Тестовый контакт");
     expect(screen.getByRole("status", { name: "Текущий адрес" })).toHaveTextContent(/\/deals\?deal=deal-/);
   });
 
@@ -142,7 +145,8 @@ describe("DealsPage", () => {
     await user.click(screen.getAllByRole("button", { name: "Новая сделка" })[0]);
     const createDialog = await screen.findByRole("dialog", { name: "Новая сделка" });
     await user.type(within(createDialog).getByRole("textbox", { name: "Название" }), "Сделка сотрудника");
-    await user.type(within(createDialog).getByRole("textbox", { name: "Потребность" }), "Продление");
+    await user.type(within(createDialog).getByRole("textbox", { name: "Организация" }), "ООО Сотрудник");
+    await user.type(within(createDialog).getByRole("textbox", { name: "Контакт" }), "Контакт сотрудника");
     await user.type(within(createDialog).getByRole("spinbutton", { name: "Сумма, ₽" }), "1500");
     await user.click(within(createDialog).getByRole("button", { name: "Создать сделку" }));
 

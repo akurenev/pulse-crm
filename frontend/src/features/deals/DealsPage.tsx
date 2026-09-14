@@ -162,7 +162,7 @@ export function DealsPage() {
     return deals.filter((deal) => {
       const matchesSource = sourceFilter === "all" || deal.source === sourceFilter;
       const matchesSearch = remoteEnabled || !deferredSearch
-        || `${deal.title} ${deal.subtitle} ${deal.sourceLabel} ${deal.contactName ?? ""} ${deal.companyName ?? ""} ${deal.phone ?? ""} ${deal.email ?? ""} ${deal.tags.join(" ")}`
+        || `${deal.title} ${deal.sourceLabel} ${deal.contactName ?? ""} ${deal.companyName ?? ""} ${deal.phone ?? ""} ${deal.email ?? ""} ${deal.tags.join(" ")}`
           .toLocaleLowerCase("ru")
           .includes(deferredSearch);
       return matchesSource && matchesSearch;
@@ -291,7 +291,7 @@ export function DealsPage() {
                   <span className="company-avatar" aria-hidden="true">{deal.title.slice(0, 1)}</span>
                   <span className="deals-list__identity">
                     <strong title={deal.title}>{deal.title}</strong>
-                    <small title={deal.tags.length ? `${deal.subtitle} · ${deal.tags.join(" · ")}` : deal.subtitle}>{deal.tags.length ? `${deal.subtitle} · ${deal.tags.join(" · ")}` : deal.subtitle}</small>
+                    <small title={deal.tags.length ? `${deal.companyName ?? "Организация не указана"} · ${deal.tags.join(" · ")}` : deal.companyName ?? "Организация не указана"}>{deal.tags.length ? `${deal.companyName ?? "Организация не указана"} · ${deal.tags.join(" · ")}` : deal.companyName ?? "Организация не указана"}</small>
                   </span>
                 </span>
                 <span className="deals-list__stage" data-label="Этап">
