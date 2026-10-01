@@ -335,6 +335,25 @@ export interface ApiImportReport {
   expires_in: number;
 }
 
+export interface ApiSubscriptionImportGroup {
+  organization_name: string;
+  inn: string;
+  expires_at: string;
+  license_count: number;
+  products: string[];
+  contact_count: number;
+  action: "create" | "update" | "skip" | "error";
+  error: string | null;
+}
+
+export interface ApiSubscriptionImportResult {
+  job: Pick<ApiImportJob, "id" | "provider" | "status" | "dry_run" | "entity_type" | "counts" | "started_at" | "completed_at" | "last_error" | "version" | "created_at" | "updated_at">;
+  format: string;
+  counts: Record<string, number>;
+  groups: ApiSubscriptionImportGroup[];
+  warnings: string[];
+}
+
 export interface ApiContactConsent {
   id: string;
   contact_id: string;

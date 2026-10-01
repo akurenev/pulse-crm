@@ -76,7 +76,7 @@ export class DealMutationInProgressError extends Error {
 }
 
 const sourceCodes = new Set<SourceCode>([
-  "manual", "email", "telegram", "max", "webhook", "html_form", "amo_import",
+  "manual", "email", "telegram", "max", "webhook", "html_form", "amo_import", "subscription_import",
 ]);
 const tones: UserSummary["tone"][] = ["blue", "violet", "green", "amber"];
 
@@ -876,6 +876,7 @@ export function CrmProvider({ children, currentUser = demoUsers.ak, userRole = "
       webhook: "webhook",
       html_form: "форма на сайте",
       amo_import: "amoCRM",
+      subscription_import: "импорт подписок",
     };
 
     const optimistic: Deal = {

@@ -1,4 +1,4 @@
-import { Braces, FileText, Mail, MessageCircle, MousePointerClick, PencilLine } from "lucide-react";
+import { Braces, FileSpreadsheet, FileText, Mail, MessageCircle, MousePointerClick, PencilLine } from "lucide-react";
 
 import type { SourceCode } from "../types/crm";
 
@@ -10,6 +10,7 @@ const icons = {
   webhook: Braces,
   html_form: FileText,
   amo_import: MousePointerClick,
+  subscription_import: FileSpreadsheet,
 } satisfies Record<SourceCode, typeof Mail>;
 
 interface SourceBadgeProps {

@@ -74,6 +74,27 @@ describe("SettingsPage custom fields", () => {
   });
 });
 
+describe("SettingsPage subscription imports", () => {
+  it("offers an XLSX preview with pipeline and assignee selection", async () => {
+    const user = userEvent.setup();
+    renderPage();
+
+    await user.click(screen.getByRole("tab", { name: "Импорт" }));
+    expect(screen.getByRole("heading", { name: "Продления из таблицы" })).toBeInTheDocument();
+    expect(screen.getByRole("combobox", { name: "Воронка" })).toHaveValue("pipeline-repeat-sales");
+    expect(screen.getByRole("combobox", { name: "Ответственный" })).not.toHaveValue("");
+
+    const file = new File(["test"], "renewals.xlsx", {
+      type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    });
+    await user.upload(screen.getByLabelText("Файл XLSX"), file);
+    const preview = screen.getByRole("button", { name: /Проверить файл/ });
+    expect(preview).toBeEnabled();
+    await user.click(preview);
+    expect(screen.getByRole("alert")).toHaveTextContent("доступен после подключения CRM к серверу");
+  });
+});
+
 describe("SettingsPage user roles", () => {
   it("offers the employee role with its user-facing label", async () => {
     const user = userEvent.setup();

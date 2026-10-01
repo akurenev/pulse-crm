@@ -282,6 +282,7 @@ export function DealDrawer({ deal, pipeline, assignees, canAccessCompanies = tru
                     <dd className="deal-details__value"><NextPurchaseEditor key={deal.id} deal={deal} disabled={mutationPending} onSave={onSetNextPurchase} /></dd>
                   </div>
                 </dl>
+                <SubscriptionLicenses deal={deal} />
                 <form key={deal.id} className="note-composer note-composer--details" onSubmit={(event) => void handleNote(event)}>
                   <label htmlFor={`deal-note-${deal.id}`}>Заметка о сделке</label>
                   <textarea id={`deal-note-${deal.id}`} name="note" rows={3} maxLength={10_000} required placeholder="Зафиксировать договорённость или итог разговора" />
@@ -391,6 +392,36 @@ export function DealDrawer({ deal, pipeline, assignees, canAccessCompanies = tru
       </Dialog.Root> : null}
     </>
   );
+}
+
+function SubscriptionLicenses({ deal }: { deal: Deal }) {
+  const raw = deal.customFields?.subscription_licenses;
+  if (!Array.isArray(raw) || !raw.length) return null;
+  const licenses = raw.flatMap((item) => {
+    if (!item || typeof item !== "object") return [];
+    const candidate = item as Record<string, unknown>;
+    if (typeof candidate.lid !== "string") return [];
+    return [{
+      lid: candidate.lid,
+      product: typeof candidate.product === "string" ? candidate.product : "Продукт не указан",
+      activatedAt: typeof candidate.activated_at === "string" ? candidate.activated_at : null,
+      expiresAt: typeof candidate.expires_at === "string" ? candidate.expires_at : null,
+    }];
+  });
+  if (!licenses.length) return null;
+  return <section className="subscription-licenses" aria-labelledby={`subscription-licenses-${deal.id}`}>
+    <header><h3 id={`subscription-licenses-${deal.id}`}>Лицензии</h3><span>{licenses.length}</span></header>
+    <div className="subscription-licenses__list">{licenses.map((license) => <article key={`${license.lid}:${license.expiresAt ?? ""}`}>
+      <div><strong>{license.product}</strong><code>{license.lid}</code></div>
+      <small>{license.activatedAt ? `Активирована ${formatSubscriptionDate(license.activatedAt)}` : "Дата активации не указана"}</small>
+      <em>{license.expiresAt ? `до ${formatSubscriptionDate(license.expiresAt)}` : "Срок не указан"}</em>
+    </article>)}</div>
+  </section>;
+}
+
+function formatSubscriptionDate(value: string): string {
+  const date = new Date(`${value.slice(0, 10)}T00:00:00`);
+  return Number.isNaN(date.valueOf()) ? value : date.toLocaleDateString("ru-RU");
 }
 
 const activityLabels: Record<string, string> = {

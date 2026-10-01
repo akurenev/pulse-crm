@@ -105,6 +105,36 @@ describe("DealsPage", () => {
     }));
   });
 
+  it("shows grouped subscription licenses in the deal details", () => {
+    renderDrawer({
+      deal: {
+        ...initialDeals[0],
+        customFields: {
+          ...initialDeals[0].customFields,
+          subscription_licenses: [
+            {
+              lid: "LICENSE-001",
+              product: "Frontol Тариф",
+              activated_at: "2025-10-01",
+              expires_at: "2026-10-15",
+            },
+            {
+              lid: "LICENSE-002",
+              product: "Frontol Mark Unit",
+              activated_at: "2025-10-02",
+              expires_at: "2026-10-15",
+            },
+          ],
+        },
+      },
+    });
+
+    const licenses = screen.getByRole("region", { name: "Лицензии" });
+    expect(licenses).toHaveTextContent("Frontol Тариф");
+    expect(licenses).toHaveTextContent("LICENSE-002");
+    expect(licenses).toHaveTextContent("до 15.10.2026");
+  });
+
   it("closes the selected deal when browser history removes its query parameter", async () => {
     const user = userEvent.setup();
     renderPage();

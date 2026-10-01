@@ -600,6 +600,17 @@ a {
 .details-list > div { display: grid; grid-template-columns: 138px 1fr; align-items: center; gap: 12px; }
 .details-list dt { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12px; }
 .details-list dd { min-width: 0; margin: 0; color: #273247; font-size: 13px; font-weight: 570; }
+.subscription-licenses { border-bottom: 1px solid var(--border); padding: 18px 20px; }
+.subscription-licenses > header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
+.subscription-licenses > header h3 { margin: 0; font-size: 13px; }
+.subscription-licenses > header span { display: grid; min-width: 24px; height: 24px; place-items: center; border-radius: 999px; background: var(--accent-soft); color: var(--accent); font-size: 10px; font-weight: 750; }
+.subscription-licenses__list { display: grid; gap: 8px; }
+.subscription-licenses__list article { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; gap: 12px; border: 1px solid var(--border); border-radius: 9px; background: #fbfcff; padding: 10px 12px; }
+.subscription-licenses__list article > div { display: flex; min-width: 0; flex-direction: column; gap: 3px; }
+.subscription-licenses__list strong { overflow: hidden; color: #273247; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.subscription-licenses__list code { overflow-wrap: anywhere; color: var(--muted); font-size: 9px; }
+.subscription-licenses__list small { color: var(--muted); font-size: 9px; }
+.subscription-licenses__list em { color: #344054; font-size: 10px; font-style: normal; font-weight: 700; white-space: nowrap; }
 .relation-value { display: flex; min-width: 0; align-items: center; justify-content: space-between; gap: 8px; }
 .relation-value > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .relation-value button,
@@ -1019,6 +1030,25 @@ a {
 .import-panel li { display: flex; align-items: center; gap: 8px; color: #435066; font-size: 12px; }
 .import-panel li svg { color: var(--green); }
 .import-panel .button { grid-column: 1 / -1; justify-self: start; }
+.subscription-import { max-width: 820px; margin-top: 24px; border: 1px solid var(--border); border-radius: 12px; background: white; padding: 22px; }
+.subscription-import > header { display: flex; align-items: center; gap: 14px; margin-bottom: 18px; }
+.subscription-import > header h3 { margin: 0 0 4px; font-size: 16px; }
+.subscription-import > header p { margin: 0; color: var(--muted); font-size: 11px; line-height: 1.5; }
+.subscription-import__actions { justify-content: flex-start; margin-top: 16px; }
+.subscription-import__preview { margin-top: 18px; border-top: 1px solid var(--border); padding-top: 16px; }
+.subscription-import__preview > header { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+.subscription-import__preview > header strong { font-size: 13px; }
+.subscription-import__preview > header small { color: var(--muted); font-size: 10px; }
+.subscription-import__warnings { margin: 12px 0 0; border-radius: 8px; background: #fff7ed; padding: 10px 12px 10px 28px; color: #9a3412; font-size: 11px; }
+.subscription-import__groups { display: grid; gap: 7px; max-height: 360px; margin-top: 12px; overflow: auto; }
+.subscription-import__group { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; gap: 12px; border: 1px solid var(--border); border-radius: 9px; padding: 10px 12px; }
+.subscription-import__group div { display: flex; min-width: 0; flex-direction: column; gap: 2px; }
+.subscription-import__group strong { overflow: hidden; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.subscription-import__group small { color: var(--muted); font-size: 9px; }
+.subscription-import__group span { color: var(--text); font-size: 10px; }
+.subscription-import__group em { color: var(--green); font-size: 10px; font-style: normal; }
+.subscription-import__group--error { border-color: #fecaca; background: #fff7f7; }
+.subscription-import__group--error em { color: #b42318; }
 .amocrm-connection { display: grid; max-width: 680px; min-height: 66px; grid-template-columns: auto minmax(0, 1fr) auto auto; align-items: center; gap: 12px; margin-top: 14px; border: 1px solid #b7ebce; border-radius: 10px; background: #f5fcf8; padding: 10px 13px; }
 .amocrm-connection > div:nth-child(2) { display: flex; min-width: 0; flex-direction: column; gap: 3px; }
 .amocrm-connection strong { overflow: hidden; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
@@ -1288,6 +1318,10 @@ a {
   .details-list { gap: 0; padding: 4px 16px 8px; }
   .details-list > div { grid-template-columns: minmax(0, 1fr); gap: 5px; border-bottom: 1px solid #edf0f5; padding: 12px 0; }
   .details-list > div:last-child { border-bottom: 0; }
+  .subscription-licenses { padding: 14px 16px; }
+  .subscription-licenses__list article { grid-template-columns: minmax(0, 1fr); gap: 5px; padding: 11px 12px; }
+  .subscription-licenses__list strong { white-space: normal; }
+  .subscription-licenses__list em { white-space: normal; }
   .deal-details__label { min-width: 0; color: #707b8e; font-size: 11px; font-weight: 650; }
   .deal-details__label svg { width: 16px; height: 16px; }
   .deal-details__value { min-width: 0; padding-left: 24px; font-size: 14px; }

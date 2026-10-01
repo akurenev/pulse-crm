@@ -5,7 +5,8 @@ export type SourceCode =
   | "max"
   | "webhook"
   | "html_form"
-  | "amo_import";
+  | "amo_import"
+  | "subscription_import";
 
 export type DealStatus = "open" | "won" | "lost";
 

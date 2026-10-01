@@ -56,6 +56,7 @@ import type {
   ApiPipeline,
   ApiRequiredField,
   ApiStage,
+  ApiSubscriptionImportResult,
   ApiUser,
   ApiWebhookEndpoint,
   ApiWebhookEndpointCreated,
@@ -120,7 +121,7 @@ export default function SettingsPage() {
           <Tabs.Trigger value="users"><Users size={18} /> Пользователи</Tabs.Trigger>
           <Tabs.Trigger value="channels"><MessageCircle size={18} /> Каналы</Tabs.Trigger>
           <Tabs.Trigger value="notifications"><ShieldCheck size={18} /> Оповещения</Tabs.Trigger>
-          <Tabs.Trigger value="import"><Database size={18} /> Импорт amoCRM</Tabs.Trigger>
+          <Tabs.Trigger value="import"><Database size={18} /> Импорт</Tabs.Trigger>
         </Tabs.List>
         <div className="settings-content">
           <Tabs.Content value="pipelines"><PipelinesPanel currentPipeline={pipeline} dealsCount={deals.length} /></Tabs.Content>
@@ -1261,7 +1262,9 @@ function ImportPanel() {
   }
   return (
     <>
-      <SettingsHeading title="Импорт из amoCRM" />
+      <SettingsHeading title="Импорт" />
+      <SubscriptionImportPanel onImported={() => importsQuery.refetch()} />
+      <section className="settings-subsection"><header><div><h3>Импорт из amoCRM</h3><p>Разовый перенос существующей базы и истории.</p></div></header></section>
       <section className="import-panel"><span className="import-panel__icon"><Upload size={28} /></span><div><h3>Разовый безопасный перенос</h3><p>Сначала Pulse CRM проверит доступные сущности и покажет dry-run без записи данных.</p></div><ol><li><Check size={16} /> Воронки, контакты, компании и сделки</li><li><Check size={16} /> Открытые задачи, поля и заметки</li><li><Check size={16} /> Повторный запуск без дублей</li></ol><Button variant="primary" disabled={connectionQuery.isLoading} onClick={() => { if (connected) setShowStart((value) => !value); else setShowConnect((value) => !value); }}><CirclePlay size={16} /> {connected ? "Запустить импорт" : "Подключить amoCRM"}</Button></section>
       {connection ? <section className="amocrm-connection" aria-label="Подключение amoCRM"><span className="operation-icon"><Globe2 size={18} /></span><div><strong>{connection.account_domain}</strong><small>{connected ? `Подключено${connection.token_expires_at ? ` · токен до ${formatDate(connection.token_expires_at)}` : ""}` : "Подключение отключено"}</small></div><StatusPill status={connection.status} /><div className="operation-actions">{connected ? <Button compact onClick={() => void disconnectAmo()} disabled={saving === "disconnect"}>Отключить</Button> : <Button compact onClick={() => setShowConnect(true)}>Подключить снова</Button>}</div></section> : null}
       {connectionQuery.isError ? <SettingsNotice tone="error">Не удалось проверить подключение amoCRM.</SettingsNotice> : null}
@@ -1278,10 +1281,91 @@ function ImportPanel() {
         </form>
       </SettingsEditor> : null}
       {error && !showStart && !showConnect ? <SettingsNotice tone="error">{error}</SettingsNotice> : null}
-      <section className="settings-subsection"><header><div><h3>Запуски импорта</h3><p>Статус, прогресс и управление возобновлением.</p></div><Button compact onClick={() => void importsQuery.refetch()} disabled={!remoteEnabled || importsQuery.isFetching}><RefreshCcw size={15} /> Обновить</Button></header><div className="operation-list">{imports.map((job) => <article key={job.id}><span className="operation-icon"><Database size={18} /></span><div><strong>{importEntityLabel(job.entity_type)} {job.dry_run ? "· dry-run" : "· перенос"}</strong><small>{countSummary(job.counts)}{Object.keys(job.user_mapping).length ? ` · ${Object.keys(job.user_mapping).length} сопоставлено` : ""} · обновлено {formatDate(job.updated_at)}</small>{job.last_error ? <em>{job.last_error}</em> : null}</div><StatusPill status={job.status} /><div className="operation-actions">{job.status === "running" || job.status === "pending" ? <Button compact onClick={() => void importAction(job, "pause")} disabled={saving === job.id}><Pause size={14} /> Пауза</Button> : null}{job.status === "paused" || job.status === "failed" ? <Button compact onClick={() => void importAction(job, "resume")} disabled={saving === job.id}><Play size={14} /> Продолжить</Button> : null}{job.status === "succeeded" && job.report_object_key ? <Button compact onClick={() => void downloadImportReport(job)} disabled={saving === `report:${job.id}`}><Upload size={14} /> Скачать отчёт</Button> : null}</div></article>)}{!imports.length && !importsQuery.isLoading ? <SettingsEmpty icon={<Database size={22} />} title="Импорт ещё не запускался" text="Начните с dry-run воронок, затем переносите связанные сущности." /> : null}</div></section>
+      <section className="settings-subsection"><header><div><h3>Запуски импорта</h3><p>Статус, прогресс и управление возобновлением.</p></div><Button compact onClick={() => void importsQuery.refetch()} disabled={!remoteEnabled || importsQuery.isFetching}><RefreshCcw size={15} /> Обновить</Button></header><div className="operation-list">{imports.map((job) => <article key={job.id}><span className="operation-icon"><Database size={18} /></span><div><strong>{job.provider === "subscription_xlsx" ? "Продления из XLSX" : importEntityLabel(job.entity_type)} {job.dry_run ? "· проверка" : "· импорт"}</strong><small>{countSummary(job.counts)}{Object.keys(job.user_mapping).length ? ` · ${Object.keys(job.user_mapping).length} сопоставлено` : ""} · обновлено {formatDate(job.updated_at)}</small>{job.last_error ? <em>{job.last_error}</em> : null}</div><StatusPill status={job.status} /><div className="operation-actions">{job.provider === "amocrm" && (job.status === "running" || job.status === "pending") ? <Button compact onClick={() => void importAction(job, "pause")} disabled={saving === job.id}><Pause size={14} /> Пауза</Button> : null}{job.provider === "amocrm" && (job.status === "paused" || job.status === "failed") ? <Button compact onClick={() => void importAction(job, "resume")} disabled={saving === job.id}><Play size={14} /> Продолжить</Button> : null}{job.status === "succeeded" && job.report_object_key ? <Button compact onClick={() => void downloadImportReport(job)} disabled={saving === `report:${job.id}`}><Upload size={14} /> Скачать отчёт</Button> : null}</div></article>)}{!imports.length && !importsQuery.isLoading ? <SettingsEmpty icon={<Database size={22} />} title="Импорт ещё не запускался" text="Проверьте таблицу продлений или начните с dry-run amoCRM." /> : null}</div></section>
       <section className="settings-subsection"><header><div><h3>Ошибки фоновых заданий</h3><p>После исправления причины задание можно безопасно повторить.</p></div></header><div className="operation-list operation-list--failed">{failedJobs.map((job) => <article key={job.id}><span className="operation-icon operation-icon--danger"><AlertTriangle size={18} /></span><div><strong>{job.job_type}</strong><small>{job.attempts} из {job.max_attempts} попыток · {formatDate(job.updated_at)}</small><em>{job.last_error ?? "Причина не записана"}</em></div><StatusPill status="failed" /><div className="operation-actions"><Button compact onClick={() => void retryJob(job)} disabled={saving === job.id}><RotateCcw size={14} /> Повторить</Button></div></article>)}{!failedJobs.length && !failedJobsQuery.isLoading ? <SettingsEmpty icon={<Check size={22} />} title="Ошибок нет" text="Все фоновые задания выполняются штатно." /> : null}</div></section>
     </>
   );
+}
+
+function SubscriptionImportPanel({ onImported }: { onImported: () => unknown }) {
+  const { pipelines, dealAssignees } = useCrm();
+  const [file, setFile] = useState<File | null>(null);
+  const [pipelineId, setPipelineId] = useState("");
+  const [assigneeId, setAssigneeId] = useState("");
+  const [callDueAt, setCallDueAt] = useState("");
+  const [result, setResult] = useState<ApiSubscriptionImportResult | null>(null);
+  const [saving, setSaving] = useState<"preview" | "import" | null>(null);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    if (!pipelineId && pipelines.length) setPipelineId(pipelines[0].id);
+  }, [pipelineId, pipelines]);
+  useEffect(() => {
+    if (!assigneeId && dealAssignees.length) setAssigneeId(dealAssignees[0].id);
+  }, [assigneeId, dealAssignees]);
+
+  async function upload(dryRun: boolean) {
+    if (!file || !pipelineId || !assigneeId) {
+      setError("Выберите XLSX-файл, воронку и ответственного.");
+      return;
+    }
+    if (!remoteEnabled) {
+      setError("Импорт таблиц доступен после подключения CRM к серверу.");
+      return;
+    }
+    setSaving(dryRun ? "preview" : "import");
+    setError("");
+    try {
+      const form = new FormData();
+      form.set("file", file);
+      form.set("pipeline_id", pipelineId);
+      form.set("assignee_id", assigneeId);
+      form.set("dry_run", String(dryRun));
+      if (callDueAt) form.set("call_due_at", new Date(callDueAt).toISOString());
+      const imported = await api.upload<ApiSubscriptionImportResult>("/admin/integrations/subscription-imports", form);
+      setResult(imported);
+      await onImported();
+      window.dispatchEvent(new CustomEvent("pulse:refresh"));
+      window.dispatchEvent(new CustomEvent("pulse:tasks-refresh"));
+    } catch (reason) {
+      setError(errorMessage(reason, dryRun ? "Не удалось проверить таблицу." : "Не удалось импортировать продления."));
+    } finally {
+      setSaving(null);
+    }
+  }
+
+  const hasBlockingErrors = Boolean(result?.groups.some((group) => group.action === "error"));
+  return <section className="subscription-import" aria-labelledby="subscription-import-title">
+    <header>
+      <span className="import-panel__icon"><FileText size={25} /></span>
+      <div><h3 id="subscription-import-title">Продления из таблицы</h3><p>Формат Frontol EndLic. Лицензии одной организации с одинаковой датой окончания объединяются в сделку.</p></div>
+    </header>
+    <div className="settings-form-grid">
+      <label className="field"><span>Файл XLSX</span><input type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" onChange={(event) => { setFile(event.target.files?.[0] ?? null); setResult(null); }} /></label>
+      <label className="field"><span>Воронка</span><select value={pipelineId} onChange={(event) => { setPipelineId(event.target.value); setResult(null); }} required><option value="">Выберите воронку</option>{pipelines.map((pipeline) => <option key={pipeline.id} value={pipeline.id}>{pipeline.name}</option>)}</select></label>
+      <label className="field"><span>Ответственный</span><select value={assigneeId} onChange={(event) => { setAssigneeId(event.target.value); setResult(null); }} required><option value="">Выберите сотрудника</option>{dealAssignees.filter((user) => user.id !== "unassigned").map((user) => <option key={user.id} value={user.id}>{user.name}</option>)}</select></label>
+      <label className="field"><span>Срок созвона</span><input type="datetime-local" value={callDueAt} onChange={(event) => { setCallDueAt(event.target.value); setResult(null); }} /><small>Если не указан: в рабочий день 17:00 или следующий рабочий день 10:00.</small></label>
+    </div>
+    <div className="dialog-actions subscription-import__actions">
+      <Button type="button" disabled={saving !== null || !file} onClick={() => void upload(true)}><Check size={15} /> {saving === "preview" ? "Проверяем…" : "Проверить файл"}</Button>
+      <Button type="button" variant="primary" disabled={saving !== null || !result?.job.dry_run || hasBlockingErrors} onClick={() => void upload(false)}><Upload size={15} /> {saving === "import" ? "Импортируем…" : "Импортировать"}</Button>
+    </div>
+    {error ? <p className="form-error" role="alert">{error}</p> : null}
+    {result ? <SubscriptionImportPreview result={result} /> : null}
+  </section>;
+}
+
+function SubscriptionImportPreview({ result }: { result: ApiSubscriptionImportResult }) {
+  const actionLabels: Record<string, string> = { create: "Будет создана", update: "Будет обновлена", skip: "Уже обработана", error: "Ошибка" };
+  return <div className="subscription-import__preview" role="status">
+    <header><strong>{result.job.dry_run ? "Результат проверки" : "Импорт завершён"}</strong><small>{result.counts.licenses ?? 0} лицензий · {result.counts.groups ?? 0} сделок · {result.counts.duplicate_rows ?? 0} дублей пропущено</small></header>
+    {result.warnings.length ? <ul className="subscription-import__warnings">{result.warnings.map((warning) => <li key={warning}>{warning}</li>)}</ul> : null}
+    <div className="subscription-import__groups">{result.groups.map((group) => <article className={group.action === "error" ? "subscription-import__group subscription-import__group--error" : "subscription-import__group"} key={`${group.inn}:${group.expires_at}`}>
+      <div><strong>{group.organization_name}</strong><small>ИНН {group.inn} · до {new Date(`${group.expires_at}T00:00:00`).toLocaleDateString("ru-RU")}</small></div>
+      <span>{group.license_count} {group.license_count === 1 ? "лицензия" : "лицензии"}</span>
+      <em>{group.error ?? actionLabels[group.action] ?? group.action}</em>
+    </article>)}</div>
+  </div>;
 }
 
 function InviteUsersPanel() {

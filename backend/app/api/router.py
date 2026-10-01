@@ -7,6 +7,7 @@ from app.integrations import (
     attachments_api,
     consents_api,
     operations_api,
+    subscription_import_api,
 )
 from app.integrations import api as integrations_api
 
@@ -23,3 +24,4 @@ api_router.include_router(consents_api.router)
 api_router.include_router(admin_api.router)
 api_router.include_router(amocrm_api.router)
 api_router.include_router(operations_api.router)
+api_router.include_router(subscription_import_api.router)
