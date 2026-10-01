@@ -88,6 +88,7 @@ describe("SettingsPage subscription imports", () => {
       type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     });
     await user.upload(screen.getByLabelText("Файл XLSX"), file);
+    expect(screen.getByText("renewals.xlsx")).toBeInTheDocument();
     const preview = screen.getByRole("button", { name: /Проверить файл/ });
     expect(preview).toBeEnabled();
     await user.click(preview);

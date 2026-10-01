@@ -1289,6 +1289,7 @@ function ImportPanel() {
 
 function SubscriptionImportPanel({ onImported }: { onImported: () => unknown }) {
   const { pipelines, dealAssignees } = useCrm();
+  const fileInputId = useId();
   const [file, setFile] = useState<File | null>(null);
   const [pipelineId, setPipelineId] = useState("");
   const [assigneeId, setAssigneeId] = useState("");
@@ -1341,7 +1342,14 @@ function SubscriptionImportPanel({ onImported }: { onImported: () => unknown }) 
       <div><h3 id="subscription-import-title">Продления из таблицы</h3><p>Формат Frontol EndLic. Лицензии одной организации с одинаковой датой окончания объединяются в сделку.</p></div>
     </header>
     <div className="settings-form-grid">
-      <label className="field"><span>Файл XLSX</span><input type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" onChange={(event) => { setFile(event.target.files?.[0] ?? null); setResult(null); }} /></label>
+      <label className="field subscription-import__file" htmlFor={fileInputId}>
+        <span>Файл XLSX</span>
+        <span className="subscription-import__file-control">
+          <span className="subscription-import__file-trigger"><Upload size={16} /> Выбрать XLSX</span>
+          <span className={file ? "subscription-import__file-name subscription-import__file-name--selected" : "subscription-import__file-name"} title={file?.name}>{file?.name ?? "Файл не выбран"}</span>
+        </span>
+        <input id={fileInputId} className="sr-only" type="file" aria-label="Файл XLSX" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" onChange={(event) => { setFile(event.target.files?.[0] ?? null); setResult(null); }} />
+      </label>
       <label className="field"><span>Воронка</span><select value={pipelineId} onChange={(event) => { setPipelineId(event.target.value); setResult(null); }} required><option value="">Выберите воронку</option>{pipelines.map((pipeline) => <option key={pipeline.id} value={pipeline.id}>{pipeline.name}</option>)}</select></label>
       <label className="field"><span>Ответственный</span><select value={assigneeId} onChange={(event) => { setAssigneeId(event.target.value); setResult(null); }} required><option value="">Выберите сотрудника</option>{dealAssignees.filter((user) => user.id !== "unassigned").map((user) => <option key={user.id} value={user.id}>{user.name}</option>)}</select></label>
       <label className="field"><span>Срок созвона</span><input type="datetime-local" value={callDueAt} onChange={(event) => { setCallDueAt(event.target.value); setResult(null); }} /><small>Если не указан: в рабочий день 17:00 или следующий рабочий день 10:00.</small></label>
