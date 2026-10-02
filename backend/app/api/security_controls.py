@@ -1,23 +1,22 @@
-"""Owner-visible status for privileged data-extraction capabilities."""
-
-from typing import Literal
+"""Export policy status for roles permitted to download CRM data."""
 
 from fastapi import APIRouter
 from pydantic import BaseModel
 
-from app.security import CurrentOwner, SettingsDependency
+from app.models import Role
+from app.security import CRM_EXPORT_ROLES, CurrentCRMExportUser, SettingsDependency
 
 router = APIRouter(prefix="/admin/security", tags=["security"])
 
 
 class ExportPolicyRead(BaseModel):
     enabled: bool
-    allowed_role: Literal["owner"] = "owner"
+    allowed_roles: tuple[Role, ...] = CRM_EXPORT_ROLES
 
 
 @router.get("/export-policy", response_model=ExportPolicyRead)
 async def export_policy_status(
-    context: CurrentOwner,
+    context: CurrentCRMExportUser,
     settings: SettingsDependency,
 ) -> ExportPolicyRead:
     """Return the effective server policy without enabling an export."""

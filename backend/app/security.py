@@ -173,13 +173,15 @@ CurrentUser = Annotated[AuthContext, Depends(get_auth_context)]
 CurrentMutationUser = Annotated[AuthContext, Depends(require_csrf)]
 CurrentAdmin = Annotated[AuthContext, Depends(require_roles(Role.owner, Role.admin))]
 CurrentOwner = Annotated[AuthContext, Depends(require_roles(Role.owner))]
+CRM_EXPORT_ROLES = (Role.owner, Role.admin, Role.manager)
+CurrentCRMExportUser = Annotated[AuthContext, Depends(require_roles(*CRM_EXPORT_ROLES))]
 
 
 async def require_crm_export_enabled(
-    context: CurrentOwner,
+    context: CurrentCRMExportUser,
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> AuthContext:
-    """Authorize CRM exports only for an owner and an explicit server opt-in."""
+    """Authorize CRM exports for permitted roles and an explicit server opt-in."""
 
     if not settings.crm_export_enabled:
         raise HTTPException(

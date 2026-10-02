@@ -1,4 +1,4 @@
-"""Owner-authorized, bounded monthly deal downloads without stored export files."""
+"""Role-authorized, bounded monthly deal downloads without stored export files."""
 
 from __future__ import annotations
 

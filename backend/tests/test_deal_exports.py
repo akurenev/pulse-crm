@@ -61,28 +61,70 @@ async def test_export_disabled_and_csrf_required(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("role", ["admin", "manager", "employee"])
-async def test_export_owner_only(
+@pytest.mark.parametrize("role", ["owner", "admin", "manager", "employee"])
+async def test_export_role_permissions(
     client: httpx.AsyncClient, owner_auth: dict[str, object], export_enabled: None, role: str
 ) -> None:
-    invitation = await client.post(
-        "/api/v1/invitations",
-        headers=headers(owner_auth),
-        json={"email": f"{role}@example.com", "role": role},
-    )
-    accepted = await client.post(
-        "/api/v1/auth/accept-invitation",
-        json={
-            "token": invitation.json()["token"],
-            "full_name": "Тестовый пользователь",
-            "password": "test export password only",
-        },
-    )
-    assert accepted.status_code == 201
+    workspace_id = uuid.UUID(str(owner_auth["workspace"]["id"]))  # type: ignore[index]
+    owner_id = uuid.UUID(str(owner_auth["user"]["id"]))  # type: ignore[index]
+    async with SessionLocal() as db:
+        pipeline = await db.scalar(sa.select(Pipeline).where(Pipeline.workspace_id == workspace_id))
+        assert pipeline is not None
+        stage = await db.scalar(sa.select(Stage).where(Stage.pipeline_id == pipeline.id))
+        assert stage is not None
+        db.add(
+            Deal(
+                workspace_id=workspace_id,
+                pipeline_id=pipeline.id,
+                stage_id=stage.id,
+                assignee_id=owner_id,
+                title="Тестовая сделка владельца",
+                amount=Decimal("249.50"),
+                created_at=datetime(2026, 10, 2, tzinfo=UTC),
+            )
+        )
+        await db.commit()
+    auth = owner_auth
+    if role != "owner":
+        invitation = await client.post(
+            "/api/v1/invitations",
+            headers=headers(owner_auth),
+            json={"email": f"{role}@example.com", "role": role},
+        )
+        accepted = await client.post(
+            "/api/v1/auth/accept-invitation",
+            json={
+                "token": invitation.json()["token"],
+                "full_name": "Тестовый пользователь",
+                "password": "test export password only",
+            },
+        )
+        assert accepted.status_code == 201
+        auth = accepted.json()
     response = await client.post(
-        "/api/v1/deals/export", headers=headers(accepted.json()), json={"month": "2026-10"}
+        "/api/v1/deals/export", headers=headers(auth), json={"month": "2026-10"}
     )
-    assert response.status_code == 403
+    if role == "employee":
+        assert response.status_code == 403
+    else:
+        assert response.status_code == 200, response.text
+        sheet = load_workbook(BytesIO(response.content)).active
+        assert sheet is not None
+        assert sheet.max_row == 2
+        assert sheet.cell(2, 2).value == "Тестовая сделка владельца"
+    async with SessionLocal() as db:
+        events = list(
+            (
+                await db.scalars(
+                    sa.select(ActivityEvent).where(
+                        ActivityEvent.event_type == "deals.export.downloaded"
+                    )
+                )
+            ).all()
+        )
+        assert len(events) == (0 if role == "employee" else 1)
+        if events:
+            assert str(events[0].actor_id) == str(auth["user"]["id"])  # type: ignore[index]
 
 
 @pytest.mark.asyncio

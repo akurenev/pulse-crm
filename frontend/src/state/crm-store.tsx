@@ -29,7 +29,7 @@ interface NewDealInput {
 interface CrmStore {
   currentUser: UserSummary;
   isEmployee: boolean;
-  isOwner: boolean;
+  canExportDeals: boolean;
   deals: Deal[];
   pipeline: Pipeline;
   pipelines: Pipeline[];
@@ -190,7 +190,7 @@ interface CrmProviderProps extends PropsWithChildren {
 
 export function CrmProvider({ children, currentUser = demoUsers.ak, userRole = "owner" }: CrmProviderProps) {
   const isEmployee = userRole === "employee";
-  const isOwner = userRole === "owner";
+  const canExportDeals = userRole === "owner" || userRole === "admin" || userRole === "manager";
   const [deals, setDeals] = useState<Deal[]>(() => remoteEnabled ? [] : initialDeals);
   const [pipeline, setPipeline] = useState<Pipeline>(demoPipeline);
   const [pipelines, setPipelines] = useState<Pipeline[]>(() => remoteEnabled ? [] : [demoPipeline]);
@@ -1104,7 +1104,7 @@ export function CrmProvider({ children, currentUser = demoUsers.ak, userRole = "
     () => ({
       currentUser,
       isEmployee,
-      isOwner,
+      canExportDeals,
       deals,
       pipeline,
       pipelines,
@@ -1141,7 +1141,7 @@ export function CrmProvider({ children, currentUser = demoUsers.ak, userRole = "
       retryMessage,
       toggleTask,
     }),
-    [addDeal, currentUser, dealAssignees, deals, deleteDeal, error, isEmployee, isOwner, loadMoreDealSearch, loadMoreDeals, loadStageDeals, loadedStageIds, loading, loadingMoreDealSearch, loadingStageId, moveDeal, nextCursorByStage, nextDealSearchCursor, openDeal, pipeline, pipelines, retryMessage, selectDeal, selectPipeline, selectedDeal, selectedDealId, selectedDealMutationPending, sendMessage, setDealAssignee, setDealCompany, setDealContact, setDealCustomFields, setDealDetails, setDealSearch, setDealTags, setNextPurchase, stageLoadErrorByStage, toggleTask],
+    [addDeal, currentUser, dealAssignees, deals, deleteDeal, error, isEmployee, canExportDeals, loadMoreDealSearch, loadMoreDeals, loadStageDeals, loadedStageIds, loading, loadingMoreDealSearch, loadingStageId, moveDeal, nextCursorByStage, nextDealSearchCursor, openDeal, pipeline, pipelines, retryMessage, selectDeal, selectPipeline, selectedDeal, selectedDealId, selectedDealMutationPending, sendMessage, setDealAssignee, setDealCompany, setDealContact, setDealCustomFields, setDealDetails, setDealSearch, setDealTags, setNextPurchase, stageLoadErrorByStage, toggleTask],
   );
 
   return <CrmContext.Provider value={value}>{children}</CrmContext.Provider>;

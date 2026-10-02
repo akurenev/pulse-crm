@@ -72,6 +72,20 @@ function renderDrawer(overrides: Partial<ComponentProps<typeof DealDrawer>> = {}
 }
 
 describe("DealsPage", () => {
+  it.each(["owner", "admin", "manager", "employee", null] as const)("limits XLSX export controls for role %s", async (userRole) => {
+    renderPage("/deals", { userRole });
+    const button = screen.queryByRole("button", { name: "Выгрузить сделки в XLSX" });
+    if (userRole === "employee" || userRole === null) {
+      expect(button).not.toBeInTheDocument();
+    } else {
+      expect(button).toBeInTheDocument();
+      await userEvent.setup().click(button!);
+      const dialog = await screen.findByRole("dialog", { name: "Выгрузка сделок" });
+      expect(within(dialog).getByLabelText("Месяц")).toBeInTheDocument();
+      expect(within(dialog).getByRole("button", { name: "Скачать XLSX" })).toBeInTheDocument();
+    }
+  });
+
   it("opens a deal from a deep-link URL and clears the route when the drawer closes", async () => {
     const user = userEvent.setup();
     const deal = initialDeals.find((item) => item.id === "deal-sloy")!;

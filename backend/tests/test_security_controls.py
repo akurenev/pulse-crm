@@ -18,33 +18,39 @@ from app.services.data_access import consume_cursor_page_budget
 
 
 @pytest.mark.asyncio
-async def test_export_policy_is_disabled_by_default_and_owner_only(
+@pytest.mark.parametrize("role", ["owner", "admin", "manager", "employee"])
+async def test_export_policy_is_disabled_by_default_and_role_scoped(
     client: httpx.AsyncClient,
     owner_auth: dict[str, object],
+    role: str,
 ) -> None:
-    status = await client.get("/api/v1/admin/security/export-policy")
-    assert status.status_code == 200, status.text
-    assert status.json() == {"enabled": False, "allowed_role": "owner"}
-    assert status.headers["cache-control"] == "no-store"
-    assert status.headers["pragma"] == "no-cache"
+    if role != "owner":
+        invitation = await client.post(
+            "/api/v1/invitations",
+            headers={"X-CSRF-Token": str(owner_auth["csrf_token"])},
+            json={"email": f"export-{role}@example.com", "role": role},
+        )
+        accepted = await client.post(
+            "/api/v1/auth/accept-invitation",
+            json={
+                "token": invitation.json()["token"],
+                "full_name": "Export Test User",
+                "password": "test export password only",
+            },
+        )
+        assert accepted.status_code == 201, accepted.text
 
-    invitation = await client.post(
-        "/api/v1/invitations",
-        headers={"X-CSRF-Token": str(owner_auth["csrf_token"])},
-        json={"email": "export-manager@example.com", "role": "manager"},
-    )
-    accepted = await client.post(
-        "/api/v1/auth/accept-invitation",
-        json={
-            "token": invitation.json()["token"],
-            "full_name": "Export Manager",
-            "password": "secure export manager password",
-        },
-    )
-    assert accepted.status_code == 201, accepted.text
-
-    forbidden = await client.get("/api/v1/admin/security/export-policy")
-    assert forbidden.status_code == 403
+    response = await client.get("/api/v1/admin/security/export-policy")
+    if role == "employee":
+        assert response.status_code == 403
+    else:
+        assert response.status_code == 200, response.text
+        assert response.json() == {
+            "enabled": False,
+            "allowed_roles": ["owner", "admin", "manager"],
+        }
+        assert response.headers["cache-control"] == "no-store"
+        assert response.headers["pragma"] == "no-cache"
 
 
 @pytest.mark.asyncio
@@ -159,9 +165,7 @@ async def test_cursor_budget_does_not_count_first_pages_and_audits_one_crossing(
     assert (
         await client.get("/api/v1/companies", params={"limit": 1, "cursor": cursor})
     ).status_code == 200
-    blocked = await client.get(
-        "/api/v1/companies", params={"limit": 1, "cursor": cursor}
-    )
+    blocked = await client.get("/api/v1/companies", params={"limit": 1, "cursor": cursor})
     assert blocked.status_code == 429, blocked.text
     assert blocked.json()["detail"]["code"] == "cursor_page_budget_exceeded"
     assert int(blocked.headers["retry-after"]) > 0
@@ -186,8 +190,7 @@ async def test_cursor_budget_does_not_count_first_pages_and_audits_one_crossing(
 
 
 @pytest.mark.asyncio
-async def test_cursor_budget_resets_in_place_after_fixed_window(
-) -> None:
+async def test_cursor_budget_resets_in_place_after_fixed_window() -> None:
     # A real workspace/user pair keeps SQLite foreign-key semantics honest.
     async with SessionLocal() as db:
         workspace = Workspace(name="Budget", slug="budget")

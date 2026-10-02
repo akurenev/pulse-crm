@@ -28,7 +28,7 @@ export function DealsPage() {
   const {
     currentUser,
     isEmployee,
-    isOwner,
+    canExportDeals,
     deals,
     pipeline,
     pipelines,
@@ -223,7 +223,7 @@ export function DealsPage() {
       </header>
 
       <div className="deals-filters">
-        {isOwner ? <DealExportControl pipeline={pipeline} pipelines={pipelines} /> : null}
+        {canExportDeals ? <DealExportControl pipeline={pipeline} pipelines={pipelines} /> : null}
         <label className="select-control">
           <span className="sr-only">Воронка</span>
           <select value={pipeline.id} onChange={(event) => void handleSelectPipeline(event.target.value)}>{pipelines.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select>
