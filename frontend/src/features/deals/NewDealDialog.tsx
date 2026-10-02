@@ -120,7 +120,7 @@ export function NewDealDialog({ open, onOpenChange, onSubmit }: NewDealDialogPro
             />
             <label className="field">
               <span>Сумма, ₽</span>
-              <input name="amount" type="number" min="0" step="100" required placeholder="50000" />
+              <input name="amount" type="number" inputMode="decimal" min="0" max="999999999999.99" step="0.01" required placeholder="50000" />
             </label>
             <label className="field">
               <span>Источник</span>

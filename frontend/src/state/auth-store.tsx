@@ -60,6 +60,7 @@ export function AuthProvider({ children }: PropsWithChildren) {
   const [status, setStatus] = useState<AuthStatus>(remoteEnabled ? "loading" : "authenticated");
   const [session, setSession] = useState<AuthResponse | null>(remoteEnabled ? null : demoSession);
   const activeIdentity = useRef<string | null>(remoteEnabled ? null : sessionIdentity(demoSession));
+  const accessRevision = useRef<number | null>(remoteEnabled ? null : 0);
   const sessionRefreshGeneration = useRef(0);
 
   const expireSession = useCallback((broadcast = true) => {
@@ -68,6 +69,7 @@ export function AuthProvider({ children }: PropsWithChildren) {
     api.setCsrf("");
     setSession(null);
     activeIdentity.current = null;
+    accessRevision.current = null;
     setStatus("anonymous");
     if (!broadcast || typeof window === "undefined") return;
     try {
@@ -79,10 +81,19 @@ export function AuthProvider({ children }: PropsWithChildren) {
 
   const applySession = useCallback((current: AuthResponse) => {
     const nextIdentity = sessionIdentity(current);
-    if (activeIdentity.current !== null && activeIdentity.current !== nextIdentity) queryClient.clear();
+    const nextAccessRevision = current.access_revision ?? 0;
+    if (activeIdentity.current !== null && (
+      activeIdentity.current !== nextIdentity
+      || (accessRevision.current !== null && accessRevision.current !== nextAccessRevision)
+    )) {
+      queryClient.clear();
+      window.dispatchEvent(new Event("pulse:access-changed"));
+      window.dispatchEvent(new Event("pulse:refresh"));
+    }
     api.setCsrf(current.csrf_token);
     setSession(current);
     activeIdentity.current = nextIdentity;
+    accessRevision.current = nextAccessRevision;
     setStatus("authenticated");
   }, [queryClient]);
 

@@ -183,7 +183,6 @@ function useRealtimeRefresh(refreshSession: (options?: { failClosed?: boolean })
     let fallbackInterval: number | null = null;
     let disposed = false;
     let sessionProbe: Promise<void> | null = null;
-    let hasOpened = false;
 
     const refresh = () => {
       refreshTimeout = null;
@@ -234,9 +233,8 @@ function useRealtimeRefresh(refreshSession: (options?: { failClosed?: boolean })
     const startFallback = () => {
       if (disposed || fallbackInterval !== null) return;
       fallbackInterval = window.setInterval(() => {
-        // While realtime is unavailable, an assignment or role change may not
-        // reach this tab. Fail closed before rebuilding the latest REST view.
-        purgeAccessState();
+        // /auth/me reports missed access changes. An ordinary poll must keep
+        // mounted editors and their drafts intact.
         probeSession();
         scheduleRefresh();
       }, REALTIME_FALLBACK_INTERVAL_MS);
@@ -254,10 +252,7 @@ function useRealtimeRefresh(refreshSession: (options?: { failClosed?: boolean })
     const source = new EventSource("/api/v1/events");
     const handleOpen = () => {
       stopFallback();
-      purgeAccessState();
-      const reconnecting = hasOpened;
-      hasOpened = true;
-      probeSession(reconnecting, true);
+      probeSession(false, true);
       // Reconcile the REST snapshot with events that may have arrived before
       // the server established the stream cursor, and after reconnect gaps.
       scheduleRefresh();

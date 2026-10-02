@@ -83,6 +83,7 @@ class AuthResponse(BaseModel):
     user: UserRead
     workspace: WorkspaceRead
     csrf_token: str
+    access_revision: int = 0
 
 
 class InvitationCreate(BaseModel):

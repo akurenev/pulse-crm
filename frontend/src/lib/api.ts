@@ -15,7 +15,7 @@ export class ApiError extends Error {
   }
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+async function request<T>(path: string, init?: RequestInit, asBlob = false): Promise<T> {
   const method = init?.method?.toUpperCase() ?? "GET";
   const multipart = typeof FormData !== "undefined" && init?.body instanceof FormData;
   const response = await fetch(`${API_ROOT}${path}`, {
@@ -39,13 +39,15 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     return undefined as T;
   }
 
-  return response.json() as Promise<T>;
+  return (asBlob ? response.blob() : response.json()) as Promise<T>;
 }
 
 export const api = {
   get: <T>(path: string, init?: RequestInit) => request<T>(path, init),
   post: <T>(path: string, body: unknown) =>
     request<T>(path, { method: "POST", body: JSON.stringify(body) }),
+  postBlob: (path: string, body: unknown, init?: RequestInit) =>
+    request<Blob>(path, { ...init, method: "POST", body: JSON.stringify(body) }, true),
   put: <T>(path: string, body: unknown) =>
     request<T>(path, { method: "PUT", body: JSON.stringify(body) }),
   patch: <T>(path: string, body: unknown) =>

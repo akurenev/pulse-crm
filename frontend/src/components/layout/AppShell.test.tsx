@@ -141,7 +141,7 @@ describe("AppShell realtime refresh", () => {
     act(() => source.emit("open"));
     act(() => vi.advanceTimersByTime(250));
     expect(invalidateQueries).toHaveBeenCalledOnce();
-    expect(accessChanged).toHaveBeenCalledOnce();
+    expect(accessChanged).not.toHaveBeenCalled();
     expect(refreshSessionMock).toHaveBeenCalledWith();
 
     act(() => vi.advanceTimersByTime(60_000));
@@ -157,18 +157,18 @@ describe("AppShell realtime refresh", () => {
 
     act(() => source.emit("open"));
     act(() => vi.advanceTimersByTime(250));
-    expect(accessChanged).toHaveBeenCalledTimes(1);
+    expect(accessChanged).not.toHaveBeenCalled();
     act(() => source.emit("error"));
     act(() => vi.advanceTimersByTime(15_250));
     expect(invalidateQueries).toHaveBeenCalledTimes(2);
-    expect(accessChanged).toHaveBeenCalledTimes(2);
+    expect(accessChanged).not.toHaveBeenCalled();
 
     act(() => source.emit("open"));
     act(() => vi.advanceTimersByTime(250));
     act(() => vi.advanceTimersByTime(45_000));
     expect(invalidateQueries).toHaveBeenCalledTimes(3);
-    expect(accessChanged).toHaveBeenCalledTimes(3);
-    expect(refreshSessionMock).toHaveBeenCalledWith({ failClosed: true });
+    expect(accessChanged).not.toHaveBeenCalled();
+    expect(refreshSessionMock).not.toHaveBeenCalledWith({ failClosed: true });
     window.removeEventListener("pulse:access-changed", accessChanged);
   });
 

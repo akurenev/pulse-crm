@@ -32,3 +32,18 @@ describe("api.delete", () => {
     }));
   });
 });
+
+describe("api.postBlob", () => {
+  it("downloads binary data with the session cookie and CSRF protection", async () => {
+    fetchMock.mockResolvedValueOnce(new Response("test-xlsx", { headers: { "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" } }));
+    const blob = await api.postBlob("/deals/export", { month: "2026-10" });
+    expect(blob.size).toBe(9);
+    expect(blob.type).toBe("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    expect(fetchMock).toHaveBeenCalledWith("/api/v1/deals/export", expect.objectContaining({
+      method: "POST",
+      credentials: "include",
+      headers: expect.objectContaining({ "X-CSRF-Token": "csrf-test" }),
+      body: JSON.stringify({ month: "2026-10" }),
+    }));
+  });
+});

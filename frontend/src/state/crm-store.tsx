@@ -29,6 +29,7 @@ interface NewDealInput {
 interface CrmStore {
   currentUser: UserSummary;
   isEmployee: boolean;
+  isOwner: boolean;
   deals: Deal[];
   pipeline: Pipeline;
   pipelines: Pipeline[];
@@ -189,6 +190,7 @@ interface CrmProviderProps extends PropsWithChildren {
 
 export function CrmProvider({ children, currentUser = demoUsers.ak, userRole = "owner" }: CrmProviderProps) {
   const isEmployee = userRole === "employee";
+  const isOwner = userRole === "owner";
   const [deals, setDeals] = useState<Deal[]>(() => remoteEnabled ? [] : initialDeals);
   const [pipeline, setPipeline] = useState<Pipeline>(demoPipeline);
   const [pipelines, setPipelines] = useState<Pipeline[]>(() => remoteEnabled ? [] : [demoPipeline]);
@@ -359,7 +361,9 @@ export function CrmProvider({ children, currentUser = demoUsers.ak, userRole = "
         if (!selected) return mappedDeals;
         if (mappedDeals.some((deal) => deal.id === selected.id)) {
           return mappedDeals.map((deal) => deal.id === selected.id
-            ? { ...deal, messages: selected.messages, tasks: selected.tasks }
+            ? deal.version < selected.version || dealMutationLocksRef.current.has(deal.id)
+              ? selected
+              : { ...deal, messages: selected.messages, tasks: selected.tasks }
             : deal);
         }
         return pipeline.stages.some((stage) => stage.id === selected.stageId)
@@ -434,6 +438,7 @@ export function CrmProvider({ children, currentUser = demoUsers.ak, userRole = "
   const mergeRemoteDeal = useCallback((persisted: ApiDeal) => {
     setDeals((items) => items.map((current) => {
       if (current.id !== persisted.id) return current;
+      if (persisted.version < current.version) return current;
       const mapped = mapRemoteDeal(
         persisted,
         pipeline.stages,
@@ -909,10 +914,11 @@ export function CrmProvider({ children, currentUser = demoUsers.ak, userRole = "
 
     setDeals((items) => [optimistic, ...items]);
     const creationGeneration = ++openDealGeneration.current;
-    selectedDealIdRef.current = optimistic.id;
-    setSelectedDealId(optimistic.id);
-
-    if (!remoteEnabled) return optimistic;
+    if (!remoteEnabled) {
+      selectedDealIdRef.current = optimistic.id;
+      setSelectedDealId(optimistic.id);
+      return optimistic;
+    }
 
     try {
       const firstStage = pipeline.stages[0];
@@ -1098,6 +1104,7 @@ export function CrmProvider({ children, currentUser = demoUsers.ak, userRole = "
     () => ({
       currentUser,
       isEmployee,
+      isOwner,
       deals,
       pipeline,
       pipelines,
@@ -1134,7 +1141,7 @@ export function CrmProvider({ children, currentUser = demoUsers.ak, userRole = "
       retryMessage,
       toggleTask,
     }),
-    [addDeal, currentUser, dealAssignees, deals, deleteDeal, error, isEmployee, loadMoreDealSearch, loadMoreDeals, loadStageDeals, loadedStageIds, loading, loadingMoreDealSearch, loadingStageId, moveDeal, nextCursorByStage, nextDealSearchCursor, openDeal, pipeline, pipelines, retryMessage, selectDeal, selectPipeline, selectedDeal, selectedDealId, selectedDealMutationPending, sendMessage, setDealAssignee, setDealCompany, setDealContact, setDealCustomFields, setDealDetails, setDealSearch, setDealTags, setNextPurchase, stageLoadErrorByStage, toggleTask],
+    [addDeal, currentUser, dealAssignees, deals, deleteDeal, error, isEmployee, isOwner, loadMoreDealSearch, loadMoreDeals, loadStageDeals, loadedStageIds, loading, loadingMoreDealSearch, loadingStageId, moveDeal, nextCursorByStage, nextDealSearchCursor, openDeal, pipeline, pipelines, retryMessage, selectDeal, selectPipeline, selectedDeal, selectedDealId, selectedDealMutationPending, sendMessage, setDealAssignee, setDealCompany, setDealContact, setDealCustomFields, setDealDetails, setDealSearch, setDealTags, setNextPurchase, stageLoadErrorByStage, toggleTask],
   );
 
   return <CrmContext.Provider value={value}>{children}</CrmContext.Provider>;

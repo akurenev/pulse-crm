@@ -179,7 +179,7 @@ async def require_crm_export_enabled(
     context: CurrentOwner,
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> AuthContext:
-    """Authorize a future CRM export only for an owner and an explicit opt-in."""
+    """Authorize CRM exports only for an owner and an explicit server opt-in."""
 
     if not settings.crm_export_enabled:
         raise HTTPException(

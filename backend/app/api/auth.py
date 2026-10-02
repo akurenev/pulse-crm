@@ -17,6 +17,7 @@ from app.models import (
     Invitation,
     Membership,
     Pipeline,
+    RealtimeEvent,
     Role,
     Session,
     Source,
@@ -55,7 +56,8 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 users_router = APIRouter(tags=["users"])
 
 
-def _auth_response(
+async def _auth_response(
+    db: AsyncSession,
     user: User,
     workspace: Workspace,
     role: Role,
@@ -63,6 +65,13 @@ def _auth_response(
     *,
     version: int = 1,
 ) -> AuthResponse:
+    access_revision = await db.scalar(
+        sa.select(sa.func.max(RealtimeEvent.id)).where(
+            RealtimeEvent.workspace_id == workspace.id,
+            RealtimeEvent.event_type == "access.changed",
+            RealtimeEvent.payload["recipient_id"].as_string() == str(user.id),
+        )
+    )
     return AuthResponse(
         user=UserRead(
             id=user.id,
@@ -73,6 +82,7 @@ def _auth_response(
         ),
         workspace=WorkspaceRead.model_validate(workspace),
         csrf_token=csrf_token,
+        access_revision=access_revision or 0,
     )
 
 
@@ -174,7 +184,9 @@ async def bootstrap(
         ) from exc
 
     set_session_cookie(response, token, settings)
-    return _auth_response(user, workspace, Role.owner, csrf_token, version=membership.version)
+    return await _auth_response(
+        db, user, workspace, Role.owner, csrf_token, version=membership.version
+    )
 
 
 @router.post("/login", response_model=AuthResponse)
@@ -209,7 +221,8 @@ async def login(
     )
     await db.commit()
     set_session_cookie(response, token, settings)
-    return _auth_response(
+    return await _auth_response(
+        db,
         user,
         workspace,
         membership.role,
@@ -255,7 +268,8 @@ async def me(
         .values(csrf_token_hash=digest_token(csrf_token))
     )
     await db.commit()
-    return _auth_response(
+    return await _auth_response(
+        db,
         context.user,
         context.workspace,
         context.role,
@@ -324,7 +338,8 @@ async def accept_invitation(
     )
     await db.commit()
     set_session_cookie(response, token, settings)
-    return _auth_response(
+    return await _auth_response(
+        db,
         user,
         workspace,
         membership.role,

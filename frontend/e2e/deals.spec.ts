@@ -29,13 +29,14 @@ test("new deal is created on the first stage", async ({ page }) => {
   await page.getByRole("button", { name: "Новая сделка", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "Новая сделка" });
   await dialog.getByLabel("Название").fill("Тестовая кофейня");
-  await dialog.getByLabel("Потребность").fill("Зерно и сиропы");
-  await dialog.getByLabel("Сумма, ₽").fill("51000");
+  await dialog.getByLabel("Организация").fill("ООО Тестовая компания");
+  await dialog.getByLabel("Контакт", { exact: true }).fill("Тестовый контакт");
+  await dialog.getByLabel("Сумма, ₽").fill("249.50");
   await dialog.getByLabel("Источник").selectOption("telegram");
   await dialog.getByRole("button", { name: "Создать сделку" }).click();
 
   await expect(page.getByRole("dialog", { name: "Тестовая кофейня" })).toBeVisible();
-  await expect(page.getByText("51 000 ₽", { exact: true }).first()).toBeVisible();
+  await expect(page.getByText("249,5 ₽", { exact: true }).first()).toBeVisible();
 });
 
 test("list view opens the same deal card", async ({ page }, testInfo) => {

@@ -337,6 +337,7 @@ a {
 
 .deals-toolbar { margin-bottom: 16px; transition: margin-right 180ms ease; }
 .deals-toolbar__actions { display: flex; align-items: center; gap: 9px; }
+.deal-export-button { flex-shrink: 0; }
 .view-switch { display: inline-flex; padding: 3px; border: 1px solid var(--border-strong); border-radius: 9px; background: var(--surface); }
 .view-switch button { display: inline-grid; width: 34px; height: 32px; place-items: center; border-radius: 6px; background: transparent; color: #667085; }
 .view-switch button.is-active { background: var(--accent-soft); color: var(--accent); }

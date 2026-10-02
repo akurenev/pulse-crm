@@ -146,6 +146,43 @@ describe("AuthProvider", () => {
     await waitFor(() => expect(queryClient.getQueryData(["settings", "pipelines"])).toBeUndefined());
   });
 
+  it("preserves mounted state and cache when the access revision is unchanged", async () => {
+    const user = userEvent.setup();
+    const { queryClient } = renderProvider();
+    await screen.findByRole("button", { name: "Проверить сессию" });
+    queryClient.setQueryData(["contacts"], [{ id: "allowed-contact" }]);
+    const button = screen.getByRole("button", { name: "Проверить сессию" });
+    const accessChanged = vi.fn();
+    window.addEventListener("pulse:access-changed", accessChanged);
+    try {
+      await user.click(button);
+      await waitFor(() => expect(apiGetMock).toHaveBeenCalledTimes(2));
+      expect(queryClient.getQueryData(["contacts"])).toEqual([{ id: "allowed-contact" }]);
+      expect(screen.getByRole("button", { name: "Проверить сессию" })).toBe(button);
+      expect(accessChanged).not.toHaveBeenCalled();
+    } finally {
+      window.removeEventListener("pulse:access-changed", accessChanged);
+    }
+  });
+
+  it("purges revoked data when a session probe discovers a missed access change", async () => {
+    const user = userEvent.setup();
+    const { queryClient } = renderProvider();
+    await screen.findByRole("button", { name: "Проверить сессию" });
+    queryClient.setQueryData(["contacts"], [{ id: "revoked-contact" }]);
+    apiGetMock.mockResolvedValueOnce({ ...authResponse, access_revision: 7 });
+    const accessChanged = vi.fn();
+    window.addEventListener("pulse:access-changed", accessChanged);
+    try {
+      await user.click(screen.getByRole("button", { name: "Проверить сессию" }));
+      await waitFor(() => expect(queryClient.getQueryData(["contacts"])).toBeUndefined());
+      expect(accessChanged).toHaveBeenCalledOnce();
+      expect(screen.getByRole("button", { name: "Проверить сессию" })).toBeInTheDocument();
+    } finally {
+      window.removeEventListener("pulse:access-changed", accessChanged);
+    }
+  });
+
   it("clears cached workspace data on logout", async () => {
     const user = userEvent.setup();
     const { queryClient } = renderProvider();

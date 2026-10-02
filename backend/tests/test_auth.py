@@ -1,7 +1,56 @@
 from __future__ import annotations
 
+import uuid
+
 import httpx
 import pytest
+
+from app.db import SessionLocal
+from app.models import RealtimeEvent, Workspace
+
+
+@pytest.mark.asyncio
+async def test_auth_access_revision_tracks_only_targeted_workspace_access_changes(
+    client: httpx.AsyncClient, owner_auth: dict[str, object]
+) -> None:
+    workspace_id = uuid.UUID(str(owner_auth["workspace"]["id"]))  # type: ignore[index]
+    user_id = str(owner_auth["user"]["id"])  # type: ignore[index]
+    assert owner_auth["access_revision"] == 0
+    async with SessionLocal() as db:
+        db.add(RealtimeEvent(workspace_id=workspace_id, event_type="deal.updated", payload={}))
+        db.add(
+            RealtimeEvent(
+                workspace_id=workspace_id,
+                event_type="access.changed",
+                payload={"recipient_id": str(uuid.uuid4())},
+            )
+        )
+        other = Workspace(name="Other Test", slug="other-test")
+        db.add(other)
+        await db.flush()
+        db.add(
+            RealtimeEvent(
+                workspace_id=other.id,
+                event_type="access.changed",
+                payload={"recipient_id": user_id},
+            )
+        )
+        await db.commit()
+    response = await client.get("/api/v1/auth/me")
+    assert response.json()["access_revision"] == 0
+    async with SessionLocal() as db:
+        targeted = RealtimeEvent(
+            workspace_id=workspace_id,
+            event_type="access.changed",
+            payload={"recipient_id": user_id, "resource": "deals"},
+        )
+        db.add(targeted)
+        await db.commit()
+        revision = targeted.id
+    response = await client.get("/api/v1/auth/me")
+    assert response.json()["access_revision"] == revision
+    response = await client.get("/api/v1/auth/me")
+    assert response.json()["access_revision"] == revision
 
 
 @pytest.mark.asyncio

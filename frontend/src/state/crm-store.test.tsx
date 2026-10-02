@@ -201,6 +201,8 @@ describe("CrmProvider deal stage loading", () => {
       if (path === "/pipelines") return Promise.resolve([pipeline, secondaryPipeline]);
       if (path === "/sources") return Promise.resolve([]);
       if (path === "/users") return Promise.resolve([owner]);
+      if (path === "/custom-fields?entity_type=deal") return Promise.resolve([{ id: "field-test", key: "test", name: "Тестовое поле", field_type: "text", options: [] }]);
+      if (path.startsWith("/activity?")) return Promise.resolve({ items: [], next_cursor: null });
       if (path === "/tasks?limit=100") return taskPagePromise;
       if (path === "/deals/deal-open/messages?limit=100") return Promise.resolve({ items: [], next_cursor: null });
       if (path.includes("stage_id=stage-service-open")) {
@@ -228,6 +230,26 @@ describe("CrmProvider deal stage loading", () => {
   afterEach(() => {
     cleanup();
     vi.restoreAllMocks();
+  });
+
+  it("сохраняет открытый редактор и черновики при фоновой синхронизации", async () => {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(<MemoryRouter initialEntries={["/deals"]}><QueryClientProvider client={queryClient}><CrmProvider><DealsPage /></CrmProvider></QueryClientProvider></MemoryRouter>);
+    fireEvent.click(await screen.findByText("Активная сделка"));
+    await screen.findByRole("dialog", { name: "Активная сделка" });
+    fireEvent.click(screen.getByRole("button", { name: "Изменить название и сумму сделки" }));
+    const title = screen.getByRole("textbox", { name: "Название сделки" });
+    fireEvent.change(title, { target: { value: "Несохранённый заголовок" } });
+    const note = screen.getByPlaceholderText("Зафиксировать договорённость или итог разговора");
+    fireEvent.change(note, { target: { value: "Несохранённая заметка" } });
+    const date = screen.getByLabelText("Дата следующей покупки");
+    fireEvent.change(date, { target: { value: "2026-10-15" } });
+    act(() => window.dispatchEvent(new Event("pulse:refresh")));
+    await waitFor(() => expect(apiMocks.get.mock.calls.filter(([path]) => path === "/pipelines")).toHaveLength(2));
+    await waitFor(() => expect(screen.getByRole("textbox", { name: "Название сделки" })).toHaveValue("Несохранённый заголовок"));
+    expect(screen.getByRole("textbox", { name: "Название сделки" })).toBe(title);
+    expect(note).toHaveValue("Несохранённая заметка");
+    expect(date).toHaveValue("2026-10-15");
   });
 
   it("не запрашивает won/lost при старте, но загружает и пагинирует выбранный финальный этап", async () => {

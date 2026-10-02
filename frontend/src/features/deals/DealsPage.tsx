@@ -20,6 +20,7 @@ import { ApiError, remoteEnabled } from "../../lib/api";
 import { deepLinkEntityId } from "../../lib/deep-links";
 import { DealMutationInProgressError, useCrm, useDeferredSelection } from "../../state/crm-store";
 import { DealDrawer } from "./DealDrawer";
+import { DealExportControl } from "./DealExportControl";
 import { NewDealDialog } from "./NewDealDialog";
 import { StageColumn } from "./StageColumn";
 
@@ -27,6 +28,7 @@ export function DealsPage() {
   const {
     currentUser,
     isEmployee,
+    isOwner,
     deals,
     pipeline,
     pipelines,
@@ -221,6 +223,7 @@ export function DealsPage() {
       </header>
 
       <div className="deals-filters">
+        {isOwner ? <DealExportControl pipeline={pipeline} pipelines={pipelines} /> : null}
         <label className="select-control">
           <span className="sr-only">Воронка</span>
           <select value={pipeline.id} onChange={(event) => void handleSelectPipeline(event.target.value)}>{pipelines.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select>
@@ -340,6 +343,7 @@ export function DealsPage() {
         }}
       />
       <DealDrawer
+        key={selectedDealId ?? "closed"}
         deal={selectedDeal}
         pipeline={pipeline}
         assignees={isEmployee ? [currentUser] : dealAssignees}

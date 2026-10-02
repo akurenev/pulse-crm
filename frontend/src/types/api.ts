@@ -18,6 +18,7 @@ export interface AuthResponse {
   user: ApiUser;
   workspace: ApiWorkspace;
   csrf_token: string;
+  access_revision?: number;
 }
 
 export interface InvitationCreated {
