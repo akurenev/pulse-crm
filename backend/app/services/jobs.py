@@ -26,6 +26,8 @@ from typing import Any, Protocol
 
 from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy.exc import DBAPIError, InterfaceError, OperationalError
+from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import SessionLocal
@@ -455,6 +457,7 @@ class JobSupervisor:
         self._running = False
         self._last_heartbeat_monotonic: float | None = None
         self._last_heartbeat_at: datetime | None = None
+        self._database_failures: set[str] = set()
 
     @property
     def running(self) -> bool:
@@ -471,7 +474,7 @@ class JobSupervisor:
     def is_healthy(self, *, max_age_seconds: float | None = None) -> bool:
         """Return whether readiness can trust the in-process supervisor."""
 
-        if not self._running or self._last_heartbeat_monotonic is None:
+        if not self._running or self._database_failures or self._last_heartbeat_monotonic is None:
             return False
         max_age = max_age_seconds or max(5.0, self.heartbeat_interval_seconds * 3)
         return time.monotonic() - self._last_heartbeat_monotonic <= max_age
@@ -497,13 +500,15 @@ class JobSupervisor:
             await task
 
     async def run(self) -> None:
-        """Run until :meth:`stop` is called or an infrastructure loop fails."""
+        """Run until stopped, retrying transient database availability failures."""
 
         if self._running:
             raise RuntimeError("job supervisor is already running")
 
         self._running = True
-        self._touch_heartbeat()
+        self._database_failures.clear()
+        self._last_heartbeat_monotonic = None
+        self._last_heartbeat_at = None
         self._started_event.set()
         try:
             async with asyncio.TaskGroup() as task_group:
@@ -518,16 +523,59 @@ class JobSupervisor:
         self._last_heartbeat_monotonic = time.monotonic()
         self._last_heartbeat_at = utcnow()
 
+    def _database_unavailable(
+        self, operation: str, error: DBAPIError | SQLAlchemyTimeoutError
+    ) -> None:
+        # Programming/integrity errors must still fail the task group. Only
+        # connection, operational and pool availability failures are retried.
+        if not (
+            isinstance(error, (OperationalError, InterfaceError, SQLAlchemyTimeoutError))
+            or (isinstance(error, DBAPIError) and error.connection_invalidated)
+        ):
+            raise error
+        self._database_failures.add(operation)
+        # SQLAlchemy exception strings can contain statements and parameters.
+        logger.warning(
+            "background job database %s unavailable (%s)",
+            operation,
+            type(error).__name__,
+            extra={"operation": operation, "error_type": type(error).__name__},
+        )
+
+    def _database_available(self, operation: str) -> None:
+        self._database_failures.discard(operation)
+        if operation == "recovery":
+            # Failed acknowledgements leave their durable leases untouched;
+            # lease recovery owns those jobs after the database is available.
+            self._database_failures.discard("acknowledgement")
+        if not self._database_failures:
+            self._touch_heartbeat()
+
     async def _heartbeat_loop(self) -> None:
         while not self._stop_event.is_set():
-            self._touch_heartbeat()
+            # Keep readiness honest even when all worker slots are occupied and
+            # the dispatcher cannot perform its usual database poll.
+            try:
+                async with self.session_factory() as session:
+                    async with session.begin():
+                        await session.execute(select(1))
+            except (DBAPIError, SQLAlchemyTimeoutError) as exc:
+                self._database_unavailable("heartbeat", exc)
+            else:
+                self._database_available("heartbeat")
             await self._wait_or_stop(self.heartbeat_interval_seconds)
 
     async def _recovery_loop(self) -> None:
         while not self._stop_event.is_set():
-            async with self.session_factory() as session:
-                async with session.begin():
-                    recovered = await recover_expired_leases(session)
+            try:
+                async with self.session_factory() as session:
+                    async with session.begin():
+                        recovered = await recover_expired_leases(session)
+            except (DBAPIError, SQLAlchemyTimeoutError) as exc:
+                self._database_unavailable("recovery", exc)
+                await self._wait_or_stop(self.recovery_interval_seconds)
+                continue
+            self._database_available("recovery")
             if recovered.total:
                 logger.warning(
                     "recovered expired background job leases",
@@ -545,15 +593,21 @@ class JobSupervisor:
                 await self._wait_for_capacity()
                 continue
 
-            async with self.session_factory() as session:
-                async with session.begin():
-                    models = await claim_jobs(
-                        session,
-                        self.worker_id,
-                        limit=min(capacity, self.batch_size),
-                        lease_seconds=self.lease_seconds,
-                    )
-                    claimed = [ClaimedJob.from_model(job) for job in models]
+            try:
+                async with self.session_factory() as session:
+                    async with session.begin():
+                        models = await claim_jobs(
+                            session,
+                            self.worker_id,
+                            limit=min(capacity, self.batch_size),
+                            lease_seconds=self.lease_seconds,
+                        )
+                        claimed = [ClaimedJob.from_model(job) for job in models]
+            except (DBAPIError, SQLAlchemyTimeoutError) as exc:
+                self._database_unavailable("dispatch", exc)
+                await self._wait_or_stop(self.poll_interval_seconds)
+                continue
+            self._database_available("dispatch")
 
             if not claimed:
                 await self._wait_or_stop(self.poll_interval_seconds)
@@ -580,6 +634,14 @@ class JobSupervisor:
             stop_task.cancel()
 
     async def _execute(self, job: ClaimedJob) -> None:
+        try:
+            await self._execute_and_acknowledge(job)
+        except (DBAPIError, SQLAlchemyTimeoutError) as exc:
+            # Do not rerun a handler whose side effect may already have happened,
+            # or cancel unrelated jobs. Its lease is recovered durably later.
+            self._database_unavailable("acknowledgement", exc)
+
+    async def _execute_and_acknowledge(self, job: ClaimedJob) -> None:
         handler = self.handlers.get(job.job_type)
         if handler is None:
             await self._acknowledge_failure(

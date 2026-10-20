@@ -68,6 +68,7 @@ def _active_push_runtime() -> SimpleNamespace:
         handlers=SimpleNamespace(web_push_sender=object()),
         supervisor=SimpleNamespace(running=True),
         scheduler=SimpleNamespace(running=True),
+        is_healthy=lambda **kwargs: True,
     )
 
 
@@ -142,6 +143,14 @@ async def test_push_config_requires_vapid_and_runtime_cipher(
         )
         app.state.integration_runtime = _active_push_runtime()
         enabled = await client.get("/api/v1/push/config")
+        app.state.integration_runtime.is_healthy = lambda **kwargs: False
+        stale_runtime = await client.get("/api/v1/push/config")
+        stale_subscription = await client.post(
+            "/api/v1/push/subscriptions",
+            headers={"X-CSRF-Token": str(owner_auth["csrf_token"])},
+            json=_subscription_payload("https://fcm.googleapis.com/fcm/send/stale-runtime"),
+        )
+        app.state.integration_runtime = _active_push_runtime()
         disabled_settings = settings.model_copy(update={"job_runner_enabled": False})
         app.dependency_overrides[get_settings] = lambda: disabled_settings
         disabled_runner = await client.get("/api/v1/push/config")
@@ -166,6 +175,8 @@ async def test_push_config_requires_vapid_and_runtime_cipher(
     assert without_cipher.json() == {"enabled": False, "public_key": None}
     assert without_runtime.json() == {"enabled": False, "public_key": None}
     assert blocked_subscription.status_code == 503
+    assert stale_runtime.json() == {"enabled": False, "public_key": None}
+    assert stale_subscription.status_code == 503
     assert disabled_runner.json() == {"enabled": False, "public_key": None}
     assert blocked_test.status_code == 503
     assert enabled.status_code == 200

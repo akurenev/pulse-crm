@@ -7,6 +7,8 @@ from typing import Any
 
 import pytest
 from sqlalchemy.dialects.postgresql.base import PGDialect
+from sqlalchemy.exc import DBAPIError, InterfaceError, OperationalError, ProgrammingError
+from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 
 from app.models import BackgroundJob, JobStatus
 from app.services import jobs as job_service
@@ -406,3 +408,360 @@ async def test_supervisor_terminally_fails_unknown_job_type(
 
     assert failure["lease_owner"] == "worker-test"
     assert failure["retryable"] is False
+
+
+async def wait_until(predicate: Any) -> None:
+    async with asyncio.timeout(1):
+        while not predicate():  # noqa: ASYNC110 - readiness exposes a predicate, not an event.
+            await asyncio.sleep(0.001)
+
+
+def recovery_supervisor(
+    handlers: dict[str, Any] | None = None,
+    *,
+    session_factory: Any = None,
+    concurrency: int = 1,
+) -> job_service.JobSupervisor:
+    return job_service.JobSupervisor(
+        handlers or {},
+        session_factory=session_factory or FakeSessionFactory(),
+        concurrency=concurrency,
+        poll_interval_seconds=0.01,
+        heartbeat_interval_seconds=0.01,
+        recovery_interval_seconds=0.01,
+        lease_seconds=2,
+        job_timeout_seconds=1,
+    )
+
+
+@pytest.mark.asyncio
+async def test_supervisor_requires_first_successful_database_transaction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    allow_database = asyncio.Event()
+
+    class Session(TransactionalFakeSession):
+        async def execute(self, statement: Any) -> FakeResult:
+            await allow_database.wait()
+            return FakeResult()
+
+    async def claim(*args: Any, **kwargs: Any) -> list[BackgroundJob]:
+        await allow_database.wait()
+        return []
+
+    async def recover(*args: Any) -> job_service.RecoveryResult:
+        await allow_database.wait()
+        return job_service.RecoveryResult(requeued=0, failed=0)
+
+    monkeypatch.setattr(job_service, "claim_jobs", claim)
+    monkeypatch.setattr(job_service, "recover_expired_leases", recover)
+    supervisor = recovery_supervisor(session_factory=Session)
+    await supervisor.start()
+    try:
+        assert supervisor.running
+        assert supervisor.last_heartbeat_at is None
+        assert not supervisor.is_healthy()
+        allow_database.set()
+        await wait_until(supervisor.is_healthy)
+    finally:
+        allow_database.set()
+        await supervisor.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["dispatch", "recovery", "heartbeat"])
+@pytest.mark.parametrize("failure_stage", ["query", "commit"])
+async def test_supervisor_retries_database_outage_and_restores_readiness(
+    monkeypatch: pytest.MonkeyPatch, operation: str, failure_stage: str
+) -> None:
+    unavailable = False
+    failed = asyncio.Event()
+    calls = {"dispatch": 0, "recovery": 0, "heartbeat": 0}
+    committed = {"dispatch": 0, "recovery": 0, "heartbeat": 0}
+
+    def maybe_fail(current_operation: str, current_stage: str) -> None:
+        if unavailable and current_operation == operation and current_stage == failure_stage:
+            failed.set()
+            raise OperationalError("test operation", {}, RuntimeError("test database unavailable"))
+
+    class Transaction:
+        def __init__(self, session: Session) -> None:
+            self.session = session
+
+        async def __aenter__(self) -> None:
+            return None
+
+        async def __aexit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
+            if exc_type is None:
+                maybe_fail(self.session.operation, "commit")
+                committed[self.session.operation] += 1
+
+    class Session(TransactionalFakeSession):
+        operation = "heartbeat"
+
+        def begin(self) -> Transaction:  # type: ignore[override]
+            return Transaction(self)
+
+        async def execute(self, statement: Any) -> FakeResult:
+            self.operation = "heartbeat"
+            calls[self.operation] += 1
+            maybe_fail(self.operation, "query")
+            return FakeResult()
+
+    async def claim_none(session: Session, *args: Any, **kwargs: Any) -> list[BackgroundJob]:
+        session.operation = "dispatch"
+        calls[session.operation] += 1
+        maybe_fail(session.operation, "query")
+        return []
+
+    async def recover_none(session: Session) -> job_service.RecoveryResult:
+        session.operation = "recovery"
+        calls[session.operation] += 1
+        maybe_fail(session.operation, "query")
+        return job_service.RecoveryResult(requeued=0, failed=0)
+
+    monkeypatch.setattr(job_service, "claim_jobs", claim_none)
+    monkeypatch.setattr(job_service, "recover_expired_leases", recover_none)
+    supervisor = recovery_supervisor(session_factory=Session)
+    await supervisor.start()
+    try:
+        await wait_until(lambda: all(committed.values()) and supervisor.is_healthy())
+        unavailable = True
+        await asyncio.wait_for(failed.wait(), timeout=0.5)
+        await wait_until(lambda: not supervisor.is_healthy())
+        heartbeat = supervisor.last_heartbeat_at
+        attempts = calls[operation]
+        await asyncio.sleep(0.035)
+        assert supervisor.running is True
+        assert supervisor.is_healthy() is False
+        assert supervisor.last_heartbeat_at == heartbeat
+        # Retries wait for the configured interval; other successful paths must
+        # not conceal an unavailable dispatch, recovery or heartbeat operation.
+        assert 1 <= calls[operation] - attempts <= 5
+        unavailable = False
+        await wait_until(supervisor.is_healthy)
+        assert supervisor.last_heartbeat_at != heartbeat
+    finally:
+        await asyncio.wait_for(supervisor.stop(), timeout=0.25)
+    assert supervisor.running is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [
+        OperationalError("test", {}, RuntimeError("unavailable")),
+        InterfaceError("test", {}, RuntimeError("connection closed")),
+        SQLAlchemyTimeoutError("test pool unavailable"),
+        DBAPIError("test", {}, RuntimeError("disconnected"), connection_invalidated=True),
+    ],
+)
+async def test_supervisor_claims_jobs_after_transient_database_errors(
+    monkeypatch: pytest.MonkeyPatch, error: Exception
+) -> None:
+    model = make_job(status=JobStatus.running, attempts=1, lease_owner="worker-test")
+    attempts = 0
+    handled = asyncio.Event()
+    acknowledged = asyncio.Event()
+
+    async def claim(*args: Any, **kwargs: Any) -> list[BackgroundJob]:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise error
+        return [model] if attempts == 2 else []
+
+    async def recover(*args: Any) -> job_service.RecoveryResult:
+        return job_service.RecoveryResult(requeued=0, failed=0)
+
+    async def complete(*args: Any, **kwargs: Any) -> bool:
+        acknowledged.set()
+        return True
+
+    async def handler(job: job_service.ClaimedJob) -> None:
+        handled.set()
+
+    monkeypatch.setattr(job_service, "claim_jobs", claim)
+    monkeypatch.setattr(job_service, "recover_expired_leases", recover)
+    monkeypatch.setattr(job_service, "complete_job", complete)
+    supervisor = recovery_supervisor({"notification.send": handler})
+    await supervisor.start()
+    try:
+        await asyncio.wait_for(acknowledged.wait(), timeout=0.5)
+        assert handled.is_set()
+        assert supervisor.running is True
+        await wait_until(supervisor.is_healthy)
+    finally:
+        await supervisor.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("acknowledgement", ["complete", "fail", "unknown"])
+async def test_supervisor_acknowledgement_outage_keeps_other_jobs_and_durable_lease(
+    monkeypatch: pytest.MonkeyPatch, acknowledgement: str
+) -> None:
+    first = make_job(status=JobStatus.running, attempts=1, lease_owner="worker-test")
+    second = make_job(status=JobStatus.running, attempts=1, lease_owner="worker-test")
+    first.job_type = "unknown" if acknowledgement == "unknown" else "notification.send"
+    claimed = False
+    handler_calls: list[Any] = []
+    acknowledgement_failed = asyncio.Event()
+    other_job_started = asyncio.Event()
+    release_other_job = asyncio.Event()
+    allow_recovery = asyncio.Event()
+    other_job_completed = asyncio.Event()
+
+    async def claim(*args: Any, **kwargs: Any) -> list[BackgroundJob]:
+        nonlocal claimed
+        if claimed:
+            return []
+        claimed = True
+        assert kwargs["limit"] == 2
+        return [first, second]
+
+    async def recover(*args: Any) -> job_service.RecoveryResult:
+        if acknowledgement_failed.is_set():
+            await allow_recovery.wait()
+        return job_service.RecoveryResult(requeued=0, failed=0)
+
+    async def complete(session: Any, job_id: Any, **kwargs: Any) -> bool:
+        if job_id == first.id:
+            acknowledgement_failed.set()
+            raise OperationalError("test", {}, RuntimeError("database unavailable"))
+        other_job_completed.set()
+        return True
+
+    async def fail(session: Any, job_id: Any, *args: Any, **kwargs: Any) -> str:
+        assert job_id == first.id
+        acknowledgement_failed.set()
+        raise OperationalError("test", {}, RuntimeError("database unavailable"))
+
+    async def handler(job: job_service.ClaimedJob) -> None:
+        handler_calls.append(job.id)
+        if job.id == first.id:
+            if acknowledgement == "fail":
+                raise RuntimeError("test provider unavailable")
+            return
+        other_job_started.set()
+        await release_other_job.wait()
+
+    monkeypatch.setattr(job_service, "claim_jobs", claim)
+    monkeypatch.setattr(job_service, "recover_expired_leases", recover)
+    monkeypatch.setattr(job_service, "complete_job", complete)
+    monkeypatch.setattr(job_service, "fail_job", fail)
+    supervisor = recovery_supervisor({"notification.send": handler}, concurrency=2)
+    await supervisor.start()
+    try:
+        await asyncio.wait_for(acknowledgement_failed.wait(), timeout=0.5)
+        await asyncio.wait_for(other_job_started.wait(), timeout=0.5)
+        await wait_until(lambda: not supervisor.is_healthy())
+        await wait_until(lambda: supervisor.active_job_count == 1)
+        assert supervisor.running is True
+        assert supervisor.active_job_count == 1
+        assert not other_job_completed.is_set()
+        assert first.status is JobStatus.running
+        assert first.lease_owner == "worker-test"
+        assert first.attempts == 1
+        # A later successful recovery pass restores health even if no new job
+        # acknowledgement occurs; the original side effect is not replayed.
+        allow_recovery.set()
+        await wait_until(supervisor.is_healthy)
+        release_other_job.set()
+        await asyncio.wait_for(other_job_completed.wait(), timeout=0.5)
+    finally:
+        allow_recovery.set()
+        release_other_job.set()
+        await supervisor.stop()
+    assert handler_calls.count(first.id) == (0 if acknowledgement == "unknown" else 1)
+    assert handler_calls.count(second.id) == 1
+
+
+@pytest.mark.asyncio
+async def test_supervisor_saturated_workers_require_successful_database_heartbeat(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    claimed = False
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def claim(*args: Any, **kwargs: Any) -> list[BackgroundJob]:
+        nonlocal claimed
+        if claimed:
+            return []
+        claimed = True
+        return [make_job(status=JobStatus.running, attempts=1, lease_owner="worker-test")]
+
+    async def recover(*args: Any) -> job_service.RecoveryResult:
+        return job_service.RecoveryResult(requeued=0, failed=0)
+
+    async def complete(*args: Any, **kwargs: Any) -> bool:
+        return True
+
+    async def handler(job: job_service.ClaimedJob) -> None:
+        started.set()
+        await release.wait()
+
+    monkeypatch.setattr(job_service, "claim_jobs", claim)
+    monkeypatch.setattr(job_service, "recover_expired_leases", recover)
+    monkeypatch.setattr(job_service, "complete_job", complete)
+    supervisor = recovery_supervisor({"notification.send": handler})
+    supervisor.recovery_interval_seconds = 1
+    await supervisor.start()
+    try:
+        await asyncio.wait_for(started.wait(), timeout=0.5)
+        await asyncio.sleep(0.06)
+        assert supervisor.active_job_count == 1
+        assert supervisor.is_healthy(max_age_seconds=0.04)
+    finally:
+        release.set()
+        await supervisor.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_supervisor_stops_or_cancels_during_database_retry(
+    monkeypatch: pytest.MonkeyPatch, cancel: bool
+) -> None:
+    failed = asyncio.Event()
+
+    async def claim(*args: Any, **kwargs: Any) -> list[BackgroundJob]:
+        failed.set()
+        raise OperationalError("test", {}, RuntimeError("database unavailable"))
+
+    async def recover(*args: Any) -> job_service.RecoveryResult:
+        return job_service.RecoveryResult(requeued=0, failed=0)
+
+    monkeypatch.setattr(job_service, "claim_jobs", claim)
+    monkeypatch.setattr(job_service, "recover_expired_leases", recover)
+    supervisor = recovery_supervisor()
+    supervisor.poll_interval_seconds = 10
+    await supervisor.start()
+    await asyncio.wait_for(failed.wait(), timeout=0.5)
+    if cancel:
+        assert supervisor._runner_task is not None
+        supervisor._runner_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(supervisor._runner_task, timeout=0.25)
+    else:
+        await asyncio.wait_for(supervisor.stop(), timeout=0.25)
+    assert not supervisor.running
+    assert not supervisor.is_healthy()
+    assert supervisor.active_job_count == 0
+
+
+@pytest.mark.asyncio
+async def test_supervisor_does_not_hide_programming_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def claim(*args: Any, **kwargs: Any) -> list[BackgroundJob]:
+        raise ProgrammingError("test invalid statement", {}, RuntimeError("test programming error"))
+
+    async def recover(*args: Any) -> job_service.RecoveryResult:
+        return job_service.RecoveryResult(requeued=0, failed=0)
+
+    monkeypatch.setattr(job_service, "claim_jobs", claim)
+    monkeypatch.setattr(job_service, "recover_expired_leases", recover)
+    supervisor = recovery_supervisor()
+    with pytest.raises(ExceptionGroup) as captured:
+        await supervisor.run()
+    assert isinstance(captured.value.exceptions[0], ProgrammingError)
+    assert not supervisor.running
+    assert not supervisor.is_healthy()

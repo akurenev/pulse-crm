@@ -144,7 +144,8 @@ def _is_enabled(settings: Settings, request: Request) -> bool:
     supervisor = getattr(runtime, "supervisor", None)
     scheduler = getattr(runtime, "scheduler", None)
     return bool(
-        settings.web_push_enabled
+        runtime is not None
+        and settings.web_push_enabled
         and settings.job_runner_enabled
         and isinstance(
             getattr(request.app.state, "integration_secret_cipher", None),
@@ -153,6 +154,7 @@ def _is_enabled(settings: Settings, request: Request) -> bool:
         and getattr(handlers, "web_push_sender", None) is not None
         and getattr(supervisor, "running", False)
         and getattr(scheduler, "running", False)
+        and runtime.is_healthy(max_age_seconds=settings.job_runner_heartbeat_timeout_seconds)
     )
 
 
