@@ -77,6 +77,7 @@ function renderDrawer() {
     onSetCustomFields: vi.fn().mockResolvedValue(undefined),
     onSendMessage: vi.fn().mockResolvedValue(undefined),
     onRetryMessage: vi.fn().mockResolvedValue(undefined),
+    onCreateTask: vi.fn().mockResolvedValue(undefined),
     onToggleTask: vi.fn().mockResolvedValue(undefined),
     onDelete: vi.fn().mockResolvedValue(undefined),
   };

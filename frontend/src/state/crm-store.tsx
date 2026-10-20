@@ -26,6 +26,15 @@ interface NewDealInput {
   contact?: { id?: string; name: string; phone?: string; email?: string };
 }
 
+interface NewDealTaskInput {
+  title: string;
+  description?: string;
+  taskType: string;
+  dueAt: string;
+  remindAt: string | null;
+  assigneeId: string;
+}
+
 interface CrmStore {
   currentUser: UserSummary;
   isEmployee: boolean;
@@ -64,6 +73,7 @@ interface CrmStore {
   deleteDeal: (dealId: string) => Promise<void>;
   sendMessage: (dealId: string, body: string, attachment?: File) => Promise<void>;
   retryMessage: (dealId: string, messageId: string) => Promise<void>;
+  createDealTask: (dealId: string, input: NewDealTaskInput) => Promise<void>;
   toggleTask: (dealId: string, taskId: string) => Promise<void>;
 }
 
@@ -1061,6 +1071,42 @@ export function CrmProvider({ children, currentUser = demoUsers.ak, userRole = "
     }
   }, []);
 
+  const createDealTask = useCallback(async (dealId: string, input: NewDealTaskInput) => {
+    if (remoteEnabled) {
+      const persisted = await api.post<ApiTask>("/tasks", {
+        title: input.title,
+        description: input.description?.trim() || null,
+        task_type: input.taskType,
+        due_at: input.dueAt,
+        remind_at: input.remindAt,
+        assignee_id: input.assigneeId,
+        deal_id: dealId,
+      });
+      const currentTasks = tasksByDealRef.current.get(dealId) ?? [];
+      const nextTasks = [...currentTasks.filter((task) => task.id !== persisted.id), persisted];
+      tasksByDealRef.current = new Map(tasksByDealRef.current).set(dealId, nextTasks);
+      setDeals((items) => items.map((deal) => deal.id === dealId
+        ? { ...deal, tasks: mapRemoteTasks(nextTasks, users) }
+        : deal));
+      return;
+    }
+
+    const assignee = dealAssignees.find((user) => user.id === input.assigneeId) ?? currentUser;
+    setDeals((items) => items.map((deal) => deal.id === dealId
+      ? {
+        ...deal,
+        tasks: [...deal.tasks, {
+          id: `task-${crypto.randomUUID()}`,
+          title: input.title,
+          dueAt: input.dueAt,
+          completed: false,
+          assignee,
+          version: 1,
+        }],
+      }
+      : deal));
+  }, [currentUser, dealAssignees, users]);
+
   const toggleTask = useCallback(async (dealId: string, taskId: string) => {
     const currentDeal = deals.find((deal) => deal.id === dealId);
     const currentTask = currentDeal?.tasks.find((task) => task.id === taskId);
@@ -1139,9 +1185,10 @@ export function CrmProvider({ children, currentUser = demoUsers.ak, userRole = "
       deleteDeal,
       sendMessage,
       retryMessage,
+      createDealTask,
       toggleTask,
     }),
-    [addDeal, currentUser, dealAssignees, deals, deleteDeal, error, isEmployee, canExportDeals, loadMoreDealSearch, loadMoreDeals, loadStageDeals, loadedStageIds, loading, loadingMoreDealSearch, loadingStageId, moveDeal, nextCursorByStage, nextDealSearchCursor, openDeal, pipeline, pipelines, retryMessage, selectDeal, selectPipeline, selectedDeal, selectedDealId, selectedDealMutationPending, sendMessage, setDealAssignee, setDealCompany, setDealContact, setDealCustomFields, setDealDetails, setDealSearch, setDealTags, setNextPurchase, stageLoadErrorByStage, toggleTask],
+    [addDeal, createDealTask, currentUser, dealAssignees, deals, deleteDeal, error, isEmployee, canExportDeals, loadMoreDealSearch, loadMoreDeals, loadStageDeals, loadedStageIds, loading, loadingMoreDealSearch, loadingStageId, moveDeal, nextCursorByStage, nextDealSearchCursor, openDeal, pipeline, pipelines, retryMessage, selectDeal, selectPipeline, selectedDeal, selectedDealId, selectedDealMutationPending, sendMessage, setDealAssignee, setDealCompany, setDealContact, setDealCustomFields, setDealDetails, setDealSearch, setDealTags, setNextPurchase, stageLoadErrorByStage, toggleTask],
   );
 
   return <CrmContext.Provider value={value}>{children}</CrmContext.Provider>;

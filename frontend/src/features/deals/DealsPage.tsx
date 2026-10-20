@@ -62,6 +62,7 @@ export function DealsPage() {
     deleteDeal,
     sendMessage,
     retryMessage,
+    createDealTask,
     toggleTask,
   } = useCrm();
   const selectDeal = useDeferredSelection();
@@ -362,6 +363,7 @@ export function DealsPage() {
         onSetCustomFields={setDealCustomFields}
         onSendMessage={sendMessage}
         onRetryMessage={retryMessage}
+        onCreateTask={createDealTask}
         onToggleTask={toggleTask}
         onDelete={deleteDeal}
         onOpenContact={(contactId) => navigate(`/contacts?contact=${encodeURIComponent(contactId)}`)}

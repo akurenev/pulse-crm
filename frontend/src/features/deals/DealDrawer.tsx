@@ -12,6 +12,7 @@ import {
   Paperclip,
   Pencil,
   Phone,
+  Plus,
   Send,
   Tag,
   Trash2,
@@ -34,6 +35,23 @@ const MAX_NOTE_FILES = 5;
 const MAX_NOTE_FILE_BYTES = 20 * 1024 * 1024;
 const NOTE_FILE_ACCEPT = ".jpg,.jpeg,.png,.gif,.webp,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.odt,.ods,.odp,.rtf,.txt,.csv";
 
+interface DealTaskDefaults {
+  title: string;
+  dueAt: string;
+  remindAt: string;
+  assigneeId: string;
+}
+
+function toDateTimeLocal(value: Date): string {
+  const localDate = new Date(value.getTime() - value.getTimezoneOffset() * 60_000);
+  return localDate.toISOString().slice(0, 16);
+}
+
+function defaultDealTaskTitle(dealTitle: string): string {
+  const prefix = "Задача по сделке: ";
+  return `${prefix}${dealTitle.slice(0, 240 - prefix.length)}`;
+}
+
 interface DealDrawerProps {
   deal: Deal | null;
   pipeline: Pipeline;
@@ -53,13 +71,14 @@ interface DealDrawerProps {
   onSetCustomFields: (dealId: string, fields: Record<string, unknown>) => Promise<void>;
   onSendMessage: (dealId: string, body: string, attachment?: File) => Promise<void>;
   onRetryMessage: (dealId: string, messageId: string) => Promise<void>;
+  onCreateTask: (dealId: string, input: { title: string; description?: string; taskType: string; dueAt: string; remindAt: string | null; assigneeId: string }) => Promise<void>;
   onToggleTask: (dealId: string, taskId: string) => Promise<void>;
   onDelete: (dealId: string) => Promise<void>;
   onOpenContact?: (contactId: string) => void;
   onOpenCompany?: (companyId: string) => void;
 }
 
-export function DealDrawer({ deal, pipeline, assignees, canAccessCompanies = true, canDelete = true, canManageAssignee = true, mutationPending, onClose, onMove, onSetDetails, onSetNextPurchase, onSetContact, onSetCompany, onSetAssignee, onSetTags, onSetCustomFields, onSendMessage, onRetryMessage, onToggleTask, onDelete, onOpenContact, onOpenCompany }: DealDrawerProps) {
+export function DealDrawer({ deal, pipeline, assignees, canAccessCompanies = true, canDelete = true, canManageAssignee = true, mutationPending, onClose, onMove, onSetDetails, onSetNextPurchase, onSetContact, onSetCompany, onSetAssignee, onSetTags, onSetCustomFields, onSendMessage, onRetryMessage, onCreateTask, onToggleTask, onDelete, onOpenContact, onOpenCompany }: DealDrawerProps) {
   const queryClient = useQueryClient();
   const overlayModal = useMediaQuery("(max-width: 1100px)");
   const [tab, setTab] = useState("details");
@@ -74,6 +93,10 @@ export function DealDrawer({ deal, pipeline, assignees, canAccessCompanies = tru
   const [deleting, setDeleting] = useState(false);
   const [deleteError, setDeleteError] = useState("");
   const [stageError, setStageError] = useState("");
+  const [taskCreateOpen, setTaskCreateOpen] = useState(false);
+  const [taskCreating, setTaskCreating] = useState(false);
+  const [taskCreateError, setTaskCreateError] = useState("");
+  const [taskDefaults, setTaskDefaults] = useState<DealTaskDefaults | null>(null);
   const historyQuery = useQuery({
     queryKey: ["activity", "deal", deal?.id],
     queryFn: ({ signal }) => api.get<CursorPage<ApiActivity>>(
@@ -91,6 +114,9 @@ export function DealDrawer({ deal, pipeline, assignees, canAccessCompanies = tru
     setNoteFilesInvalid(false);
     setNoteError("");
     setNoteDownloadError("");
+    setTaskCreateOpen(false);
+    setTaskCreateError("");
+    setTaskDefaults(null);
   }, [deal?.id]);
   if (!deal) return null;
 
@@ -207,13 +233,62 @@ export function DealDrawer({ deal, pipeline, assignees, canAccessCompanies = tru
     }
   }
 
+  function openTaskCreator() {
+    if (!deal) return;
+    const scheduledAt = new Date();
+    scheduledAt.setDate(scheduledAt.getDate() + 1);
+    scheduledAt.setSeconds(0, 0);
+    const scheduled = toDateTimeLocal(scheduledAt);
+    const assigneeId = assignees.some((assignee) => assignee.id === deal.assignee.id)
+      ? deal.assignee.id
+      : assignees[0]?.id ?? "";
+    setTaskDefaults({
+      title: defaultDealTaskTitle(deal.title),
+      dueAt: scheduled,
+      remindAt: scheduled,
+      assigneeId,
+    });
+    setTaskCreateError("");
+    setTaskCreateOpen(true);
+  }
+
+  async function handleCreateTask(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!deal) return;
+    const data = new FormData(event.currentTarget);
+    const dueAt = new Date(String(data.get("due_at") ?? ""));
+    const remindRaw = String(data.get("remind_at") ?? "");
+    if (Number.isNaN(dueAt.valueOf())) {
+      setTaskCreateError("Укажите корректный срок задачи.");
+      return;
+    }
+    setTaskCreating(true);
+    setTaskCreateError("");
+    try {
+      await onCreateTask(deal.id, {
+        title: String(data.get("title") ?? "").trim(),
+        description: String(data.get("description") ?? "").trim(),
+        taskType: String(data.get("task_type") ?? "follow_up"),
+        dueAt: dueAt.toISOString(),
+        remindAt: remindRaw ? new Date(remindRaw).toISOString() : null,
+        assigneeId: String(data.get("assignee_id") ?? ""),
+      });
+      setTaskCreateOpen(false);
+      setTaskDefaults(null);
+    } catch {
+      setTaskCreateError("Не удалось создать задачу. Проверьте срок и исполнителя.");
+    } finally {
+      setTaskCreating(false);
+    }
+  }
+
   const activityItems = historyQuery.data?.items ?? [];
   const noteItems = activityItems.filter((event) => event.event_type === "deal.note.created");
   const historyItems = activityItems.filter((event) => event.event_type !== "deal.note.created");
 
   return (
     <>
-      <Dialog.Root open modal={overlayModal && !(canDelete && deleteConfirmOpen)} onOpenChange={(open) => { if (!open && !(canDelete && deleteConfirmOpen)) onClose(); }}>
+      <Dialog.Root open modal={overlayModal && !(taskCreateOpen || canDelete && deleteConfirmOpen)} onOpenChange={(open) => { if (!open && !(taskCreateOpen || canDelete && deleteConfirmOpen)) onClose(); }}>
       <Dialog.Portal>
         <Dialog.Overlay className="drawer-overlay" />
         <Dialog.Content className="deal-drawer" aria-describedby={undefined} aria-busy={mutationPending}>
@@ -336,7 +411,7 @@ export function DealDrawer({ deal, pipeline, assignees, canAccessCompanies = tru
               </Tabs.Content>
 
               <Tabs.Content value="tasks" className="drawer-section">
-                <DrawerTasks deal={deal} onToggleTask={onToggleTask} expanded />
+                <DrawerTasks deal={deal} onAdd={openTaskCreator} onToggleTask={onToggleTask} expanded />
               </Tabs.Content>
 
               <Tabs.Content value="messages" className="drawer-section drawer-section--messages">
@@ -361,6 +436,32 @@ export function DealDrawer({ deal, pipeline, assignees, canAccessCompanies = tru
           </Tabs.Root>
         </Dialog.Content>
       </Dialog.Portal>
+      </Dialog.Root>
+
+      <Dialog.Root open={taskCreateOpen} onOpenChange={(open) => { if (!taskCreating) setTaskCreateOpen(open); }}>
+        <Dialog.Portal>
+          <Dialog.Overlay className="dialog-overlay" />
+          <Dialog.Content className="dialog-content" aria-describedby="deal-task-dialog-description">
+            <div className="dialog-header">
+              <div>
+                <Dialog.Title>Новая задача</Dialog.Title>
+                <Dialog.Description id="deal-task-dialog-description">Проверьте заполненные данные и сохраните задачу по сделке.</Dialog.Description>
+              </div>
+              <Dialog.Close className="icon-button" aria-label="Закрыть" disabled={taskCreating}><X size={20} /></Dialog.Close>
+            </div>
+            {taskDefaults ? <form key={`${deal.id}:${taskDefaults.dueAt}`} className="form-stack" onSubmit={(event) => void handleCreateTask(event)}>
+              <label className="field"><span>Название</span><input name="title" required maxLength={240} autoFocus defaultValue={taskDefaults.title} /></label>
+              <label className="field"><span>Описание</span><textarea name="description" rows={3} /></label>
+              <label className="field"><span>Тип</span><select name="task_type" defaultValue="follow_up"><option value="follow_up">Связаться</option><option value="meeting">Встреча</option><option value="purchase">Следующая покупка</option></select></label>
+              <label className="field"><span>Срок</span><input name="due_at" type="datetime-local" required defaultValue={taskDefaults.dueAt} /></label>
+              <label className="field"><span>Напомнить</span><input name="remind_at" type="datetime-local" defaultValue={taskDefaults.remindAt} /></label>
+              <label className="field"><span>Исполнитель</span><select name="assignee_id" required defaultValue={taskDefaults.assigneeId}><option value="" disabled>Выберите исполнителя</option>{assignees.map((assignee) => <option key={assignee.id} value={assignee.id}>{assignee.name}</option>)}</select></label>
+              <div className="field deal-task-dialog__deal" aria-label="Сделка"><span>Сделка</span><strong>{deal.title}</strong><input name="deal_id" type="hidden" value={deal.id} /></div>
+              {taskCreateError ? <p className="form-error" role="alert">{taskCreateError}</p> : null}
+              <div className="dialog-actions"><Dialog.Close asChild><Button type="button" disabled={taskCreating}>Отмена</Button></Dialog.Close><Button type="submit" variant="primary" disabled={taskCreating}>{taskCreating ? "Создаём…" : "Создать задачу"}</Button></div>
+            </form> : null}
+          </Dialog.Content>
+        </Dialog.Portal>
       </Dialog.Root>
 
       {canDelete ? <Dialog.Root
@@ -890,10 +991,16 @@ function NextPurchaseEditor({ deal, disabled, onSave }: { deal: Deal; disabled: 
   );
 }
 
-function DrawerTasks({ deal, onToggleTask, expanded = false }: { deal: Deal; onToggleTask: DealDrawerProps["onToggleTask"]; expanded?: boolean }) {
+function DrawerTasks({ deal, onAdd, onToggleTask, expanded = false }: { deal: Deal; onAdd: () => void; onToggleTask: DealDrawerProps["onToggleTask"]; expanded?: boolean }) {
   return (
     <section className={`drawer-block${expanded ? " drawer-block--expanded" : ""}`}>
-      <header><h3>Задачи</h3><span className="drawer-block__count">{deal.tasks.length}</span></header>
+      <header>
+        <h3>Задачи</h3>
+        <div className="drawer-block__header-actions">
+          <span className="drawer-block__count">{deal.tasks.length}</span>
+          <button type="button" className="drawer-block__add" onClick={onAdd}><Plus size={15} aria-hidden="true" /> Добавить</button>
+        </div>
+      </header>
       {deal.tasks.length ? deal.tasks.map((task) => (
         <button key={task.id} type="button" className={`task-row${task.completed ? " task-row--done" : ""}`} onClick={() => void onToggleTask(deal.id, task.id)}>
           <span className="task-row__check">{task.completed ? <Check size={14} /> : <Circle size={14} />}</span>

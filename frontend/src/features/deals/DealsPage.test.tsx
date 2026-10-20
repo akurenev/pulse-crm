@@ -59,6 +59,7 @@ function renderDrawer(overrides: Partial<ComponentProps<typeof DealDrawer>> = {}
     onSetCustomFields: vi.fn().mockResolvedValue(undefined),
     onSendMessage: vi.fn().mockResolvedValue(undefined),
     onRetryMessage: vi.fn().mockResolvedValue(undefined),
+    onCreateTask: vi.fn().mockResolvedValue(undefined),
     onToggleTask: vi.fn().mockResolvedValue(undefined),
     onDelete: vi.fn().mockResolvedValue(undefined),
     ...overrides,
@@ -335,6 +336,35 @@ describe("DealsPage", () => {
     await user.click(within(dialog).getByRole("tab", { name: "История" }));
     expect(within(dialog).queryByRole("textbox", { name: "Заметка о сделке" })).not.toBeInTheDocument();
     expect(within(dialog).getByText("Сделка создана")).toBeInTheDocument();
+  });
+
+  it("creates a task from the deal tab with deal defaults", async () => {
+    const user = userEvent.setup();
+    const deal = initialDeals.find((item) => item.id === "deal-sloy")!;
+    renderPage();
+
+    await user.click(screen.getByText(deal.title));
+    const dealDialog = await screen.findByRole("dialog", { name: deal.title });
+    await user.click(within(dealDialog).getByRole("tab", { name: "Задачи" }));
+    await user.click(within(dealDialog).getByRole("button", { name: "Добавить" }));
+
+    const taskDialog = await screen.findByRole("dialog", { name: "Новая задача" });
+    const title = within(taskDialog).getByRole("textbox", { name: "Название" });
+    const dueAt = within(taskDialog).getByLabelText("Срок") as HTMLInputElement;
+    const remindAt = within(taskDialog).getByLabelText("Напомнить") as HTMLInputElement;
+    const assignee = within(taskDialog).getByRole("combobox", { name: "Исполнитель" }) as HTMLSelectElement;
+
+    expect(title).toHaveValue(`Задача по сделке: ${deal.title}`);
+    expect(remindAt.value).toBe(dueAt.value);
+    expect(new Date(dueAt.value).getTime() - Date.now()).toBeGreaterThan(23 * 60 * 60 * 1_000);
+    expect(new Date(dueAt.value).getTime() - Date.now()).toBeLessThan(25 * 60 * 60 * 1_000);
+    expect(assignee.value).toBe(deal.assignee.id);
+    expect(within(taskDialog).getByLabelText("Сделка")).toHaveTextContent(deal.title);
+
+    await user.click(within(taskDialog).getByRole("button", { name: "Создать задачу" }));
+
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Новая задача" })).not.toBeInTheDocument());
+    expect(within(dealDialog).getByText(`Задача по сделке: ${deal.title}`)).toBeInTheDocument();
   });
 
   it("shows and edits deal tags", async () => {
