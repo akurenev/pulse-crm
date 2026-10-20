@@ -51,13 +51,31 @@ jobs:
           cache-dependency-path: backend/pyproject.toml
       - name: Install backend dependencies
         run: python -m pip install -e "backend[dev]"
+      - name: Lint
+        run: ruff check backend/app backend/tests
+      - name: Type check
+        run: mypy backend/app
+      - name: Validate local Compose
+        run: docker compose config --quiet
+      - uses: docker/setup-buildx-action@v3
+      - name: Build S3-compatible MinIO
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/minio.Dockerfile
+          target: minio
+          load: true
+          push: false
+          tags: pulse-ci-minio:ci
+          cache-from: type=gha,scope=ci-minio
+          cache-to: type=gha,scope=ci-minio,mode=max
       - name: Start S3-compatible MinIO
         run: |
           docker run --detach --name pulse-ci-minio \
-            --publish 9000:9000 \
+            --publish 127.0.0.1:9000:9000 \
             --env MINIO_ROOT_USER=pulse-ci \
             --env MINIO_ROOT_PASSWORD=pulse-ci-secret-password \
-            minio/minio:latest server /data
+            pulse-ci-minio:ci server /data
           for attempt in $(seq 1 30); do
             if curl --fail --silent http://127.0.0.1:9000/minio/health/live >/dev/null; then
               exit 0
@@ -66,10 +84,6 @@ jobs:
           done
           docker logs pulse-ci-minio
           exit 1
-      - name: Lint
-        run: ruff check backend/app backend/tests
-      - name: Type check
-        run: mypy backend/app
       - name: Apply migrations
         env:
           PULSE_DATABASE_URL: postgresql+psycopg://pulse:pulse-test-password@127.0.0.1:5432/pulse_test

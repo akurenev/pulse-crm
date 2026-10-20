@@ -512,6 +512,15 @@ cursor budget из раздела 10.
 
 ## 4. Приватный S3 и вложения
 
+Для локальной разработки и GitHub CI MinIO собирается из закреплённых
+официальных исходников в `docker/minio.Dockerfile`, без скачивания готовых
+образов `minio/minio` и `minio/mc`. В Compose используйте
+`docker compose up --build`; при изменении закреплённой версии пересоберите сервисы `minio` и
+`minio-init`. В CI шаг **Build S3-compatible MinIO** собирает тестовый образ,
+а **Start S3-compatible MinIO** проверяет его готовность перед миграциями и
+тестами. Ошибка этих шагов относится к тестовой инфраструктуре GitHub Actions;
+успешный deploy в Timeweb проверяется отдельно.
+
 Бакет должен быть приватным. Webapp получает доступ только через
 `PULSE_S3_ENDPOINT_URL`, `PULSE_S3_REGION`, `PULSE_S3_BUCKET`,
 `PULSE_S3_ACCESS_KEY_ID` и `PULSE_S3_SECRET_ACCESS_KEY`. Публичный read ACL не

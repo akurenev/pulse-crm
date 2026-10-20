@@ -21,7 +21,10 @@ services:
       retries: 20
 
   minio:
-    image: minio/minio:latest
+    build:
+      context: .
+      dockerfile: docker/minio.Dockerfile
+      target: minio
     restart: unless-stopped
     command: server /data --console-address ":9001"
     environment:
@@ -39,7 +42,10 @@ services:
       retries: 20
 
   minio-init:
-    image: minio/mc:latest
+    build:
+      context: .
+      dockerfile: docker/minio.Dockerfile
+      target: mc
     restart: "no"
     depends_on:
       minio:
