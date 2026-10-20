@@ -215,7 +215,7 @@ async def register_subscription(
         )
         .returning(WebPushSubscription.id)
     )
-    stored_id = (await session.execute(statement)).scalar_one()
+    stored_id: uuid.UUID = (await session.execute(statement)).scalar_one()
 
     await session.execute(
         sa.delete(WebPushSubscription)

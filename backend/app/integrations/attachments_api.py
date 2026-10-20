@@ -372,10 +372,11 @@ async def post_deal_note_with_attachments(
     )
 
 
-def _note_attachment_query(
+async def _find_note_attachment(
     attachment_id: uuid.UUID,
     context: CurrentUser,
-) -> sa.Select[tuple[NoteAttachment]]:
+    db: AsyncSession,
+) -> NoteAttachment | None:
     query = (
         sa.select(NoteAttachment)
         .join(ActivityEvent, ActivityEvent.id == NoteAttachment.activity_event_id)
@@ -397,7 +398,7 @@ def _note_attachment_query(
     )
     if is_employee(context):
         query = query.where(deal_access_condition(context))
-    return query
+    return await db.scalar(query)
 
 
 @router.get(
@@ -409,7 +410,7 @@ async def get_note_attachment(
     context: CurrentUser,
     db: AsyncSession = Depends(get_session),
 ) -> NoteAttachmentRead:
-    attachment = await db.scalar(_note_attachment_query(attachment_id, context))
+    attachment = await _find_note_attachment(attachment_id, context, db)
     if attachment is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -428,7 +429,7 @@ async def download_note_attachment(
     context: CurrentUser,
     db: AsyncSession = Depends(get_session),
 ) -> AttachmentDownload:
-    attachment = await db.scalar(_note_attachment_query(attachment_id, context))
+    attachment = await _find_note_attachment(attachment_id, context, db)
     if attachment is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
