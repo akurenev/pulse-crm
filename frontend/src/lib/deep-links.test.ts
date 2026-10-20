@@ -13,6 +13,7 @@ describe("deep links", () => {
     expect(normalizeInternalAppPath("/contacts?company=company_789", origin))
       .toBe("/contacts?company=company_789");
     expect(normalizeInternalAppPath("/contacts?unused=true", origin)).toBe("/contacts");
+    expect(normalizeInternalAppPath("/mail?ignored=true", origin)).toBe("/mail");
   });
 
   it("rejects cross-origin, unknown and unsafe entity targets", () => {

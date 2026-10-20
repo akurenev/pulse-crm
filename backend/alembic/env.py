@@ -12,6 +12,7 @@ from app import models  # noqa: F401
 from app.config import get_settings
 from app.db import Base
 from app.integrations import models as integration_models  # noqa: F401
+from app.mail import models as mail_models  # noqa: F401
 
 config = context.config
 if config.config_file_name is not None:

@@ -10,6 +10,7 @@ import { useAuth } from "./state/auth-store";
 const DashboardPage = lazy(() => import("./pages/DashboardPage"));
 const ContactsPage = lazy(() => import("./pages/ContactsPage"));
 const TasksPage = lazy(() => import("./pages/TasksPage"));
+const MailPage = lazy(() => import("./pages/MailPage"));
 const ActivityPage = lazy(() => import("./pages/ActivityPage"));
 const SettingsPage = lazy(() => import("./pages/SettingsPage"));
 const LoginPage = lazy(() => import("./pages/LoginPage"));
@@ -31,6 +32,7 @@ export default function App() {
               <Route path="deals" element={<DealsPage />} />
               <Route path="contacts" element={<ContactsPage />} />
               <Route path="tasks" element={<TasksPage />} />
+              <Route path="mail" element={<MailPage />} />
               <Route path="activity" element={<ActivityPage />} />
               <Route path="settings" element={<AdminOnly><SettingsPage /></AdminOnly>} />
             </Route>

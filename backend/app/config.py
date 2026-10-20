@@ -54,6 +54,9 @@ class Settings(BaseSettings):
     static_dir: Path = Path("/app/backend/static")
     integration_encryption_key: str | None = None
     integration_encryption_key_id: str = "primary"
+    mail_allowed_hosts: list[str] = Field(
+        default_factory=lambda: ["imap.majordomo.ru", "smtp.majordomo.ru"]
+    )
     web_push_vapid_public_key: str | None = None
     web_push_vapid_private_key: str | None = None
     web_push_vapid_subject: str | None = None

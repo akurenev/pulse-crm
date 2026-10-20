@@ -82,6 +82,7 @@ from app.integrations.web_push import (
     mirror_delivered_in_app_notification,
 )
 from app.integrations.webhooks import VerifiedWebhook, accept_inbound_event
+from app.mail.worker import schedule_mail_jobs
 from app.models import (
     BackgroundJob,
     Deal,
@@ -1841,6 +1842,10 @@ class RuntimeScheduler:
                 await self._schedule_task_events(session, now, scheduled)
                 await self._schedule_inactive_deals(session, now, scheduled)
                 await self._schedule_imap(session, now, scheduled)
+                for job_type, count in (
+                    await schedule_mail_jobs(session, now, self.batch_size)
+                ).items():
+                    scheduled[job_type] = scheduled.get(job_type, 0) + count
                 await self._schedule_maintenance(session, now, scheduled)
         return SchedulerTickResult(lock_acquired=True, scheduled=scheduled)
 
