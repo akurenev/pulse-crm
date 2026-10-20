@@ -9,7 +9,13 @@ import pytest
 import sqlalchemy as sa
 
 from app.db import SessionLocal
+from app.integrations.models import NotificationDelivery
 from app.integrations.secrets import SecretCipher
+from app.integrations.web_push import (
+    PERSONAL_MAIL_PUSH_BODY,
+    PERSONAL_MAIL_PUSH_SUBJECT,
+    register_subscription,
+)
 from app.mail.models import MailAccount, MailFolder, MailMessage
 from app.mail.transport import (
     FolderSnapshot,
@@ -241,6 +247,105 @@ async def test_folder_sync_reconciles_external_flags_and_deletions() -> None:
         updated_folder = await db.get(MailFolder, folder.id)
         assert (
             updated_folder and updated_folder.total_count == 1 and updated_folder.unread_count == 0
+        )
+
+
+async def test_new_personal_inbox_letter_queues_private_web_push() -> None:
+    account, folder, _ = await seed(status="received")
+    async with SessionLocal() as db, db.begin():
+        await register_subscription(
+            db,
+            cipher=CIPHER,
+            workspace_id=account.workspace_id,
+            user_id=account.owner_id,
+            endpoint="https://fcm.googleapis.com/fcm/send/mail-push-device",
+            expiration_time=None,
+            p256dh="test-public-key",
+            auth="test-auth-secret",
+            now=datetime(2026, 10, 20, tzinfo=UTC),
+        )
+    transport = FakeMailTransport()
+    transport.snapshot = FolderSnapshot(
+        1,
+        2,
+        False,
+        (
+            RemoteMessage(
+                2,
+                b"From: sender@example.com\r\nSubject: Private subject\r\n\r\nPrivate body",
+                frozenset(),
+            ),
+        ),
+        frozenset({1, 2}),
+        {},
+    )
+
+    await runtime(transport).sync(
+        job(
+            JOB_MAIL_SYNC,
+            account,
+            account_id=str(account.id),
+            folder_id=str(folder.id),
+        )
+    )
+
+    async with SessionLocal() as db:
+        delivery = await db.scalar(
+            sa.select(NotificationDelivery).where(
+                NotificationDelivery.workspace_id == account.workspace_id,
+                NotificationDelivery.dedupe_key.like("web-push:mail:%"),
+            )
+        )
+        assert delivery is not None
+        assert delivery.recipient_id == account.owner_id
+        assert delivery.subject == PERSONAL_MAIL_PUSH_SUBJECT
+        assert delivery.body == PERSONAL_MAIL_PUSH_BODY
+        assert "Private subject" not in delivery.body
+
+
+async def test_initial_personal_mail_sync_does_not_queue_push() -> None:
+    account, folder, _ = await seed(status="received")
+    async with SessionLocal() as db, db.begin():
+        current_folder = await db.get(MailFolder, folder.id)
+        assert current_folder is not None
+        current_folder.uidvalidity = None
+        current_folder.last_uid = 0
+        await register_subscription(
+            db,
+            cipher=CIPHER,
+            workspace_id=account.workspace_id,
+            user_id=account.owner_id,
+            endpoint="https://fcm.googleapis.com/fcm/send/initial-sync-device",
+            expiration_time=None,
+            p256dh="test-public-key",
+            auth="test-auth-secret",
+            now=datetime(2026, 10, 20, tzinfo=UTC),
+        )
+    transport = FakeMailTransport()
+    transport.snapshot = FolderSnapshot(
+        1,
+        1,
+        False,
+        (RemoteMessage(1, b"From: sender@example.com\r\n\r\nOld letter", frozenset()),),
+        frozenset({1}),
+        {},
+    )
+
+    await runtime(transport).sync(
+        job(
+            JOB_MAIL_SYNC,
+            account,
+            account_id=str(account.id),
+            folder_id=str(folder.id),
+        )
+    )
+
+    async with SessionLocal() as db:
+        assert not await db.scalar(
+            sa.select(NotificationDelivery.id).where(
+                NotificationDelivery.workspace_id == account.workspace_id,
+                NotificationDelivery.dedupe_key.like("web-push:mail:%"),
+            )
         )
 
 

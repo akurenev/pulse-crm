@@ -28,7 +28,7 @@ self.addEventListener("push", (event) => {
   event.waitUntil(self.registration.showNotification(title, options));
 });
 
-const APP_PATHS = new Set(["/", "/deals", "/tasks", "/contacts", "/activity", "/settings"]);
+const APP_PATHS = new Set(["/", "/deals", "/tasks", "/contacts", "/mail", "/activity", "/settings"]);
 const ENTITY_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 
 function applicationRootUrl() {

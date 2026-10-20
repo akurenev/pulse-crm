@@ -17,6 +17,7 @@ from app.db import SessionLocal
 from app.integrations.models import Attachment
 from app.integrations.s3 import AttachmentStorage, AttachmentValidationError, StoredObject
 from app.integrations.secrets import SecretCipher
+from app.integrations.web_push import enqueue_personal_mail_push_delivery
 from app.mail.mime import ParsedAttachment, build_mail, parse_mail, parsed_values
 from app.mail.models import MailAccount, MailAttachment, MailFolder, MailMessage
 from app.mail.service import decrypt_credentials
@@ -482,6 +483,12 @@ class MailRuntime:
                 await db.flush()
                 for item, parsed in parsed_messages:
                     existing = by_uid.get(item.uid)
+                    received_new_mail = (
+                        folder.kind == "inbox"
+                        and old_validity == snapshot.uidvalidity
+                        and old_cursor > 0
+                        and item.uid > old_cursor
+                    )
                     if existing is None and parsed.internet_message_id:
                         # Reuse our sent draft when it appears on IMAP; copies in
                         # distinct remote folders remain distinct cache entries.
@@ -531,6 +538,15 @@ class MailRuntime:
                         )
                         db.add(existing)
                         await db.flush()
+                        if received_new_mail:
+                            await enqueue_personal_mail_push_delivery(
+                                db,
+                                workspace_id=current_account.workspace_id,
+                                user_id=current_account.owner_id,
+                                account_id=current_account.id,
+                                message_id=existing.id,
+                                scheduled_at=datetime.now(UTC),
+                            )
                         for obj in stored.get(item.uid, []):
                             db.add(
                                 MailAttachment(

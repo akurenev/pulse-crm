@@ -62,7 +62,15 @@ from app.integrations.runtime import (
 )
 from app.integrations.s3 import AttachmentStorage
 from app.integrations.secrets import SecretCipher
-from app.integrations.web_push import TEST_PUSH_BODY, TEST_PUSH_SUBJECT, register_subscription
+from app.integrations.web_push import (
+    PERSONAL_MAIL_PUSH_BODY,
+    PERSONAL_MAIL_PUSH_PREFIX,
+    PERSONAL_MAIL_PUSH_SUBJECT,
+    TEST_PUSH_BODY,
+    TEST_PUSH_SUBJECT,
+    register_subscription,
+)
+from app.mail.models import MailAccount, MailFolder, MailMessage
 from app.models import (
     ActivityEvent,
     BackgroundJob,
@@ -1655,6 +1663,90 @@ async def test_restricted_employee_delivery_requires_owned_target_or_exact_test_
     assert owned_task.status is DeliveryStatus.delivered
     assert pushed == [exact_test.id, owned.id, owned_task.id]
     assert adapter.sent == []
+
+
+@pytest.mark.asyncio
+async def test_personal_mail_push_is_delivered_only_to_its_account_owner(
+    db: AsyncSession,
+    integration_domain: dict[str, Any],
+) -> None:
+    workspace = integration_domain["workspace"]
+    owner = integration_domain["user"]
+    other_user = User(
+        email="other-mail-owner@example.com",
+        full_name="Other mail owner",
+        password_hash="not-used",
+    )
+    db.add(other_user)
+    await db.flush()
+    db.add(Membership(workspace_id=workspace.id, user_id=other_user.id, role=Role.employee))
+
+    async def add_message(user_id: uuid.UUID, suffix: str) -> MailMessage:
+        account = MailAccount(
+            workspace_id=workspace.id,
+            owner_id=user_id,
+            email=f"{suffix}@example.com",
+            display_name=suffix,
+            username=f"{suffix}@example.com",
+            imap_host="imap.example.com",
+            smtp_host="smtp.example.com",
+        )
+        db.add(account)
+        await db.flush()
+        folder = MailFolder(
+            workspace_id=workspace.id,
+            account_id=account.id,
+            name="INBOX",
+            display_name="INBOX",
+            kind="inbox",
+        )
+        db.add(folder)
+        await db.flush()
+        message = MailMessage(
+            workspace_id=workspace.id,
+            account_id=account.id,
+            folder_id=folder.id,
+            from_address="sender@example.com",
+            to_addresses=[],
+            cc_addresses=[],
+            bcc_addresses=[],
+            direction="inbound",
+            status="received",
+        )
+        db.add(message)
+        await db.flush()
+        return message
+
+    own_message = await add_message(owner.id, "owner")
+    foreign_message = await add_message(other_user.id, "other")
+
+    def delivery_for(message: MailMessage) -> NotificationDelivery:
+        return NotificationDelivery(
+            workspace_id=workspace.id,
+            audience=NotificationAudience.employee,
+            channel="web_push",
+            recipient_id=owner.id,
+            recipient_address=str(owner.id),
+            subject=PERSONAL_MAIL_PUSH_SUBJECT,
+            body=PERSONAL_MAIL_PUSH_BODY,
+            status=DeliveryStatus.pending,
+            dedupe_key=(
+                f"{PERSONAL_MAIL_PUSH_PREFIX}{message.account_id}:{message.id}"
+            ),
+            scheduled_at=FIXED_NOW,
+        )
+
+    own_delivery = delivery_for(own_message)
+    foreign_delivery = delivery_for(foreign_message)
+    db.add_all([own_delivery, foreign_delivery])
+    await db.commit()
+
+    assert await RuntimeHandlers._employee_delivery_is_allowed(
+        db, delivery=own_delivery, recipient_role=Role.owner
+    )
+    assert not await RuntimeHandlers._employee_delivery_is_allowed(
+        db, delivery=foreign_delivery, recipient_role=Role.owner
+    )
 
 
 @pytest.mark.asyncio
