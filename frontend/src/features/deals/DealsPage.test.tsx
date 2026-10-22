@@ -218,6 +218,107 @@ describe("DealsPage", () => {
     expect(within(firstStage).getByText("Анна Смирнова")).not.toBeVisible();
   });
 
+  describe("mouse panning", () => {
+    function renderScrollableKanban(scrollWidth = 1600) {
+      renderPage();
+      const kanban = screen.getByRole("region", { name: "Воронка продаж" });
+      let capturedPointer: number | null = null;
+      Object.defineProperties(kanban, {
+        clientWidth: { value: 600 },
+        clientHeight: { value: 600 },
+        scrollWidth: { value: scrollWidth },
+        setPointerCapture: { value: (pointerId: number) => { capturedPointer = pointerId; } },
+        hasPointerCapture: { value: (pointerId: number) => capturedPointer === pointerId },
+        releasePointerCapture: { value: () => { capturedPointer = null; } },
+      });
+      kanban.scrollLeft = 200;
+      return kanban;
+    }
+
+    const mousePointer = { pointerId: 1, pointerType: "mouse", button: 0, buttons: 1, clientX: 300, clientY: 100 };
+
+    it("pans horizontally in both directions from the background and an empty stage area", () => {
+      const kanban = renderScrollableKanban();
+
+      fireEvent.pointerDown(kanban, mousePointer);
+      fireEvent.pointerMove(kanban, { ...mousePointer, clientX: 200 });
+      expect(kanban.scrollLeft).toBe(300);
+      expect(kanban.hasPointerCapture(mousePointer.pointerId)).toBe(true);
+      fireEvent.pointerUp(kanban, { ...mousePointer, buttons: 0 });
+
+      const stageBody = within(kanban).getByRole("region", { name: "Новый лид" }).querySelector(".stage__body")!;
+      fireEvent.pointerDown(stageBody, mousePointer);
+      fireEvent.pointerMove(kanban, { ...mousePointer, clientX: 400 });
+      expect(kanban.scrollLeft).toBe(200);
+      fireEvent.pointerUp(kanban, { ...mousePointer, buttons: 0 });
+    });
+
+    it.each(["pointerup", "pointercancel", "lostpointercapture", "released-button"])("stops panning after %s", (ending) => {
+      const kanban = renderScrollableKanban();
+      fireEvent.pointerDown(kanban, mousePointer);
+      fireEvent.pointerMove(kanban, { ...mousePointer, clientX: 200 });
+      expect(kanban.scrollLeft).toBe(300);
+
+      if (ending === "released-button") {
+        fireEvent.pointerMove(kanban, { ...mousePointer, buttons: 0, clientX: 150 });
+      } else {
+        fireEvent(kanban, new PointerEvent(ending, { ...mousePointer, bubbles: true, buttons: 0 }));
+      }
+      fireEvent.pointerMove(kanban, { ...mousePointer, clientX: 100 });
+
+      expect(kanban.scrollLeft).toBe(300);
+      expect(kanban.hasPointerCapture(mousePointer.pointerId)).toBe(false);
+      expect(kanban).not.toHaveClass("kanban--panning");
+    });
+
+    it("keeps cards and nested button content available for their own interactions", async () => {
+      const user = userEvent.setup();
+      const kanban = renderScrollableKanban();
+      const dealTitle = within(kanban).getByText("Кофейня «Слой»");
+      const stage = within(kanban).getByRole("region", { name: "Новый лид" });
+      const addButton = within(stage).getByRole("button", { name: "Добавить сделку в этап Новый лид" });
+      const targets = [dealTitle.closest(".deal-card")!, dealTitle, within(stage).getByText("Новый лид"), addButton.querySelector("svg")!];
+
+      for (const target of targets) {
+        expect(fireEvent.pointerDown(target, mousePointer)).toBe(true);
+        fireEvent.pointerMove(kanban, { ...mousePointer, clientX: 200 });
+        fireEvent.pointerUp(kanban, { ...mousePointer, buttons: 0 });
+        expect(kanban.scrollLeft).toBe(200);
+        expect(kanban.hasPointerCapture(mousePointer.pointerId)).toBe(false);
+      }
+
+      await user.click(dealTitle);
+      expect(await screen.findByRole("dialog", { name: "Кофейня «Слой»" })).toBeInTheDocument();
+    });
+
+    it("preserves native touch, pen and non-primary mouse interactions", () => {
+      const kanban = renderScrollableKanban();
+      for (const pointer of [
+        { ...mousePointer, pointerType: "touch" },
+        { ...mousePointer, pointerType: "pen" },
+        { ...mousePointer, button: 1, buttons: 4 },
+        { ...mousePointer, button: 2, buttons: 2 },
+      ]) {
+        expect(fireEvent.pointerDown(kanban, pointer)).toBe(true);
+        fireEvent.pointerMove(kanban, { ...pointer, clientX: 200 });
+        fireEvent.pointerUp(kanban, { ...pointer, buttons: 0 });
+        expect(kanban.scrollLeft).toBe(200);
+        expect(kanban.hasPointerCapture(pointer.pointerId)).toBe(false);
+      }
+    });
+
+    it("does not intercept dragging when all stages fit without scrolling", () => {
+      const kanban = renderScrollableKanban(600);
+      kanban.scrollLeft = 0;
+
+      expect(fireEvent.pointerDown(kanban, mousePointer)).toBe(true);
+      fireEvent.pointerMove(kanban, { ...mousePointer, clientX: 200 });
+
+      expect(kanban.scrollLeft).toBe(0);
+      expect(kanban.hasPointerCapture(mousePointer.pointerId)).toBe(false);
+    });
+  });
+
   it("должен загружать финальный этап только по кнопке с его точным именем", async () => {
     const user = userEvent.setup();
     const loadStage = vi.fn().mockResolvedValue(undefined);

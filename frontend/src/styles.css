@@ -463,8 +463,12 @@ a {
   scroll-snap-type: x proximity;
   overscroll-behavior-inline: contain;
   -webkit-overflow-scrolling: touch;
+  cursor: grab;
   transition: margin-right 180ms ease;
 }
+
+.kanban--panning { scroll-snap-type: none; cursor: grabbing; user-select: none; }
+.kanban.kanban--panning * { cursor: grabbing; }
 
 .stage {
   position: relative;
@@ -502,6 +506,7 @@ a {
 
 .deal-card {
   position: relative;
+  cursor: default;
   content-visibility: auto;
   contain-intrinsic-size: auto 170px;
   border: 1px solid #d4dae4;

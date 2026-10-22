@@ -10,6 +10,7 @@ import {
 import { sortableKeyboardCoordinates } from "@dnd-kit/sortable";
 import { Columns3, Filter, List, Plus, Search } from "lucide-react";
 import { useCallback, useDeferredValue, useEffect, useId, useMemo, useRef, useState } from "react";
+import type { PointerEvent } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 
 import { Avatar } from "../../components/Avatar";
@@ -79,6 +80,8 @@ export function DealsPage() {
   const accessGenerationRef = useRef(0);
   const mountedRef = useRef(false);
   const kanbanScrollHintId = useId();
+  const kanbanPanRef = useRef<{ pointerId: number; startX: number; scrollLeft: number } | null>(null);
+  const [isKanbanPanning, setIsKanbanPanning] = useState(false);
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 8 } }),
     useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
@@ -177,6 +180,43 @@ export function DealsPage() {
     return [...options.entries()].sort((left, right) => left[1].localeCompare(right[1], "ru"));
   }, [deals]);
 
+  function handleKanbanPointerDown(event: PointerEvent<HTMLDivElement>) {
+    const kanban = event.currentTarget;
+    if (event.defaultPrevented || event.pointerType !== "mouse" || event.button !== 0
+      || kanban.scrollWidth <= kanban.clientWidth
+      || !(event.target instanceof Element)
+      || event.target.closest(".deal-card, button, a, input, select, textarea, label, [role='button'], [contenteditable]")) return;
+
+    const bounds = kanban.getBoundingClientRect();
+    if (event.clientX >= bounds.left + kanban.clientLeft + kanban.clientWidth
+      || event.clientY >= bounds.top + kanban.clientTop + kanban.clientHeight) return;
+
+    event.preventDefault();
+    kanbanPanRef.current = { pointerId: event.pointerId, startX: event.clientX, scrollLeft: kanban.scrollLeft };
+    kanban.setPointerCapture(event.pointerId);
+    kanban.focus({ preventScroll: true });
+    setIsKanbanPanning(true);
+  }
+
+  function handleKanbanPointerEnd(event: PointerEvent<HTMLDivElement>) {
+    if (kanbanPanRef.current?.pointerId !== event.pointerId) return;
+    kanbanPanRef.current = null;
+    setIsKanbanPanning(false);
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+  }
+
+  function handleKanbanPointerMove(event: PointerEvent<HTMLDivElement>) {
+    const pan = kanbanPanRef.current;
+    if (!pan || pan.pointerId !== event.pointerId) return;
+    if (!(event.buttons & 1)) {
+      handleKanbanPointerEnd(event);
+      return;
+    }
+    event.currentTarget.scrollLeft = pan.scrollLeft - (event.clientX - pan.startX);
+  }
+
   async function handleDragEnd(event: DragEndEvent) {
     const dealId = String(event.active.id);
     const stageId = event.over ? String(event.over.id) : null;
@@ -254,13 +294,18 @@ export function DealsPage() {
 
       {!loading && !error && layout === "kanban" ? <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={(event) => void handleDragEnd(event)}>
         <div
-          className="kanban kanban--single-row kanban--mobile-scroll"
+          className={`kanban kanban--single-row kanban--mobile-scroll${isKanbanPanning ? " kanban--panning" : ""}`}
           role="region"
           aria-label="Воронка продаж"
           aria-describedby={kanbanScrollHintId}
           tabIndex={0}
+          onPointerDown={handleKanbanPointerDown}
+          onPointerMove={handleKanbanPointerMove}
+          onPointerUp={handleKanbanPointerEnd}
+          onPointerCancel={handleKanbanPointerEnd}
+          onLostPointerCapture={handleKanbanPointerEnd}
         >
-          <p id={kanbanScrollHintId} className="sr-only">Прокручивайте воронку по горизонтали, чтобы увидеть остальные этапы.</p>
+          <p id={kanbanScrollHintId} className="sr-only">Прокручивайте воронку по горизонтали, чтобы увидеть остальные этапы. Мышью можно перетаскивать воронку за пустое место вне карточек и кнопок.</p>
           {pipeline.stages.map((stage) => (
             <StageColumn
               key={stage.id}
