@@ -253,8 +253,16 @@ async def export_deals(
                 company.name if company else None,
                 str(deal.company_id) if deal.company_id else None,
                 company.inn if company else None,
-                company.phone if company else None,
-                company.email if company else None,
+                "; ".join(
+                    dict.fromkeys(value for value in [company.phone, *company.phones] if value)
+                )
+                if company
+                else None,
+                "; ".join(
+                    dict.fromkeys(value for value in [company.email, *company.emails] if value)
+                )
+                if company
+                else None,
                 "\n".join(
                     f"{contact.first_name} {contact.last_name}".strip() for contact in contacts
                 ),

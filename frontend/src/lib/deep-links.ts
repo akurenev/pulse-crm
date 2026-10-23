@@ -1,6 +1,6 @@
 const ENTITY_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 
-const SIMPLE_APP_PATHS = new Set(["/", "/deals", "/tasks", "/contacts", "/activity", "/settings"]);
+const SIMPLE_APP_PATHS = new Set(["/", "/deals", "/tasks", "/contacts", "/activity", "/mail", "/settings"]);
 
 export type DeepLinkEntity = "deal" | "task" | "contact" | "company";
 

@@ -10,6 +10,7 @@ from app.integrations import (
     subscription_import_api,
 )
 from app.integrations import api as integrations_api
+from app.mail import api as mail_api
 
 api_router = APIRouter(prefix="/api/v1")
 api_router.include_router(auth.router)
@@ -26,3 +27,4 @@ api_router.include_router(admin_api.router)
 api_router.include_router(amocrm_api.router)
 api_router.include_router(operations_api.router)
 api_router.include_router(subscription_import_api.router)
+api_router.include_router(mail_api.router)

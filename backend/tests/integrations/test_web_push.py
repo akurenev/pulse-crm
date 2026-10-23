@@ -19,6 +19,9 @@ from app.integrations.models import (
 from app.integrations.secrets import SecretCipher
 from app.integrations.web_push import (
     MAX_WEB_PUSH_PAYLOAD_BYTES,
+    PERSONAL_MAIL_PUSH_BODY,
+    PERSONAL_MAIL_PUSH_PREFIX,
+    PERSONAL_MAIL_PUSH_SUBJECT,
     WebPushDeliveryError,
     WebPushSender,
     _NoRedirectSession,
@@ -343,6 +346,25 @@ def test_web_push_payload_rejects_invalid_materialized_targets(
     )
 
     assert json.loads(build_web_push_payload(delivery))["url"] == "/"
+
+
+def test_personal_mail_push_opens_the_private_mailbox() -> None:
+    account_id = uuid.uuid4()
+    message_id = uuid.uuid4()
+    recipient_id = uuid.uuid4()
+    delivery = NotificationDelivery(
+        workspace_id=uuid.uuid4(),
+        audience=NotificationAudience.employee,
+        channel="web_push",
+        recipient_id=recipient_id,
+        recipient_address=str(recipient_id),
+        subject=PERSONAL_MAIL_PUSH_SUBJECT,
+        body=PERSONAL_MAIL_PUSH_BODY,
+        dedupe_key=f"{PERSONAL_MAIL_PUSH_PREFIX}{account_id}:{message_id}",
+        scheduled_at=FIXED_NOW,
+    )
+
+    assert json.loads(build_web_push_payload(delivery))["url"] == "/mail"
 
 
 @pytest.mark.parametrize(

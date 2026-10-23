@@ -80,8 +80,11 @@ from app.integrations.web_push import (
     WebPushDeliverySender,
     is_trusted_test_push_delivery,
     mirror_delivered_in_app_notification,
+    trusted_personal_mail_push_ids,
 )
 from app.integrations.webhooks import VerifiedWebhook, accept_inbound_event
+from app.mail.models import MailAccount, MailMessage
+from app.mail.worker import schedule_mail_jobs
 from app.models import (
     BackgroundJob,
     Deal,
@@ -1136,6 +1139,23 @@ class RuntimeHandlers:
             or delivery.recipient_address != str(recipient_id)
         ):
             return False
+        personal_mail_ids = trusted_personal_mail_push_ids(delivery)
+        if personal_mail_ids is not None:
+            account_id, message_id = personal_mail_ids
+            owned_message = await session.scalar(
+                sa.select(MailMessage.id)
+                .join(MailAccount, MailAccount.id == MailMessage.account_id)
+                .where(
+                    MailMessage.id == message_id,
+                    MailMessage.account_id == account_id,
+                    MailMessage.workspace_id == delivery.workspace_id,
+                    MailAccount.workspace_id == delivery.workspace_id,
+                    MailAccount.owner_id == recipient_id,
+                    MailAccount.status.in_({"active", "degraded"}),
+                )
+                .with_for_update()
+            )
+            return owned_message is not None
         if recipient_role is not Role.employee:
             return True
         if is_trusted_test_push_delivery(delivery):
@@ -1841,6 +1861,10 @@ class RuntimeScheduler:
                 await self._schedule_task_events(session, now, scheduled)
                 await self._schedule_inactive_deals(session, now, scheduled)
                 await self._schedule_imap(session, now, scheduled)
+                for job_type, count in (
+                    await schedule_mail_jobs(session, now, self.batch_size)
+                ).items():
+                    scheduled[job_type] = scheduled.get(job_type, 0) + count
                 await self._schedule_maintenance(session, now, scheduled)
         return SchedulerTickResult(lock_acquired=True, scheduled=scheduled)
 

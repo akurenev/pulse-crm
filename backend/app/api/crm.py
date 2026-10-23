@@ -155,6 +155,52 @@ def _literal_contains_pattern(value: str) -> str:
     return f"%{escaped}%"
 
 
+def _synchronize_communication_fields(
+    values: dict[str, Any],
+    provided: set[str],
+    *,
+    existing: Company | Contact | None = None,
+    contact: bool = False,
+) -> None:
+    """Keep ordered values and legacy primary fields consistent on partial edits."""
+    for list_field, primary_field in (
+        ("emails", "primary_email" if contact else "email"),
+        ("phones", "primary_phone" if contact else "phone"),
+    ):
+        if list_field in provided:
+            ordered = list(
+                dict.fromkeys(value.strip() for value in values[list_field] if value.strip())
+            )
+            primary = (values.get(primary_field) or "").strip()
+            # Older clients sent a primary separately from their secondary list.
+            # An explicit empty list always means to remove every value.
+            if ordered and primary and primary not in ordered:
+                ordered.append(primary)
+        elif primary_field in provided:
+            previous_primary = getattr(existing, primary_field, None)
+            secondary = (
+                [value for value in getattr(existing, list_field) if value != previous_primary]
+                if existing is not None
+                else []
+            )
+            primary = values.get(primary_field)
+            ordered = list(
+                dict.fromkeys(
+                    value.strip()
+                    for value in ([primary] if primary else []) + secondary
+                    if value.strip()
+                )
+            )
+        elif existing is not None:
+            continue
+        else:
+            ordered = []
+        if len(ordered) > 20:
+            raise HTTPException(status_code=422, detail=f"{list_field} cannot exceed 20 values")
+        values[list_field] = ordered
+        values[primary_field] = ordered[0] if ordered else None
+
+
 def _tags_search_condition(tags: Any, term: str, dialect_name: str) -> Any:
     if dialect_name == "postgresql":
         tag_values = sa.func.jsonb_array_elements_text(tags).table_valued("value").alias()
@@ -392,6 +438,8 @@ async def list_companies(
                 Company.inn.ilike(literal_pattern, escape="\\"),
                 Company.email.ilike(literal_pattern, escape="\\"),
                 Company.phone.ilike(literal_pattern, escape="\\"),
+                _tags_search_condition(Company.emails, term, dialect_name),
+                _tags_search_condition(Company.phones, term, dialect_name),
                 Company.website.ilike(literal_pattern, escape="\\"),
                 _tags_search_condition(Company.tags, term, dialect_name),
                 _json_object_values_search_condition(
@@ -421,7 +469,9 @@ async def create_company(
     db: AsyncSession = Depends(get_session),
 ) -> Company:
     forbid_employee(context)
-    company = Company(workspace_id=context.workspace_id, **payload.model_dump(mode="json"))
+    data = payload.model_dump(mode="json")
+    _synchronize_communication_fields(data, payload.model_fields_set)
+    company = Company(workspace_id=context.workspace_id, **data)
     db.add(company)
     await db.flush()
     record_domain_event(
@@ -489,13 +539,15 @@ async def update_company(
     db: AsyncSession = Depends(get_session),
 ) -> Company:
     forbid_employee(context)
-    for required_field in ("name", "tags", "custom_fields"):
+    existing_company = await ensure_company_access(db, context, company_id, for_update=True)
+    for required_field in ("name", "emails", "phones", "tags", "custom_fields"):
         if required_field in payload.model_fields_set and getattr(payload, required_field) is None:
             raise HTTPException(
                 status_code=422,
                 detail=f"{required_field} cannot be null",
             )
     values = payload.model_dump(exclude_unset=True, exclude={"expected_version"}, mode="json")
+    _synchronize_communication_fields(values, payload.model_fields_set, existing=existing_company)
     values.update(version=payload.expected_version + 1, updated_at=datetime.now(UTC))
     company = (
         await db.execute(
@@ -644,6 +696,10 @@ async def list_contacts(
         tags_match = _tags_search_condition(
             Contact.tags, search_term, db.get_bind().dialect.name
         )
+        details_match = sa.or_(
+            _tags_search_condition(Contact.emails, search_term, db.get_bind().dialect.name),
+            _tags_search_condition(Contact.phones, search_term, db.get_bind().dialect.name),
+        )
         if db.get_bind().dialect.name == "postgresql":
             document = sa.func.to_tsvector(
                 sa.text("'simple'"),
@@ -661,6 +717,7 @@ async def list_contacts(
                         sa.func.websearch_to_tsquery(sa.text("'simple'"), search_term)
                     ),
                     tags_match,
+                    details_match,
                 )
             )
         else:
@@ -671,6 +728,7 @@ async def list_contacts(
                     Contact.primary_email.ilike(term),
                     Contact.primary_phone.ilike(term),
                     tags_match,
+                    details_match,
                 )
             )
     if (condition := _cursor_condition(Contact, cursor)) is not None:
@@ -702,6 +760,7 @@ async def create_contact(
     elif payload.assignee_id is not None:
         await _ensure_member(db, context.workspace_id, payload.assignee_id)
     data = payload.model_dump()
+    _synchronize_communication_fields(data, payload.model_fields_set, contact=True)
     if is_employee(context):
         data["assignee_id"] = context.user_id
     contact = Contact(workspace_id=context.workspace_id, **data)
@@ -765,6 +824,9 @@ async def update_contact(
         elif payload.assignee_id is not None:
             await _ensure_member(db, context.workspace_id, payload.assignee_id)
     values = payload.model_dump(exclude_unset=True, exclude={"expected_version"})
+    _synchronize_communication_fields(
+        values, payload.model_fields_set, existing=existing_contact, contact=True
+    )
     values.update(version=payload.expected_version + 1, updated_at=datetime.now(UTC))
     contact = (
         await db.execute(
@@ -2041,6 +2103,8 @@ async def list_deals(
                     search_company.inn.ilike(literal_pattern, escape="\\"),
                     search_company.email.ilike(literal_pattern, escape="\\"),
                     search_company.phone.ilike(literal_pattern, escape="\\"),
+                    _tags_search_condition(search_company.emails, term, dialect_name),
+                    _tags_search_condition(search_company.phones, term, dialect_name),
                 ),
             )
         )

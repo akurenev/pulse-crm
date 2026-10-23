@@ -9,6 +9,7 @@ import {
   ChevronRight,
   Home,
   LogOut,
+  Mail,
   Menu,
   Settings,
   Users,
@@ -31,6 +32,7 @@ const navigation = [
   { to: "/deals", label: "Сделки", icon: Building2 },
   { to: "/contacts", label: "Клиенты", icon: Users },
   { to: "/tasks", label: "Задачи", icon: CheckSquare2 },
+  { to: "/mail", label: "Почта", icon: Mail },
   { to: "/activity", label: "Активность", icon: Activity, desktopOnly: true },
   { to: "/settings", label: "Настройки", icon: Settings, desktopOnly: true },
 ];

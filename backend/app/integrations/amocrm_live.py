@@ -822,8 +822,10 @@ class PulseAmoWriter(ImportEntityWriter):
         )
         model.name = _required_text(entity.data.get("name"), "Компания amoCRM")[:240]
         model.inn = _amo_company_inn(entity.data)
-        model.phone = _first_amo_field_value(entity.data, "PHONE", max_length=64)
-        model.email = _first_amo_field_value(entity.data, "EMAIL", max_length=320)
+        model.phones = _all_amo_field_values(entity.data, "PHONE", max_length=64)
+        model.emails = _all_amo_field_values(entity.data, "EMAIL", max_length=320)
+        model.phone = model.phones[0] if model.phones else None
+        model.email = model.emails[0] if model.emails else None
         model.website = _first_amo_field_value(entity.data, "WEB", max_length=512)
         model.tags = _tags(entity.data)
         model.custom_fields = fields

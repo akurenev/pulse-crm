@@ -32,6 +32,9 @@ MAX_WEB_PUSH_PAYLOAD_BYTES = 3_000
 DEFAULT_WEB_PUSH_URL = "/"
 TEST_PUSH_SUBJECT = "Pulse CRM"
 TEST_PUSH_BODY = "Тестовое push-уведомление. Уведомления настроены правильно."
+PERSONAL_MAIL_PUSH_SUBJECT = "Новое письмо"
+PERSONAL_MAIL_PUSH_BODY = "Получено новое письмо."
+PERSONAL_MAIL_PUSH_PREFIX = "web-push:mail:"
 
 
 class WebPushDeliveryError(RuntimeError):
@@ -97,6 +100,39 @@ def is_trusted_test_push_delivery(delivery: NotificationDelivery) -> bool:
         and bucket.isascii()
         and bucket.isdecimal()
     )
+
+
+def trusted_personal_mail_push_ids(
+    delivery: NotificationDelivery,
+) -> tuple[uuid.UUID, uuid.UUID] | None:
+    """Return account and message ids only for a tightly-scoped mail push."""
+
+    if delivery.recipient_id is None:
+        return None
+    key = delivery.dedupe_key.removeprefix(PERSONAL_MAIL_PUSH_PREFIX)
+    account_id, separator, message_id = key.partition(":")
+    if not separator or ":" in message_id:
+        return None
+    try:
+        parsed_account_id = uuid.UUID(account_id)
+        parsed_message_id = uuid.UUID(message_id)
+    except ValueError:
+        return None
+    if not (
+        delivery.audience is NotificationAudience.employee
+        and delivery.channel == "web_push"
+        and delivery.rule_id is None
+        and delivery.template_id is None
+        and delivery.recipient_address == str(delivery.recipient_id)
+        and delivery.subject == PERSONAL_MAIL_PUSH_SUBJECT
+        and delivery.body == PERSONAL_MAIL_PUSH_BODY
+        and delivery.target_entity_type is None
+        and delivery.target_entity_id is None
+        and delivery.dedupe_key
+        == f"{PERSONAL_MAIL_PUSH_PREFIX}{parsed_account_id}:{parsed_message_id}"
+    ):
+        return None
+    return parsed_account_id, parsed_message_id
 
 
 def _as_utc(value: datetime) -> datetime:
@@ -398,6 +434,36 @@ async def enqueue_web_push_delivery(
     return QueuedWebPushDelivery(delivery=delivery, created=True)
 
 
+async def enqueue_personal_mail_push_delivery(
+    session: AsyncSession,
+    *,
+    workspace_id: uuid.UUID,
+    user_id: uuid.UUID,
+    account_id: uuid.UUID,
+    message_id: uuid.UUID,
+    scheduled_at: datetime | None = None,
+) -> NotificationDelivery | None:
+    """Queue a privacy-preserving push for a newly received personal letter."""
+
+    if not await has_active_subscription(
+        session,
+        workspace_id=workspace_id,
+        user_id=user_id,
+        now=scheduled_at,
+    ):
+        return None
+    queued = await enqueue_web_push_delivery(
+        session,
+        workspace_id=workspace_id,
+        user_id=user_id,
+        subject=PERSONAL_MAIL_PUSH_SUBJECT,
+        body=PERSONAL_MAIL_PUSH_BODY,
+        dedupe_key=f"{PERSONAL_MAIL_PUSH_PREFIX}{account_id}:{message_id}",
+        scheduled_at=scheduled_at,
+    )
+    return queued.delivery
+
+
 async def mirror_delivered_in_app_notification(
     session: AsyncSession,
     *,
@@ -443,6 +509,8 @@ def _truncate_utf8(value: str, maximum_bytes: int) -> str:
 def _web_push_url(delivery: NotificationDelivery) -> str:
     """Build only the UUID-based relative routes supported by the PWA."""
 
+    if trusted_personal_mail_push_ids(delivery) is not None:
+        return "/mail"
     if delivery.target_entity_id is None:
         return DEFAULT_WEB_PUSH_URL
     try:
@@ -680,6 +748,9 @@ __all__ = [
     "MAX_WEB_PUSH_PAYLOAD_BYTES",
     "QueuedWebPushDelivery",
     "DEFAULT_WEB_PUSH_URL",
+    "PERSONAL_MAIL_PUSH_BODY",
+    "PERSONAL_MAIL_PUSH_PREFIX",
+    "PERSONAL_MAIL_PUSH_SUBJECT",
     "TEST_PUSH_BODY",
     "TEST_PUSH_SUBJECT",
     "WebPushDeliveryError",
@@ -689,9 +760,11 @@ __all__ = [
     "delete_subscription",
     "endpoint_hash",
     "enqueue_web_push_delivery",
+    "enqueue_personal_mail_push_delivery",
     "has_active_subscription",
     "is_trusted_test_push_delivery",
     "mirror_delivered_in_app_notification",
     "register_subscription",
     "subscription_aad",
+    "trusted_personal_mail_push_ids",
 ]

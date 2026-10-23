@@ -188,6 +188,8 @@ class Company(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     website: Mapped[str | None] = mapped_column(sa.String(512))
     phone: Mapped[str | None] = mapped_column(sa.String(64))
     email: Mapped[str | None] = mapped_column(sa.String(320))
+    phones: Mapped[list[str]] = mapped_column(JSON_TYPE, default=list, nullable=False)
+    emails: Mapped[list[str]] = mapped_column(JSON_TYPE, default=list, nullable=False)
     tags: Mapped[list[str]] = mapped_column(JSON_TYPE, default=list, nullable=False)
     custom_fields: Mapped[dict[str, Any]] = mapped_column(JSON_TYPE, default=dict, nullable=False)
     version: Mapped[int] = mapped_column(sa.Integer, default=1, nullable=False)

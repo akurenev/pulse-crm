@@ -68,6 +68,8 @@ const company = (id: string, name: string): ApiCompany => ({
   website: null,
   phone: null,
   email: `${id}@example.com`,
+  emails: [],
+  phones: [],
   tags: [],
   custom_fields: {},
   version: 1,
@@ -188,6 +190,40 @@ describe("ContactsPage pagination", () => {
       expect(getMock.mock.calls.some(([path]) => path === "/contacts?limit=25&search=%D0%BF%D0%B5%D1%80%D0%B2%D1%8B%D0%B9")).toBe(true);
     });
     expect(requestedPaths().filter((path) => path.includes("/contacts?") && path.includes("search=")).length).toBe(1);
+  });
+
+  it.each([
+    { query: "secondary@example.test", description: "a secondary email" },
+    { query: "70001112233", description: "a normalized phone number" },
+  ])("keeps contacts matched by the server using $description", async ({ query }) => {
+    const user = userEvent.setup();
+    const matchedContact: ApiContact = {
+      ...contact("contact-server-match", "Найденный"),
+      primary_email: "primary@example.test",
+      primary_phone: "+7 000 000-00-00",
+      emails: ["primary@example.test", "secondary@example.test"],
+      phones: ["+7 000 000-00-00", "+7 (000) 111-22-33"],
+    };
+    getMock.mockImplementation((path: string) => {
+      if (path === "/users") return Promise.resolve([responsibleUser]);
+      const [pathname, searchParams = ""] = path.split("?");
+      if (pathname === "/contacts") {
+        const search = new URLSearchParams(searchParams).get("search");
+        return Promise.resolve({
+          items: search === query ? [matchedContact] : [contact("contact-initial", "Исходный")],
+          next_cursor: null,
+        });
+      }
+      return Promise.reject(new Error(`Unexpected GET ${path}`));
+    });
+    renderPage();
+
+    expect(await screen.findByText("Исходный Контакт")).toBeInTheDocument();
+    await user.type(screen.getByPlaceholderText("Имя, компания, ИНН, тег, телефон или email"), query);
+
+    expect(await screen.findByText("Найденный Контакт")).toBeInTheDocument();
+    expect(screen.queryByText("Исходный Контакт")).not.toBeInTheDocument();
+    expect(requestedPaths()).toContain(`/contacts?${new URLSearchParams({ limit: "25", search: query })}`);
   });
 
   it("shows no invented assignee for remote contacts and retries a failed request", async () => {
@@ -328,6 +364,71 @@ describe("ContactsPage linked records", () => {
 });
 
 describe("ContactsPage contact management", () => {
+  it.each(["contacts", "companies"] as const)("creates %s with several contact points", async (collection) => {
+    const user = userEvent.setup();
+    postMock.mockResolvedValue(collection === "contacts" ? contact("created", "Тест") : company("created", "Тест"));
+    renderPage();
+    if (collection === "companies") await user.click(screen.getByRole("button", { name: "Компании" }));
+    await user.click(screen.getByRole("button", { name: collection === "contacts" ? "Добавить контакт" : "Добавить компанию" }));
+    const dialog = screen.getByRole("dialog");
+    await user.type(within(dialog).getByLabelText(collection === "contacts" ? "Имя" : "Название"), "Тест");
+    await user.type(within(dialog).getByLabelText("Email", { exact: true }), "first@example.com");
+    await user.click(within(dialog).getByRole("button", { name: "Добавить email" }));
+    await user.type(within(dialog).getByLabelText("Email 2", { exact: true }), "second@example.com");
+    await user.type(within(dialog).getByLabelText("Телефон", { exact: true }), "+7 000 000-00-01");
+    await user.click(within(dialog).getByRole("button", { name: "Добавить телефон" }));
+    await user.type(within(dialog).getByLabelText("Телефон 2", { exact: true }), "+7 000 000-00-02");
+    await user.click(within(dialog).getByRole("button", { name: "Сохранить" }));
+    await waitFor(() => expect(postMock).toHaveBeenCalledWith(`/${collection}`, expect.objectContaining({
+      emails: ["first@example.com", "second@example.com"],
+      phones: ["+7 000 000-00-01", "+7 000 000-00-02"],
+      ...(collection === "contacts"
+        ? { primary_email: "first@example.com", primary_phone: "+7 000 000-00-01" }
+        : { email: "first@example.com", phone: "+7 000 000-00-01" }),
+    })));
+  });
+
+  it.each(["contacts", "companies"] as const)("preserves extra %s contact points and promotes the next after deletion", async (collection) => {
+    const user = userEvent.setup();
+    let storedContact = { ...contact("contact-multi", "Тест"), primary_email: "first@example.com", emails: ["first@example.com", "second@example.com"], phones: ["+7 000 000-00-00", "+7 000 000-00-02"] };
+    let storedCompany = { ...company("company-multi", "Тестовая компания"), email: "first@example.com", phone: "+7 000 000-00-00", emails: [...storedContact.emails], phones: [...storedContact.phones] };
+    getMock.mockImplementation((path: string) => {
+      if (path === "/users") return Promise.resolve([responsibleUser]);
+      const pathname = path.split("?")[0];
+      if (pathname === "/contacts") return Promise.resolve({ items: [storedContact], next_cursor: null });
+      if (pathname === "/companies") return Promise.resolve({ items: [storedCompany], next_cursor: null });
+      return Promise.resolve({ items: [], next_cursor: null });
+    });
+    patchMock.mockImplementation((_path: string, payload: Record<string, unknown>) => {
+      if (collection === "contacts") {
+        storedContact = { ...storedContact, ...payload, version: 2 } as typeof storedContact;
+        return Promise.resolve(storedContact);
+      }
+      storedCompany = { ...storedCompany, ...payload, version: 2 } as typeof storedCompany;
+      return Promise.resolve(storedCompany);
+    });
+    renderPage();
+    if (collection === "companies") await user.click(screen.getByRole("button", { name: "Компании" }));
+    await user.click(await screen.findByText(collection === "contacts" ? "Тест Контакт" : "Тестовая компания"));
+    const dialog = screen.getByRole("dialog");
+    expect(within(dialog).getByText("second@example.com")).toBeInTheDocument();
+    expect(within(dialog).getByText("+7 000 000-00-02")).toBeInTheDocument();
+    await user.click(within(dialog).getByRole("button", { name: collection === "contacts" ? "Редактировать контакт" : "Редактировать компанию" }));
+    expect(within(dialog).getByLabelText("Email 2", { exact: true })).toHaveValue("second@example.com");
+    await user.click(within(dialog).getByRole("button", { name: "Удалить email 1" }));
+    await user.click(within(dialog).getByRole("button", { name: "Удалить телефон 1" }));
+    await user.click(within(dialog).getByRole("button", { name: "Сохранить" }));
+    await waitFor(() => expect(patchMock).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({
+      emails: ["second@example.com"], phones: ["+7 000 000-00-02"],
+      ...(collection === "contacts"
+        ? { primary_email: "second@example.com", primary_phone: "+7 000 000-00-02" }
+        : { email: "second@example.com", phone: "+7 000 000-00-02" }),
+    })));
+    await user.click(within(dialog).getByRole("button", { name: collection === "contacts" ? "Редактировать контакт" : "Редактировать компанию" }));
+    expect(within(dialog).getByLabelText("Email", { exact: true })).toHaveValue("second@example.com");
+    expect(within(dialog).getByLabelText("Телефон", { exact: true })).toHaveValue("+7 000 000-00-02");
+  });
+
   it("edits a contact with its current version and refreshes the list cache", async () => {
     const user = userEvent.setup();
     let storedContact = contact("contact-edit", "Анна");
@@ -410,6 +511,8 @@ describe("ContactsPage contact management", () => {
         inn: payload.inn as string | null,
         email: payload.email as string | null,
         phone: payload.phone as string | null,
+        emails: payload.emails as string[],
+        phones: payload.phones as string[],
         website: payload.website as string | null,
         tags: payload.tags as string[],
         version: 2,
@@ -440,6 +543,8 @@ describe("ContactsPage contact management", () => {
       inn: "000000000000",
       email: "new-company@example.com",
       phone: "+7 000 111-22-33",
+      emails: ["new-company@example.com"],
+      phones: ["+7 000 111-22-33"],
       website: "https://company.example.com",
       tags: ["Партнёр", "VIP"],
     }));

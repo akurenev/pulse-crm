@@ -80,6 +80,8 @@ export interface Contact {
   company: string;
   email: string;
   phone: string;
+  emails?: string[];
+  phones?: string[];
   tags: string[];
   deals: number;
   revenue: number;
