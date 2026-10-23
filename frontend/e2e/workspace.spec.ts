@@ -1,6 +1,6 @@
 import { expect, test } from "@playwright/test";
 
-test("creates a contact and switches to companies", async ({ page }) => {
+test("creates and edits multiple contact points for contacts and companies", async ({ page }) => {
   await page.goto("/contacts");
   const importedContact = page.getByRole("region", { name: "Список контактов" })
     .locator("button.data-row")
@@ -16,13 +16,50 @@ test("creates a contact and switches to companies", async ({ page }) => {
   const dialog = page.getByRole("dialog", { name: "Новый контакт" });
   await dialog.getByLabel("Имя").fill("Мария");
   await dialog.getByLabel("Фамилия").fill("Орлова");
-  await dialog.getByLabel("Email").fill("maria@example.com");
-  await dialog.getByLabel("Телефон").fill("+7 000 000-00-06");
+  await dialog.getByLabel("Email", { exact: true }).fill("maria@example.com");
+  await dialog.getByRole("button", { name: "Добавить email", exact: true }).click();
+  await dialog.getByLabel("Email 2", { exact: true }).fill("maria.work@example.com");
+  await dialog.getByLabel("Телефон", { exact: true }).fill("+7 000 000-00-06");
+  await dialog.getByRole("button", { name: "Добавить телефон", exact: true }).click();
+  await dialog.getByLabel("Телефон 2", { exact: true }).fill("+7 000 000-00-07");
   await dialog.getByRole("button", { name: "Сохранить" }).click();
-  await expect(page.getByText("Мария Орлова", { exact: true })).toBeVisible();
+  await page.getByText("Мария Орлова", { exact: true }).click();
+  const contactDialog = page.getByRole("dialog", { name: "Мария Орлова" });
+  await expect(contactDialog.getByText("maria.work@example.com", { exact: true })).toBeVisible();
+  await expect(contactDialog.getByText("+7 000 000-00-07", { exact: true })).toBeVisible();
+  await contactDialog.getByRole("button", { name: "Редактировать контакт" }).click();
+  await contactDialog.getByRole("button", { name: "Удалить email 1", exact: true }).click();
+  await contactDialog.getByRole("button", { name: "Удалить телефон 1", exact: true }).click();
+  await contactDialog.getByRole("button", { name: "Сохранить", exact: true }).click();
+  await contactDialog.getByRole("button", { name: "Редактировать контакт" }).click();
+  await expect(contactDialog.getByLabel("Email", { exact: true })).toHaveValue("maria.work@example.com");
+  await expect(contactDialog.getByLabel("Телефон", { exact: true })).toHaveValue("+7 000 000-00-07");
+  await contactDialog.getByRole("button", { name: "Отмена", exact: true }).click();
+  await contactDialog.getByRole("button", { name: "Закрыть", exact: true }).click();
 
   await page.getByRole("button", { name: "Компании" }).click();
   await expect(page.getByRole("region", { name: "Список компаний" })).toBeVisible();
+  await page.getByRole("button", { name: /^(Новая компания|Добавить компанию)$/ }).click();
+  const newCompany = page.getByRole("dialog", { name: "Новая компания" });
+  await newCompany.getByLabel("Название", { exact: true }).fill("Тестовая организация");
+  await newCompany.getByLabel("Email", { exact: true }).fill("info@example.com");
+  await newCompany.getByRole("button", { name: "Добавить email", exact: true }).click();
+  await newCompany.getByLabel("Email 2", { exact: true }).fill("sales@example.com");
+  await newCompany.getByLabel("Телефон", { exact: true }).fill("+7 000 000-00-08");
+  await newCompany.getByRole("button", { name: "Добавить телефон", exact: true }).click();
+  await newCompany.getByLabel("Телефон 2", { exact: true }).fill("+7 000 000-00-09");
+  await newCompany.getByRole("button", { name: "Сохранить", exact: true }).click();
+  await page.getByText("Тестовая организация", { exact: true }).click();
+  const companyDialog = page.getByRole("dialog", { name: "Тестовая организация" });
+  await expect(companyDialog.getByText("sales@example.com", { exact: true })).toBeVisible();
+  await companyDialog.getByRole("button", { name: "Редактировать компанию" }).click();
+  await expect(companyDialog.getByLabel("Телефон 2", { exact: true })).toHaveValue("+7 000 000-00-09");
+  await companyDialog.getByRole("button", { name: "Удалить email 1", exact: true }).click();
+  await companyDialog.getByRole("button", { name: "Удалить телефон 1", exact: true }).click();
+  await companyDialog.getByRole("button", { name: "Сохранить", exact: true }).click();
+  await companyDialog.getByRole("button", { name: "Редактировать компанию" }).click();
+  await expect(companyDialog.getByLabel("Email", { exact: true })).toHaveValue("sales@example.com");
+  await expect(companyDialog.getByLabel("Телефон", { exact: true })).toHaveValue("+7 000 000-00-09");
 });
 
 test("creates and completes a task", async ({ page }) => {

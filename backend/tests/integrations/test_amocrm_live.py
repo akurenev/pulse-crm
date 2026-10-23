@@ -367,7 +367,15 @@ async def test_workspace_writer_imports_full_domain_and_reruns_without_duplicate
                 {
                     "field_name": "Юр. лицо",
                     "values": [{"value": {"vat_id": "0000000000"}}],
-                }
+                },
+                {
+                    "field_code": "PHONE",
+                    "values": [{"value": "+12025550101"}, {"value": "+12025550102"}],
+                },
+                {
+                    "field_code": "EMAIL",
+                    "values": [{"value": "office@example.com"}, {"value": "team@example.com"}],
+                },
             ],
             "_embedded": {"tags": [{"id": 1, "name": "Партнёр"}]},
         }
@@ -475,6 +483,10 @@ async def test_workspace_writer_imports_full_domain_and_reruns_without_duplicate
         assert task is not None and note is not None
         assert company.tags == ["Партнёр"]
         assert company.inn == "0000000000"
+        assert company.phones == ["+12025550101", "+12025550102"]
+        assert company.emails == ["office@example.com", "team@example.com"]
+        assert company.phone == company.phones[0]
+        assert company.email == company.emails[0]
         assert contact.company_id == company.id
         assert contact.primary_email == "anna@example.com"
         assert contact.assignee_id == owner.id

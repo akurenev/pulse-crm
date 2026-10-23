@@ -391,6 +391,15 @@ a {
 .record-dialog__header-actions .record-delete-button { width: 36px; height: 36px; color: #c53a22; }
 .record-dialog__header-actions .record-delete-button:hover { border-color: #ffd5ce; background: #fff4f1; color: #a82f1b; }
 .contact-edit-form { margin-top: 2px; }
+.contact-point-fields { min-width: 0; margin: 0; border: 0; padding: 0; }
+.contact-point-fields legend { margin-bottom: 6px; padding: 0; }
+.contact-point-fields__rows { display: grid; gap: 8px; }
+.contact-point-fields__row { display: flex; align-items: center; gap: 8px; }
+.contact-point-fields__row input { flex: 1; width: 100%; min-width: 0; }
+.contact-point-fields__remove { flex: 0 0 36px; color: var(--muted); }
+.contact-point-fields__remove:hover { color: #c53a22; }
+.contact-point-fields__add { align-self: flex-start; margin-top: 4px; }
+.contact-point-fields__hint { color: var(--muted); font-size: 11px; font-weight: 400; line-height: 1.5; }
 .dialog-overlay--confirm { z-index: 102; }
 .confirm-dialog { z-index: 103; width: min(440px, calc(100vw - 32px)); }
 .record-detail-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-top: 20px; }

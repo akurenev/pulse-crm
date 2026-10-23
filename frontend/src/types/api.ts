@@ -136,6 +136,8 @@ export interface ApiCompany {
   website: string | null;
   phone: string | null;
   email: string | null;
+  phones: string[];
+  emails: string[];
   tags: string[];
   custom_fields: Record<string, unknown>;
   version: number;

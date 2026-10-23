@@ -147,7 +147,15 @@ async def test_export_all_fields_month_boundaries_and_workspace_isolation(
             sa.select(Source).where(Source.workspace_id == workspace_id, Source.key == "manual")
         )
         assert source is not None
-        company = Company(workspace_id=workspace_id, name="ООО Тест", inn="1234567890")
+        company = Company(
+            workspace_id=workspace_id,
+            name="ООО Тест",
+            inn="1234567890",
+            phone="+12025550101",
+            phones=["+12025550101", "+12025550102"],
+            email="office@example.com",
+            emails=["office@example.com", "team@example.com"],
+        )
         contact = Contact(
             workspace_id=workspace_id,
             first_name="Тестовый",
@@ -235,6 +243,8 @@ async def test_export_all_fields_month_boundaries_and_workspace_isolation(
     assert cells["Сумма"].value == 249.5 and cells["Сумма"].data_type == "n"
     assert cells["Создана"].value == datetime(2026, 10, 1)
     assert cells["Компания"].value == "ООО Тест"
+    assert cells["Телефон компании"].value == "+12025550101; +12025550102"
+    assert cells["Email компании"].value == "office@example.com; team@example.com"
     assert cells["ИНН компании"].data_type == "s"
     assert cells["Контакты"].value == "Тестовый Контакт"
     assert cells["Телефоны контактов"].value == "+70000000000"

@@ -6,9 +6,11 @@ import { Link, useSearchParams } from "react-router-dom";
 
 import { Avatar } from "../components/Avatar";
 import { Button } from "../components/Button";
+import { ContactPointFields } from "../components/ContactPointFields";
 import { contacts, users } from "../data/demo";
 import { ApiError, api, remoteEnabled } from "../lib/api";
 import { deepLinkEntityId } from "../lib/deep-links";
+import { contactPointValues, readContactPoints } from "../lib/contact-points";
 import { parseDealTags } from "../lib/deal-tags";
 import { formatLongDate, formatMoney } from "../lib/format";
 import { useCrm } from "../state/crm-store";
@@ -52,6 +54,8 @@ function contactFromApi(contact: ApiContact, usersById: ReadonlyMap<string, User
     company: contact.company_id ? "Компания" : "—",
     email: contact.primary_email ?? contact.emails[0] ?? "—",
     phone: contact.primary_phone ?? contact.phones[0] ?? "—",
+    emails: contactPointValues(contact.primary_email, contact.emails),
+    phones: contactPointValues(contact.primary_phone, contact.phones),
     tags: contact.tags,
     deals: 0,
     revenue: 0,
@@ -64,9 +68,9 @@ function demoContactNames(contact: Contact) {
   return { firstName, lastName: lastNameParts.join(" ") };
 }
 
-function replacePrimaryContactPoint(values: string[], previous: string | null, next: string) {
-  const remaining = values.filter((value) => value !== previous && value !== next);
-  return next ? [next, ...remaining] : remaining;
+function ContactPointDetails({ label, primary, values }: { label: string; primary: string | null; values?: string[] }) {
+  const points = contactPointValues(primary, values);
+  return <div><small>{label}</small>{points.length ? points.map((point) => <strong key={point}>{point}</strong>) : <strong>—</strong>}</div>;
 }
 
 export default function ContactsPage() {
@@ -81,6 +85,8 @@ export default function ContactsPage() {
     website: null,
     phone: contacts.find((contact) => contact.company === name)?.phone ?? null,
     email: contacts.find((contact) => contact.company === name)?.email ?? null,
+    phones: contactPointValues(contacts.find((contact) => contact.company === name)?.phone),
+    emails: contactPointValues(contacts.find((contact) => contact.company === name)?.email),
     tags: [],
     custom_fields: {},
     version: 1,
@@ -157,7 +163,9 @@ export default function ContactsPage() {
     return (remoteContacts.data?.items ?? []).map((contact) => contactFromApi(contact, usersById));
   }, [currentUser, demoContacts, remoteContacts.data, remoteUsers.data]);
   const visibleContacts = useMemo(
-    () => sourceContacts.filter((contact) => `${contact.name} ${contact.company} ${contact.email} ${contact.phone} ${contact.tags.join(" ")}`.toLocaleLowerCase("ru").includes(normalizedSearch)),
+    () => remoteEnabled
+      ? sourceContacts
+      : sourceContacts.filter((contact) => `${contact.name} ${contact.company} ${contactPointValues(contact.email, contact.emails).join(" ")} ${contactPointValues(contact.phone, contact.phones).join(" ")} ${contact.tags.join(" ")}`.toLocaleLowerCase("ru").includes(normalizedSearch)),
     [normalizedSearch, sourceContacts],
   );
   const sourceCompanies = useMemo<ApiCompany[]>(() => {
@@ -167,7 +175,7 @@ export default function ContactsPage() {
   const visibleCompanies = useMemo(
     () => remoteEnabled
       ? sourceCompanies
-      : sourceCompanies.filter((company) => `${company.name} ${company.inn ?? ""} ${company.email ?? ""} ${company.phone ?? ""} ${company.tags.join(" ")}`.toLocaleLowerCase("ru").includes(normalizedSearch)),
+      : sourceCompanies.filter((company) => `${company.name} ${company.inn ?? ""} ${contactPointValues(company.email, company.emails).join(" ")} ${contactPointValues(company.phone, company.phones).join(" ")} ${company.tags.join(" ")}`.toLocaleLowerCase("ru").includes(normalizedSearch)),
     [normalizedSearch, sourceCompanies],
   );
   const loading = view === "contacts" ? remoteContacts.isLoading || remoteUsers.isLoading : remoteCompanies.isLoading;
@@ -327,21 +335,21 @@ export default function ContactsPage() {
     event.preventDefault();
     const form = event.currentTarget;
     const data = new FormData(form);
+    const emails = readContactPoints(data, "email");
+    const phones = readContactPoints(data, "phone");
     if (isEmployee && view === "companies") return;
     setSaving(true);
     setSaveError("");
     try {
       if (remoteEnabled) {
         if (view === "contacts") {
-          const email = String(data.get("email") ?? "").trim();
-          const phone = String(data.get("phone") ?? "").trim();
           await api.post<ApiContact>("/contacts", {
             first_name: String(data.get("first_name") ?? "").trim(),
             last_name: String(data.get("last_name") ?? "").trim(),
-            primary_email: email || null,
-            primary_phone: phone || null,
-            emails: email ? [email] : [],
-            phones: phone ? [phone] : [],
+            primary_email: emails[0] ?? null,
+            primary_phone: phones[0] ?? null,
+            emails,
+            phones,
             tags: [],
             custom_fields: {},
             ...(!isEmployee ? { assignee_id: String(data.get("assignee_id") ?? "") || null } : {}),
@@ -349,15 +357,15 @@ export default function ContactsPage() {
           setContactCursors([null]);
           await queryClient.invalidateQueries({ queryKey: ["contacts"] });
         } else {
-          const email = String(data.get("email") ?? "").trim();
-          const phone = String(data.get("phone") ?? "").trim();
           const website = String(data.get("website") ?? "").trim();
           const inn = String(data.get("inn") ?? "").replace(/[\s-]+/g, "");
           await api.post<ApiCompany>("/companies", {
             name: String(data.get("name") ?? "").trim(),
             inn: inn || null,
-            email: email || null,
-            phone: phone || null,
+            email: emails[0] ?? null,
+            phone: phones[0] ?? null,
+            emails,
+            phones,
             website: website || null,
             tags: [],
             custom_fields: {},
@@ -372,8 +380,10 @@ export default function ContactsPage() {
           id: `contact-${crypto.randomUUID()}`,
           name: `${firstName} ${lastName}`.trim(),
           company: "—",
-          email: String(data.get("email") ?? "").trim() || "—",
-          phone: String(data.get("phone") ?? "").trim() || "—",
+          email: emails[0] ?? "—",
+          phone: phones[0] ?? "—",
+          emails,
+          phones,
           tags: [],
           deals: 0,
           revenue: 0,
@@ -387,8 +397,10 @@ export default function ContactsPage() {
           id: `company-${crypto.randomUUID()}`,
           name: String(data.get("name") ?? "").trim(),
           inn: String(data.get("inn") ?? "").replace(/[\s-]+/g, "") || null,
-          email: String(data.get("email") ?? "").trim() || null,
-          phone: String(data.get("phone") ?? "").trim() || null,
+          email: emails[0] ?? null,
+          phone: phones[0] ?? null,
+          emails,
+          phones,
           website: String(data.get("website") ?? "").trim() || null,
           tags: [],
           custom_fields: {},
@@ -481,8 +493,8 @@ export default function ContactsPage() {
     const data = new FormData(event.currentTarget);
     const firstName = String(data.get("first_name") ?? "").trim();
     const lastName = String(data.get("last_name") ?? "").trim();
-    const email = String(data.get("email") ?? "").trim();
-    const phone = String(data.get("phone") ?? "").trim();
+    const emails = readContactPoints(data, "email");
+    const phones = readContactPoints(data, "phone");
     const tags = parseDealTags(String(data.get("tags") ?? ""));
     const mutationGeneration = accessGeneration.current;
     setSaving(true);
@@ -494,10 +506,10 @@ export default function ContactsPage() {
           expected_version: selectedApiContact.version,
           first_name: firstName,
           last_name: lastName,
-          primary_email: email || null,
-          primary_phone: phone || null,
-          emails: replacePrimaryContactPoint(selectedApiContact.emails, selectedApiContact.primary_email, email),
-          phones: replacePrimaryContactPoint(selectedApiContact.phones, selectedApiContact.primary_phone, phone),
+          primary_email: emails[0] ?? null,
+          primary_phone: phones[0] ?? null,
+          emails,
+          phones,
           tags,
           ...(!isEmployee ? { assignee_id: String(data.get("assignee_id") ?? "") || null } : {}),
         });
@@ -510,8 +522,10 @@ export default function ContactsPage() {
         const updated: Contact = {
           ...selectedContact,
           name: `${firstName} ${lastName}`.trim(),
-          email: email || "—",
-          phone: phone || "—",
+          email: emails[0] ?? "—",
+          phone: phones[0] ?? "—",
+          emails,
+          phones,
           tags,
           assignee: isEmployee
             ? selectedContact.assignee
@@ -535,8 +549,8 @@ export default function ContactsPage() {
     const data = new FormData(event.currentTarget);
     const name = String(data.get("name") ?? "").trim();
     const inn = String(data.get("inn") ?? "").replace(/[\s-]+/g, "");
-    const email = String(data.get("email") ?? "").trim();
-    const phone = String(data.get("phone") ?? "").trim();
+    const emails = readContactPoints(data, "email");
+    const phones = readContactPoints(data, "phone");
     const website = String(data.get("website") ?? "").trim();
     const tags = parseDealTags(String(data.get("tags") ?? ""));
     const mutationGeneration = accessGeneration.current;
@@ -548,8 +562,10 @@ export default function ContactsPage() {
           expected_version: selectedCompany.version,
           name,
           inn: inn || null,
-          email: email || null,
-          phone: phone || null,
+          email: emails[0] ?? null,
+          phone: phones[0] ?? null,
+          emails,
+          phones,
           website: website || null,
           tags,
         });
@@ -562,8 +578,10 @@ export default function ContactsPage() {
           ...selectedCompany,
           name,
           inn: inn || null,
-          email: email || null,
-          phone: phone || null,
+          email: emails[0] ?? null,
+          phone: phones[0] ?? null,
+          emails,
+          phones,
           website: website || null,
           tags,
           version: selectedCompany.version + 1,
@@ -733,8 +751,8 @@ export default function ContactsPage() {
             <div className="dialog-header"><div><Dialog.Title>{isEmployee || view === "contacts" ? "Новый контакт" : "Новая компания"}</Dialog.Title><Dialog.Description>Запись будет доступна всей команде.</Dialog.Description></div><Dialog.Close className="icon-button" aria-label="Закрыть"><X size={20} /></Dialog.Close></div>
             <form className="form-stack" onSubmit={(event) => void createEntity(event)}>
               {view === "contacts" ? <><label className="field"><span>Имя</span><input name="first_name" required autoFocus /></label><label className="field"><span>Фамилия</span><input name="last_name" /></label></> : <><label className="field"><span>Название</span><input name="name" required autoFocus /></label><label className="field"><span>ИНН</span><input name="inn" inputMode="numeric" pattern="(?:[0-9]{10}|[0-9]{12})" maxLength={12} /></label></>}
-              <label className="field"><span>Email</span><input name="email" type="email" /></label>
-              <label className="field"><span>Телефон</span><input name="phone" type="tel" /></label>
+              <ContactPointFields kind="email" />
+              <ContactPointFields kind="phone" />
               {view === "contacts" ? (isEmployee
                 ? <div className="field" aria-label="Ответственный"><span>Ответственный</span><strong>{currentUser.name}</strong></div>
                 : <label className="field"><span>Ответственный</span><select name="assignee_id" required defaultValue={currentUser.id}>{availableAssignees.map((user) => <option key={user.id} value={user.id}>{user.name}</option>)}</select></label>) : null}
@@ -777,8 +795,8 @@ export default function ContactsPage() {
             {selectedContact && contactEditing ? <form className="form-stack contact-edit-form" onSubmit={(event) => void updateContact(event)}>
               <label className="field"><span>Имя</span><input name="first_name" required autoFocus defaultValue={selectedApiContact?.first_name ?? selectedDemoNames.firstName} /></label>
               <label className="field"><span>Фамилия</span><input name="last_name" defaultValue={selectedApiContact?.last_name ?? selectedDemoNames.lastName} /></label>
-              <label className="field"><span>Email</span><input name="email" type="email" defaultValue={selectedApiContact?.primary_email ?? (selectedContact.email === "—" ? "" : selectedContact.email)} /></label>
-              <label className="field"><span>Телефон</span><input name="phone" type="tel" defaultValue={selectedApiContact?.primary_phone ?? (selectedContact.phone === "—" ? "" : selectedContact.phone)} /></label>
+              <ContactPointFields kind="email" defaultValues={contactPointValues(selectedApiContact?.primary_email ?? selectedContact.email, selectedApiContact?.emails ?? selectedContact.emails)} />
+              <ContactPointFields kind="phone" defaultValues={contactPointValues(selectedApiContact?.primary_phone ?? selectedContact.phone, selectedApiContact?.phones ?? selectedContact.phones)} />
               <label className="field"><span>Теги</span><input name="tags" defaultValue={(selectedApiContact?.tags ?? selectedContact.tags).join(", ")} placeholder="Например: VIP, постоянный клиент" /></label>
               {isEmployee
                 ? <div className="field" aria-label="Ответственный"><span>Ответственный</span><strong>{selectedContact.assignee?.name ?? currentUser.name}</strong></div>
@@ -789,16 +807,16 @@ export default function ContactsPage() {
             {selectedCompany && companyEditing ? <form className="form-stack contact-edit-form" onSubmit={(event) => void updateCompany(event)}>
               <label className="field"><span>Название</span><input name="name" required autoFocus defaultValue={selectedCompany.name} /></label>
               <label className="field"><span>ИНН</span><input name="inn" inputMode="numeric" pattern="(?:[0-9]{10}|[0-9]{12})" maxLength={12} defaultValue={selectedCompany.inn ?? ""} /></label>
-              <label className="field"><span>Email</span><input name="email" type="email" defaultValue={selectedCompany.email ?? ""} /></label>
-              <label className="field"><span>Телефон</span><input name="phone" type="tel" defaultValue={selectedCompany.phone ?? ""} /></label>
+              <ContactPointFields kind="email" defaultValues={contactPointValues(selectedCompany.email, selectedCompany.emails)} />
+              <ContactPointFields kind="phone" defaultValues={contactPointValues(selectedCompany.phone, selectedCompany.phones)} />
               <label className="field"><span>Сайт</span><input name="website" type="url" defaultValue={selectedCompany.website ?? ""} placeholder="https://" /></label>
               <label className="field"><span>Теги</span><input name="tags" defaultValue={selectedCompany.tags.join(", ")} placeholder="Например: партнёр, поставщик" /></label>
               {saveError ? <p className="form-error" role="alert">{saveError}</p> : null}
               <div className="dialog-actions"><Button type="button" onClick={() => { setSaveError(""); setCompanyEditing(false); }}>Отмена</Button><Button type="submit" variant="primary" disabled={saving}>{saving ? "Сохраняем…" : "Сохранить"}</Button></div>
             </form> : null}
             {selectedContact && !contactEditing ? <div className="record-detail-grid">
-              <div><small>Телефон</small><strong>{selectedContact.phone}</strong></div>
-              <div><small>Email</small><strong>{selectedContact.email}</strong></div>
+              <ContactPointDetails label="Телефоны" primary={selectedContact.phone} values={selectedContact.phones} />
+              <ContactPointDetails label="Email" primary={selectedContact.email} values={selectedContact.emails} />
               {!isEmployee ? <div><small>Компания</small>{selectedContactCompany
                 ? <button className="record-entity-link" type="button" onClick={() => openCompany(selectedContactCompany)}><strong>{selectedContactCompany.name}</strong><ExternalLink size={14} aria-hidden="true" /></button>
                 : <strong>{selectedContactCompanyQuery.isLoading ? "Загружаем…" : selectedContact.company}</strong>}</div> : null}
@@ -810,8 +828,8 @@ export default function ContactsPage() {
             </div> : null}
             {selectedCompany && !companyEditing ? <div className="record-detail-grid">
               <div><small>ИНН</small><strong>{selectedCompany.inn ?? "Не указан"}</strong></div>
-              <div><small>Телефон</small><strong>{selectedCompany.phone ?? "—"}</strong></div>
-              <div><small>Email</small><strong>{selectedCompany.email ?? "—"}</strong></div>
+              <ContactPointDetails label="Телефоны" primary={selectedCompany.phone} values={selectedCompany.phones} />
+              <ContactPointDetails label="Email" primary={selectedCompany.email} values={selectedCompany.emails} />
               <div className="record-detail-grid__wide"><small>Сайт</small><strong>{selectedCompany.website ?? "Не указан"}</strong></div>
               <div><small>Теги</small><strong>{selectedCompany.tags.length ? selectedCompany.tags.join(", ") : "Нет тегов"}</strong></div>
               <div><small>Обновлено</small><strong>{formatLongDate(selectedCompany.updated_at)}</strong></div>

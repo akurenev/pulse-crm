@@ -119,6 +119,8 @@ async def test_company_contacts_contact_deals_and_global_deal_search(
             "website": "https://example.test",
             "phone": "+1 202 555 0147",
             "email": "accounts@example.com",
+            "phones": ["+1 202 555 0147", "+1 202 555 0148"],
+            "emails": ["accounts@example.com", "other-office@example.com"],
             "custom_fields": {"registration_code": "ORG-SEARCH-42"},
         },
     )
@@ -220,6 +222,8 @@ async def test_company_contacts_contact_deals_and_global_deal_search(
         "0000000000",
         "accounts@example.com",
         "+1 202 555 0147",
+        "other-office@example.com",
+        "+1 202 555 0148",
     ):
         searched = await client.get(
             "/api/v1/deals",
@@ -250,7 +254,8 @@ async def test_company_contacts_contact_deals_and_global_deal_search(
     assert updated_company.status_code == 200, updated_company.text
     assert updated_company.json()["name"] == "Example Industries Updated"
     assert updated_company.json()["inn"] == "000000000000"
-    assert updated_company.json()["phone"] is None
+    assert updated_company.json()["phone"] == "+1 202 555 0148"
+    assert updated_company.json()["phones"] == ["+1 202 555 0148"]
     assert updated_company.json()["version"] == company["version"] + 1
     for required_field in ("name", "tags", "custom_fields"):
         invalid_update = await client.patch(

@@ -3,11 +3,13 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 from decimal import Decimal
-from typing import Any, Literal, Self
+from typing import Annotated, Any, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
 
 from app.models import FieldEntity, FieldType, Role, StageType, TaskStatus
+
+PhoneNumber = Annotated[str, Field(max_length=64)]
 
 
 class ORMModel(BaseModel):
@@ -118,6 +120,8 @@ class CompanyCreate(BaseModel):
     website: str | None = Field(default=None, max_length=512)
     phone: str | None = Field(default=None, max_length=64)
     email: EmailStr | None = None
+    phones: list[PhoneNumber] = Field(default_factory=list, max_length=20)
+    emails: list[EmailStr] = Field(default_factory=list, max_length=20)
     tags: list[str] = Field(default_factory=list, max_length=100)
     custom_fields: dict[str, Any] = Field(default_factory=dict)
 
@@ -133,6 +137,8 @@ class CompanyUpdate(VersionedUpdate):
     website: str | None = Field(default=None, max_length=512)
     phone: str | None = Field(default=None, max_length=64)
     email: EmailStr | None = None
+    phones: list[PhoneNumber] | None = Field(default=None, max_length=20)
+    emails: list[EmailStr] | None = Field(default=None, max_length=20)
     tags: list[str] | None = Field(default=None, max_length=100)
     custom_fields: dict[str, Any] | None = None
 
@@ -149,6 +155,8 @@ class CompanyRead(ORMModel):
     website: str | None
     phone: str | None
     email: str | None
+    phones: list[str]
+    emails: list[str]
     tags: list[str]
     custom_fields: dict[str, Any]
     version: int
@@ -164,7 +172,7 @@ class ContactCreate(BaseModel):
     primary_email: EmailStr | None = None
     primary_phone: str | None = Field(default=None, max_length=64)
     emails: list[EmailStr] = Field(default_factory=list, max_length=20)
-    phones: list[str] = Field(default_factory=list, max_length=20)
+    phones: list[PhoneNumber] = Field(default_factory=list, max_length=20)
     tags: list[str] = Field(default_factory=list, max_length=100)
     custom_fields: dict[str, Any] = Field(default_factory=dict)
 
@@ -177,7 +185,7 @@ class ContactUpdate(VersionedUpdate):
     primary_email: EmailStr | None = None
     primary_phone: str | None = Field(default=None, max_length=64)
     emails: list[EmailStr] | None = Field(default=None, max_length=20)
-    phones: list[str] | None = Field(default=None, max_length=20)
+    phones: list[PhoneNumber] | None = Field(default=None, max_length=20)
     tags: list[str] | None = Field(default=None, max_length=100)
     custom_fields: dict[str, Any] | None = None
 
